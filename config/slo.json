@@ -1,0 +1,102 @@
+{
+  "version": "1.0.0",
+  "description": "火种系统服务等级目标 (SLO)",
+  "objectives": [
+    {
+      "name": "订单执行延迟",
+      "metric": "order_execution_latency_ms",
+      "description": "从策略发出信号到订单提交至交易所API的端到端延迟",
+      "percentile": 99,
+      "threshold_ms": 50,
+      "window": "5m",
+      "alert_threshold_ms": 80,
+      "evaluation_period": "1h",
+      "breach_consequence": "告警并收紧止损倍数10%"
+    },
+    {
+      "name": "数据接收延迟",
+      "metric": "data_receive_latency_ms",
+      "description": "从交易所行情生成到火种本地处理的延迟",
+      "percentile": 95,
+      "threshold_ms": 200,
+      "window": "1m",
+      "alert_threshold_ms": 500,
+      "evaluation_period": "1h",
+      "breach_consequence": "提升至备线路或降级为保守信号"
+    },
+    {
+      "name": "系统可用性",
+      "metric": "uptime_percentage",
+      "description": "核心交易环路正常运行时间占比",
+      "target": 99.5,
+      "window": "30d",
+      "evaluation_period": "1d",
+      "alert_threshold": 99.0,
+      "breach_consequence": "触发人工介入检查，暂停自动进化功能"
+    },
+    {
+      "name": "策略信号质量",
+      "metric": "rolling_sharpe_24h",
+      "description": "最近24小时策略信号模拟成交的滚动夏普比率",
+      "threshold": 0.0,
+      "window": "24h",
+      "evaluation_period": "1h",
+      "alert_threshold": -0.5,
+      "breach_consequence": "暂停该策略开仓，通知哥德尔监视者评估"
+    },
+    {
+      "name": "最大连续亏损",
+      "metric": "consecutive_loss_count",
+      "description": "同一策略连续亏损笔数",
+      "threshold": 5,
+      "window": "24h",
+      "evaluation_period": "实时",
+      "alert_threshold": 4,
+      "breach_consequence": "自动冻结策略、降权、启动熔断审查"
+    },
+    {
+      "name": "API请求错误率",
+      "metric": "api_error_rate",
+      "description": "交易所API返回非2xx的比例",
+      "threshold": 1.0,
+      "unit": "percent",
+      "window": "5m",
+      "evaluation_period": "30m",
+      "alert_threshold": 5.0,
+      "breach_consequence": "切换至备用交易所、暂停新订单、通知运维"
+    },
+    {
+      "name": "内存泄漏检测",
+      "metric": "memory_growth_rate_mb_per_hour",
+      "description": "核心进程内存占用增长率",
+      "threshold": 50,
+      "window": "1h",
+      "evaluation_period": "6h",
+      "alert_threshold": 100,
+      "breach_consequence": "记录堆栈、计划夜间重启"
+    },
+    {
+      "name": "模型预测偏差",
+      "metric": "psi_score",
+      "description": "特征稳定性指标 (PSI) 最大变化值",
+      "threshold": 0.25,
+      "window": "1d",
+      "evaluation_period": "1d",
+      "alert_threshold": 0.30,
+      "breach_consequence": "自动降权、触发特征重新评估"
+    }
+  ],
+  "compliance": {
+    "evaluation_schedule": "0 * * * *",
+    "reporting_channel": "telegram",
+    "default_action_on_breach": "记录并告警",
+    "auto_remediation": true,
+    "remediation_limits": {
+      "max_stop_adjust_pct": 15,
+      "max_auto_suspensions_per_day": 3
+    }
+  },
+  "created": "2025-04-01T00:00:00Z",
+  "last_updated": "2025-07-14T12:00:00Z",
+  "maintainer": "fire_seed_core_team"
+}
