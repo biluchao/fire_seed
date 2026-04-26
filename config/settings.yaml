@@ -1,0 +1,190 @@
+# =============================================================================
+# 火种系统 - 核心全局配置
+# 生产级配置文件，所有参数均可在前端经鉴权后热重载（部分需重启引擎）
+# =============================================================================
+
+system:
+  name: "FireSeed"
+  version: "4.2.1"
+  environment: "production"          # production / staging / development
+  log_level: "INFO"
+  timezone: "Asia/Shanghai"          # 系统时区，用于学习时段判定
+
+# ----------------------------- 账户与资金 -----------------------------
+account:
+  initial_capital: 10000.0           # USDT
+  max_leverage: 3.0
+  margin_mode: "cross"               # cross / isolated
+  quote_asset: "USDT"
+  # 每笔交易最大风险占权益比例
+  max_risk_per_trade: 0.02
+  # 账户每日最大亏损比例（触发热熔断）
+  daily_loss_cap: 0.05
+
+# ----------------------------- API密钥（实际密钥通过环境变量注入）-----
+api_credentials:
+  binance:
+    api_key_env: "BINANCE_API_KEY"
+    secret_env: "BINANCE_SECRET_KEY"
+  # 备用交易所
+  bybit:
+    api_key_env: "BYBIT_API_KEY"
+    secret_env: "BYBIT_SECRET_KEY"
+  okx:
+    api_key_env: "OKX_API_KEY"
+    secret_env: "OKX_SECRET_KEY"
+
+# ----------------------------- 激进 / 平稳 双模式 ---------------------
+mode_profiles:
+  aggressive:
+    score_threshold_long: 58        # 开多最低评分
+    score_threshold_short: 42       # 开空最高评分
+    position_multiplier: 1.2       # 仓位放大系数
+    cooldown_bars: 2               # 加仓冷却K线数
+    stop_atr_mult: 1.3             # 止损ATR乘数
+    max_entries: 3                  # 最大加仓次数
+  moderate:
+    score_threshold_long: 65
+    score_threshold_short: 35
+    position_multiplier: 1.0
+    cooldown_bars: 3
+    stop_atr_mult: 1.5
+    max_entries: 2
+
+# 当前启用的模式（前端可切换）
+current_mode: "moderate"
+
+# ----------------------------- 学习时段自动化 -------------------------
+learning_session:
+  enabled: true
+  start_time: "01:30"              # 凌晨1:30 进入学习
+  end_time: "04:30"               # 凌晨4:30 退出
+  # 学习期间系统自动切换至“平稳策略集”，并额外收紧风控
+  night_risk:
+    stop_atr_mult: 0.7             # 进一步缩小止损
+    position_limit_pct: 0.5        # 最大仓位为日间的50%
+    force_depth_check_interval: 3600  # 每小时强制校验盘口深度
+  # 惊梦条件：若学习期间波动率突破阈值，立刻唤醒并恢复激进策略
+  nightmare:
+    volatility_threshold_mult: 2.0 # 波动率超过历史均值倍数
+    alert_channels: ["telegram", "dashboard"]
+
+# ----------------------------- 多周期引擎配置 -------------------------
+timeframes:
+  1m:
+    engine: true                   # 是否启用本周期策略引擎
+    arbitrate: true               # 是否参与多周期仲裁
+    execute: true                  # 是否实际下单（幽灵模式时可关闭）
+    atr_period: 5
+    stop_atr_mult: 1.5            # 可由模式覆盖
+    max_entries: 3
+    cooldown_bars: 2
+  3m:
+    engine: true
+    arbitrate: true
+    execute: true
+    atr_period: 10
+    stop_atr_mult: 1.8
+    max_entries: 2
+    cooldown_bars: 2
+  5m:
+    engine: true
+    arbitrate: true
+    execute: true
+    atr_period: 14
+    stop_atr_mult: 2.0
+    max_entries: 1
+    cooldown_bars: 1
+  15m:
+    engine: true
+    arbitrate: true
+    execute: false                 # 15分钟默认只参与仲裁，不独立开仓
+    atr_period: 20
+    stop_atr_mult: 3.0
+    max_entries: 1
+
+# ----------------------------- 风控阈值 -------------------------------
+risk_control:
+  # 三级熔断（日亏损比例）
+  circuit_breaker:
+    level1: 0.03                   # 3% 预警，禁止加仓
+    level2: 0.05                   # 5% 暂停开仓，仅平仓
+    level3: 0.08                   # 8% 清仓并停止交易24小时
+  # 流动性熔断
+  liquidity:
+    bid_ask_spread_max: 0.005     # 买卖价差超过0.5%触发
+    depth_decay_ratio: 0.5         # 前20档深度低于历史中位数50%触发
+    lstm_pred_drop: 0.5            # LSTM预测流动性下降50%预熔断
+  # 保证金
+  margin:
+    warning_level: 0.15            # 保证金率低于150%告警
+    critical_level: 0.12           # 低于120%强平预警
+  # 乌龙指保护
+  fat_finger:
+    price_deviation_threshold: 0.05  # 价格偏离市场5%拒绝
+
+# ----------------------------- 动态权重校准 ---------------------------
+weights:
+  update_frequency: "daily"        # 每日更新
+  ic_window_days: 20              # IC计算窗口
+  decay_halflife_days: 15         # 指数衰减半衰期
+  volatility_gate_percentile: 0.8  # 波动率超过80%分位冻结更新
+  l2_regularization_lambda: 0.3  # 平滑强度
+  max_single_change_pct: 0.15     # 单次最大调整幅度
+  core_factor_weight: 0.6         # 核心因子总权重锚定
+  auxiliary_factor_weight: 0.4    # 辅助因子总权重锚定
+  redundancy_mi_threshold: 0.6    # 互信息冗余阈值
+
+# ----------------------------- 幽灵/影子验证 --------------------------
+shadow:
+  enable: true
+  min_sample_days: 30             # 最少验证样本天数
+  significance_level: 0.05       # 配对t检验显著性水平
+  impact_model: true              # 启用订单簿冲击模拟
+  counterparty_stress: true       # 启用对手方风险测试
+  resonance_min_profit_ratio: 1.3 # 共振信号最小历史盈利比
+
+# ----------------------------- 自进化工厂 -----------------------------
+evolution:
+  enable: true
+  population_size: 50
+  immigrant_rate: 0.15            # 每代随机移民比例
+  sandbox_timeout: 30             # 沙箱编译超时(秒)
+  economic_filter: true           # 经济意义过滤
+  failure_gene_db_size: 1000     # 保留失败基因上限
+  ota_auto_rollback: true         # OTA后自动幽灵验证，失败回滚
+
+# ----------------------------- 前端与安全 -----------------------------
+frontend:
+  port: 8000
+  password_min_length: 8
+  password_require_alphanumeric: true
+  session_timeout_minutes: 30
+  # 敏感操作二次确认密码及冷静期（秒）
+  double_confirm_cooldown: 7200   # 2小时冷静期
+
+# ----------------------------- 执行与交易成本 -------------------------
+execution:
+  default_executor: "twap"         # twap / iceberg / sor
+  max_slippage_pct: 0.15          # 最大接受滑点
+  fee_maker: 0.0002               # 挂单手续费
+  fee_taker: 0.0004               # 吃单手续费
+  funding_rate_arb_enable: true
+  anti_detection: true            # 启用GAN掩蔽挂单模式
+
+# ----------------------------- 日志与存储 -----------------------------
+logging:
+  path: "/var/log/fire_seed/"
+  max_file_size_mb: 100
+  backup_count: 30
+  compress: true
+  # 非关键信号不落盘
+  signal_detail_level: "WARN"     # DEBUG / INFO / WARN
+
+# ----------------------------- 路径与目录 -----------------------------
+paths:
+  data_dir: "/opt/fire_seed/data/"
+  weight_snapshot_dir: "/opt/fire_seed/weights/"
+  strategy_store: "/opt/fire_seed/strategies/"
+  ghost_db: "/opt/fire_seed/ghost/ghost.db"
+  evolution_db: "/opt/fire_seed/brain/evolution.db"
