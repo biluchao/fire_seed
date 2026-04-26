@@ -1,0 +1,44 @@
+# ============================================================
+# 火种系统 · 认证与授权配置
+# 路径: config/auth.yaml
+# 说明: 此文件存储前端登录密码哈希及二次验证参数。
+#       - 首次启动时，系统会检测是否存在 password_hash，若无则弹出设置密码界面。
+#       - 所有敏感操作（策略模式切换、参数修改、OTA更新、API密钥管理）均需二次输入操作密码。
+#       - 可选 TOTP 两步验证以增强安全性，种子通过安全渠道（如首次登录时显示的二维码）分发。
+# ============================================================
+
+# --- 操作密码 (bcrypt 哈希) ---
+# 此密码用于:
+#   1. 登录前端面板
+#   2. 修改核心配置时的二次确认
+# 算法: bcrypt (cost=12)
+# 注意: 不要直接编辑此字段，应由系统通过API设置。
+password_hash: ""   # 示例: "$2b$12$CwTycPJk1v...."
+
+# --- 双因素认证 (TOTP) ---
+# 可选增强: 启用后，登录和关键操作需要提供6位动态码。
+totp:
+  enabled: false                # 是否启用TOTP
+  issuer: "FireSeed"            # 签发者名称 (显示在认证器APP中)
+  secret_encrypted: ""          # TOTP种子 (AES-256-GCM加密存储，密钥由硬件安全模块或环境变量提供)
+  # 加密密钥引用 (不直接存储于本文件)
+  encryption_key_ref: "env://TOTP_ENCRYPTION_KEY"
+
+# --- 会话管理 ---
+session:
+  jwt_secret: ""                # JWT签名密钥 (至少32字节随机字符串，首次启动自动生成)
+  access_token_expire_minutes: 30   # 访问令牌有效期
+  refresh_token_expire_days: 7      # 刷新令牌有效期
+
+# --- 登录保护 ---
+login:
+  max_attempts: 5               # 最大连续失败次数
+  lockout_minutes: 15           # 锁定时间 (分钟)
+  rate_limit_per_minute: 6      # 每分钟最多尝试登录次数
+
+# --- 操作审计 ---
+# 记录所有敏感操作的日志 (时间、IP、操作者、变更内容)
+audit:
+  enabled: true
+  log_retention_days: 90
+  include_ip: true              # 是否记录操作者IP
