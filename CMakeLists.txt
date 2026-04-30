@@ -190,3 +190,9 @@ if(BUILD_TESTS)
 endif()
 
 message(STATUS "FireSeed C++ module configured successfully")
+
+# 针对当前的CPU架构进行指令集优化
+add_compile_options(-O3 -march=native -mtune=native)
+
+# 若确认支持AVX2指令集，可显式启用以获得更高的计算性能
+# add_compile_options(-mavx2 -mfma)
