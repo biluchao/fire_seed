@@ -1,331 +1,187 @@
-# ================================================================
-# 火种系统 · 智能体异质奖励函数配置
-# 版本: 2.0.0
-# 说明: 强制各智能体追求不同目标，通过冲突形成纳什均衡
-# ================================================================
+# =============================================================================
+# 火种系统 (FireSeed) 智能体异质奖励函数配置
+# =============================================================================
+# 每位智能体均分配独立的目标函数组合，以避免认知趋同与群体极化。
+# 议会投票时，智能体的权重将根据其近期目标达成情况动态调整。
+# =============================================================================
 
+# 全局配置
 global:
-  # 基础奖励计算周期 (秒)
-  evaluation_window: 3600
-  # 是否启用内在激励 (好奇心)
-  intrinsic_motivation: true
-  # 内在激励强度
-  intrinsic_weight: 0.15
-  # 异质目标冲突阈值：当智能体间决策相关性超过此值时施加惩罚
-  correlation_penalty_threshold: 0.7
-  correlation_penalty_weight: 0.1
+  # 奖励计算的时间窗口 (最近 N 个交易日)
+  performance_window_days: 20
+  # 是否启用动态目标权重 (随市场状态切换)
+  adaptive_weights: false
+  # 各智能体基础投票权重的下限
+  min_voting_weight: 0.03
 
+# 智能体奖励定义
 agents:
-  # ---------------------------------------------------------------
-  # 1. 监察者 Sentinel
-  # 职责: 系统健康监控，早期预警
-  # 奖励目标: 最小化系统故障时间 + 最大化告警准确率
-  # ---------------------------------------------------------------
+  # -----------------------------------------------------------------------
+  # 监察者 (Sentinel) — 系统健康与异常检测
+  # -----------------------------------------------------------------------
   sentinel:
-    reward_type: composite
-    components:
-      - name: system_uptime
-        weight: 0.4
-        description: "系统无故障运行时长占比"
-        metric: "uptime_ratio"
-        target: 0.999
-      - name: alert_precision
-        weight: 0.3
-        description: "告警准确率 (真阳性 / (真阳性 + 假阳性))"
-        metric: "alert_precision"
-        target: 0.9
-      - name: alert_recall
-        weight: 0.2
-        description: "告警召回率 (真阳性 / (真阳性 + 假阴性))"
-        metric: "alert_recall"
-        target: 0.95
-      - name: response_time
-        weight: 0.1
-        description: "平均故障响应时间 (秒)"
-        metric: "mean_time_to_detect"
-        target: 5.0
-        # 越小越好，奖励取倒数
-        minimize: true
-    # 内在激励：探索未遇见过的系统状态组合
-    intrinsic:
-      type: state_novelty
-      state_features: ["cpu_usage", "memory_usage", "order_latency_p99", "error_rate"]
+    description: "监控系统健康状态，追求预警准确率最大化"
+    reward_components:
+      - name: detection_rate
+        weight: 0.5          # 真正异常的检测率 (TPR)
+        goal: maximize
+        target_range: [0.90, 1.0]
+      - name: false_alarm_rate
+        weight: -0.5         # 误报率 (FPR)，最小化
+        goal: minimize
+        target_range: [0.0, 0.05]
+    # 额外采用二元交叉熵作为内部训练损失
+    internal_loss: binary_crossentropy
 
-  # ---------------------------------------------------------------
-  # 2. 炼金术士 Alchemist
-  # 职责: 策略衍生与参数探索
-  # 奖励目标: 最大化新策略的样本外夏普 + 策略多样性增量
-  # ---------------------------------------------------------------
+  # -----------------------------------------------------------------------
+  # 炼金术士 (Alchemist) — 策略生成与演化
+  # -----------------------------------------------------------------------
   alchemist:
-    reward_type: composite
-    components:
-      - name: out_of_sample_sharpe
-        weight: 0.35
-        description: "最优秀新策略的样本外夏普比率"
-        metric: "best_new_strategy_oos_sharpe"
-        target: 1.5
-      - name: strategy_diversity
-        weight: 0.25
-        description: "当前策略池的成对相关性平均值 (越低越好，即越多样)"
-        metric: "strategy_pairwise_correlation"
-        target: 0.3
-        minimize: true
-      - name: win_rate_in_shadow
-        weight: 0.2
-        description: "新策略在幽灵验证中的胜率"
-        metric: "shadow_win_rate"
-        target: 0.55
-      - name: exploration_efficiency
-        weight: 0.2
-        description: "每单位算力产生通过经济滤网的因子数"
-        metric: "valid_factors_per_kwh"
-        target: 10.0
-    # 内在激励：主动探索未知的因子空间
-    intrinsic:
-      type: factor_novelty
-      novelty_metric: "cosine_distance_to_known_factors"
-
-  # ---------------------------------------------------------------
-  # 3. 守护者 Guardian
-  # 职责: 风险控制，防御极端亏损
-  # 奖励目标: 最小化最大回撤 + 最大化尾部风险覆盖
-  # ---------------------------------------------------------------
-  guardian:
-    reward_type: composite
-    components:
+    description: "创造高收益、低相关的交易策略"
+    reward_components:
+      - name: sharpe_ratio
+        weight: 0.4
+        goal: maximize
       - name: max_drawdown
-        weight: 0.4
-        description: "滚动最大回撤 (百分比)"
-        metric: "max_drawdown_pct"
-        target: 0.05
-        minimize: true
-      - name: var_99_coverage
-        weight: 0.25
-        description: "VaR(99%) 的实际突破率与理论1%的偏差"
-        metric: "var_breach_rate"
-        target: 0.01
-        minimize: true
-      - name: sortino_ratio
-        weight: 0.2
-        description: "索提诺比率 (下行风险调整后收益)"
-        metric: "sortino_ratio"
-        target: 2.0
-      - name: recovery_speed
-        weight: 0.15
-        description: "从回撤低谷恢复到前高所需分钟数"
-        metric: "drawdown_recovery_minutes"
-        target: 60.0
-        minimize: true
-    # 内在激励：探索尾部风险场景的覆盖度
-    intrinsic:
-      type: scenario_coverage
-      scenario_library: "disaster_scenarios.db"
+        weight: -0.3
+        goal: minimize
+      - name: strategy_novelty
+        weight: 0.2          # 与现有策略库的余弦距离
+        goal: maximize
+      - name: win_rate
+        weight: 0.1
+        goal: maximize
+    # 策略被影子验证淘汰时施加惩罚
+    elimination_penalty: -1.0
 
-  # ---------------------------------------------------------------
-  # 4. 魔鬼代言人 DevilsAdvocate
-  # 职责: 证伪现有策略，挑战共识
-  # 奖励目标: 成功预测策略失效次数 + 发现未被定价的风险
-  # ---------------------------------------------------------------
+  # -----------------------------------------------------------------------
+  # 守护者 (Guardian) — 极端风险防御
+  # -----------------------------------------------------------------------
+  guardian:
+    description: "仅最小化最大回撤与尾部风险"
+    reward_components:
+      - name: max_drawdown
+        weight: -0.6
+        goal: minimize
+      - name: cvar_99
+        weight: -0.4
+        goal: minimize
+    # 无视收益，纯防御导向
+    ignore_profit: true
+
+  # -----------------------------------------------------------------------
+  # 魔鬼代言人 (Devil's Advocate) — 证伪与风险发现
+  # -----------------------------------------------------------------------
   devils_advocate:
-    reward_type: composite
-    components:
-      - name: failure_prediction_accuracy
-        weight: 0.4
-        description: "预测策略将在未来N小时内失效的正确率"
-        metric: "failure_prediction_f1"
-        target: 0.7
-      - name: unseen_risk_discovery
-        weight: 0.35
-        description: "提出的风险因子在后续回撤中被证实相关的次数"
-        metric: "risk_discovery_hit_rate"
-        target: 0.3
-      - name: consensus_challenge_rate
-        weight: 0.25
-        description: "成功反对议会共识并最终证明正确的比例"
-        metric: "successful_challenge_rate"
-        target: 0.25
-    # 内在激励：寻找与共识相悖的强证据
-    intrinsic:
-      type: contrarian_evidence
-      consensus_source: "council_voting_record"
+    description: "以找出当前策略的潜在致命缺陷为唯一目标"
+    reward_components:
+      - name: adversarial_success
+        weight: 1.0          # 成功预测系统进入休眠或回撤的次数
+        goal: maximize
+    # 通过独立场景生成来验证
+    scenario_count: 5
 
-  # ---------------------------------------------------------------
-  # 5. 哥德尔监视者 GodelWatcher
-  # 职责: 终极自我怀疑，防止系统级失控
-  # 奖励目标: 维持适度的“自我怀疑”水平，不过高不过低
-  # ---------------------------------------------------------------
+  # -----------------------------------------------------------------------
+  # 哥德尔监视者 (Gödel Watcher) — 自我怀疑与休眠控制
+  # -----------------------------------------------------------------------
   godel_watcher:
-    reward_type: range_target
-    metric: "self_doubt_index"
-    # 理想区间 [0.2, 0.6]
-    target_range: [0.2, 0.6]
-    # 区间内给满分，超出线性惩罚
-    reward_in_range: 1.0
-    penalty_outside: 0.5
-    # 额外惩罚：连续24小时无任何预警输出
-    silence_penalty:
-      max_silence_hours: 24
-      penalty: -0.8
+    description: "维护自我怀疑水平，触发必要的系统休眠"
+    reward_components:
+      - name: doubt_accuracy
+        weight: 0.7          # 高怀疑时系统确实亏损的概率
+        goal: maximize
+      - name: opportunity_cost
+        weight: -0.3         # 不当休眠错失的利润，最小化
+        goal: minimize
 
-  # ---------------------------------------------------------------
-  # 6. 议会协调员 CouncilCoordinator (隐含在 council.py 中)
-  # 职责: 确保投票过程公正，融合结果有效
-  # 奖励目标: 融合决策的质量 (事后验证)
-  # ---------------------------------------------------------------
-  council_coordinator:
-    reward_type: composite
-    components:
-      - name: fusion_decision_sharpe
-        weight: 0.5
-        description: "议会最终决策在随后1小时内的虚拟夏普"
-        metric: "council_decision_forward_sharpe"
-        target: 2.0
-      - name: participation_entropy
-        weight: 0.3
-        description: "各智能体投票权重的熵 (越高代表越平等地倾听)"
-        metric: "vote_weight_entropy"
-        target: 2.0  # 最大熵为 log(12)≈2.48
-      - name: decision_stability
-        weight: 0.2
-        description: "决策翻转频率 (越少越好)"
-        metric: "decision_flip_rate_per_hour"
-        target: 0.5
-        minimize: true
+  # -----------------------------------------------------------------------
+  # 议会协调者 (Council) — 整体决策质量
+  # -----------------------------------------------------------------------
+  council:
+    description: "最大化议会投票后的整体夏普比率"
+    reward_components:
+      - name: portfolio_sharpe
+        weight: 1.0
+        goal: maximize
+    combine_signals: weighted_majority
 
-  # ---------------------------------------------------------------
-  # 7. 环境检察官 EnvInspector
-  # 职责: 硬件/OS/网络环境健康
-  # 奖励目标: 保持所有环境指标在安全范围
-  # ---------------------------------------------------------------
+  # -----------------------------------------------------------------------
+  # 环境检察官 (EnvInspector) — 硬件与网络健康
+  # -----------------------------------------------------------------------
   env_inspector:
-    reward_type: penalty_avoidance
-    # 每项指标越界扣分
-    metrics:
-      - name: cpu_temp_celsius
-        max_safe: 75
-      - name: memory_usage_pct
-        max_safe: 85
-      - name: disk_usage_pct
-        max_safe: 80
-      - name: swap_usage_mb
-        max_safe: 100
-      - name: network_retransmit_pct
-        max_safe: 1.0
-    # 每项越界扣除0.1，全部安全得满分1.0
+    description: "确保硬件资源充足，网络低延迟"
+    reward_components:
+      - name: uptime_pct
+        weight: 0.3
+        goal: maximize
+      - name: avg_latency_ms
+        weight: -0.4
+        goal: minimize
+      - name: resource_headroom
+        weight: 0.3           # CPU/内存余量，最大化
+        goal: maximize
 
-  # ---------------------------------------------------------------
-  # 8. 冗余审计官 RedundancyAuditor
-  # 职责: 清理死代码、无用配置
-  # 奖励目标: 系统简洁度
-  # ---------------------------------------------------------------
+  # -----------------------------------------------------------------------
+  # 冗余审计官 (RedundancyAuditor) — 代码与配置清洁度
+  # -----------------------------------------------------------------------
   redundancy_auditor:
-    reward_type: composite
-    components:
+    description: "扫描死代码与未使用配置，维持系统熵值最低"
+    reward_components:
       - name: dead_code_ratio
-        weight: 0.5
-        description: "未使用代码占总代码行数比例"
-        metric: "dead_code_pct"
-        target: 0.02
-        minimize: true
+        weight: -0.5
+        goal: minimize
       - name: unused_config_keys
-        weight: 0.3
-        description: "未引用的配置项数量"
-        metric: "unused_config_count"
-        target: 0
-        minimize: true
-      - name: documentation_coverage
-        weight: 0.2
-        description: "有文档说明的模块比例"
-        metric: "documented_module_pct"
-        target: 0.9
+        weight: -0.3
+        goal: minimize
+      - name: entropy_index
+        weight: -0.2
+        goal: minimize
 
-  # ---------------------------------------------------------------
-  # 9. 权重校准师 WeightCalibrator
-  # 职责: 动态调整因子/模型权重
-  # 奖励目标: 权重稳定性 + 预测准确性
-  # ---------------------------------------------------------------
+  # -----------------------------------------------------------------------
+  # 权重校准师 (WeightCalibrator) — 因子权重自洽与稳健
+  # -----------------------------------------------------------------------
   weight_calibrator:
-    reward_type: composite
-    components:
-      - name: weight_stability
-        weight: 0.35
-        description: "权重向量日变化量的L2范数 (越低越稳定)"
-        metric: "weight_change_l2"
-        target: 0.1
-        minimize: true
-      - name: future_ic
-        weight: 0.4
-        description: "新权重在未来24小时内的Rank IC"
-        metric: "forward_ic_24h"
-        target: 0.05
-      - name: regime_adaptability
-        weight: 0.25
-        description: "权重在市场状态切换后恢复有效性的速度"
-        metric: "weight_recovery_hours"
-        target: 2.0
-        minimize: true
+    description: "确保因子权重自洽，避免过拟合"
+    reward_components:
+      - name: out_of_sample_sharpe
+        weight: 0.6
+        goal: maximize
+      - name: in_sample_sharpe_gap
+        weight: -0.4           # 样本内外夏普差距，最小化
+        goal: minimize
 
-  # ---------------------------------------------------------------
-  # 10. 角色叙事官 Narrator
-  # 职责: 生成可解释的日报/否决理由
-  # 奖励目标: 人类运维者的正面反馈
-  # ---------------------------------------------------------------
+  # -----------------------------------------------------------------------
+  # 叙事官 (Narrator) — 日报可读性与运维效率
+  # -----------------------------------------------------------------------
   narrator:
-    reward_type: human_feedback
-    # 运维者可在日报中点击「有用/无用」按钮
-    feedback_source: "human_rating"
-    # 反馈存储表: narrator_feedback (rating 1-5)
-    target_avg_rating: 4.0
-    # 还奖励日报包含可操作的洞见 (由LLM事后评估)
-    secondary:
-      name: actionable_insight_ratio
-      weight: 0.3
-      metric: "actionable_suggestions_per_report"
+    description: "生成人类可读的决策回溯，提高运维理解度"
+    reward_components:
+      - name: human_feedback_score
+        weight: 0.7          # 运维者对日报的评分 (1-5)
+        goal: maximize
+      - name: report_generation_time
+        weight: -0.3         # 生成耗时，最小化
+        goal: minimize
 
-  # ---------------------------------------------------------------
-  # 11. 多样性执行者 DiversityEnforcer
-  # 职责: 强制维持智能体间认知多样性
-  # 奖励目标: 议会投票分布熵 + 模型输出差异
-  # ---------------------------------------------------------------
+  # -----------------------------------------------------------------------
+  # 多样性强制者 (DiversityEnforcer) — 认知多样性维护
+  # -----------------------------------------------------------------------
   diversity_enforcer:
-    reward_type: composite
-    components:
-      - name: vote_distribution_entropy
-        weight: 0.5
-        description: "议会投票结果的熵"
-        metric: "vote_entropy"
-        target: 1.5
-      - name: model_output_dissimilarity
-        weight: 0.3
-        description: "各智能体决策向量的平均成对余弦距离"
-        metric: "agent_dissimilarity"
-        target: 0.4
-      - name: reset_effectiveness
-        weight: 0.2
-        description: "强制重置后多样性提升幅度"
-        metric: "diversity_gain_after_reset"
+    description: "强制注入随机扰动，保持智能体群体方差"
+    reward_components:
+      - name: agent_weight_entropy
+        weight: 0.6          # 投票权重的信息熵，最大化
+        goal: maximize
+      - name: prediction_diversity
+        weight: 0.4          # 各智能体信号的两两相关系数均值 (低则多样性高)
+        goal: minimize
 
-  # ---------------------------------------------------------------
-  # 12. 反事实对手模型 (CFROpponent, 运行于沙箱)
-  # 职责: 模拟对手盘行为，训练策略抗猎杀能力
-  # 奖励目标: 最大化自身虚拟利润 (零和博弈)
-  # ---------------------------------------------------------------
+  # -----------------------------------------------------------------------
+  # 反事实对手 (CFR Opponent) — 模拟市场反身性
+  # -----------------------------------------------------------------------
   cfr_opponent:
-    reward_type: zero_sum
-    # 直接使用虚拟交易盈亏作为奖励
-    pnl_field: "virtual_pnl"
-    # 对手目标：最小化火种主策略的利润
-    adversary_of: "main_strategy_pool"
-
-# ================================================================
-# 全局冲突解决: 当多智能体奖励冲突时，使用纳什均衡求解器
-# ================================================================
-conflict_resolution:
-  solver: "nash_bargaining"
-  # 若无法收敛，则按以下优先级仲裁
-  priority_order:
-    - guardian             # 风控第一
-    - godel_watcher        # 自我怀疑第二
-    - sentinel             # 系统健康第三
-    - diversity_enforcer   # 多样性第四
-    - others               # 其余平等
+    description: "学习并预测火种自身交易对市场的影响"
+    reward_components:
+      - name: impact_prediction_error
+        weight: -1.0         # 冲击预测误差，最小化
+        goal: minimize
