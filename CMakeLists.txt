@@ -1,145 +1,192 @@
-cmake_minimum_required(VERSION 3.18)
-project(FireSeedCore LANGUAGES CXX C)
+cmake_minimum_required(VERSION 3.14)
+project(FireSeedCpp VERSION 3.0.0 LANGUAGES CXX)
 
-# --- C++ 标准与编译选项 -------------------------------------------------------
-set(CMAKE_CXX_STANDARD 20)
+# ###############################
+# C++ 标准与编译选项
+# ###############################
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 
-# 生产级优化标志
+# 全局编译优化
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
-    add_compile_options(-O3 -DNDEBUG -march=native -mtune=native -funroll-loops)
-    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-        add_compile_options(-ffast-math -fomit-frame-pointer)
+    add_compile_options(-O3 -DNDEBUG -march=native -mtune=native)
+    # 启用链接时优化
+    if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.9")
+        include(CheckIPOSupported)
+        check_ipo_supported(RESULT ipo_supported OUTPUT ipo_output)
+        if(ipo_supported)
+            set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
+        endif()
     endif()
 endif()
 
-# SIMD 支持 (AVX2)
-include(CheckCXXCompilerFlag)
-check_cxx_compiler_flag("-mavx2" COMPILER_SUPPORTS_AVX2)
-if(COMPILER_SUPPORTS_AVX2)
-    add_compile_options(-mavx2)
+# 严格警告（生产代码推荐）
+add_compile_options(-Wall -Wextra -Wpedantic -Wno-unused-parameter)
+
+# ###############################
+# 查找必需依赖
+# ###############################
+find_package(pybind11 REQUIRED)
+
+# 线程库（某些C++运行时需要显式链接）
+find_package(Threads REQUIRED)
+
+# 数学库
+find_library(MATH_LIB m)
+if(NOT MATH_LIB)
+    set(MATH_LIB "")
 endif()
 
-# --- 查找依赖 -----------------------------------------------------------------
-# pybind11
-find_package(pybind11 2.10 QUIET)
-if(NOT pybind11_FOUND)
-    include(FetchContent)
-    FetchContent_Declare(
-        pybind11
-        GIT_REPOSITORY https://github.com/pybind/pybind11.git
-        GIT_TAG v2.11.1
-    )
-    FetchContent_MakeAvailable(pybind11)
+# ###############################
+# 可选依赖与功能开关
+# ###############################
+option(USE_AF_XDP "Enable AF_XDP acceleration (requires libxdp)" OFF)
+option(USE_ONNX_RUNTIME "Enable ONNX Runtime inline inference" OFF)
+
+# ###############################
+# 头文件包含路径
+# ###############################
+set(CPP_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR})
+include_directories(${CPP_INCLUDE_DIR})
+
+# ###############################
+# 源文件收集
+# ###############################
+# 核心公共源文件
+set(CORE_SOURCES
+    ${CPP_INCLUDE_DIR}/cpp/bindings.cpp
+)
+
+# 通用工具与数据结构
+set(UTIL_HEADERS
+    ${CPP_INCLUDE_DIR}/cpp/shared_memory/shm_queue.h
+    ${CPP_INCLUDE_DIR}/cpp/shared_memory/flat_msg.h
+    ${CPP_INCLUDE_DIR}/cpp/pool/slab_allocator.h
+)
+
+# 风险模块
+set(RISK_SOURCES
+    ${CPP_INCLUDE_DIR}/cpp/risk/incremental_covar.cpp
+    ${CPP_INCLUDE_DIR}/cpp/risk/evt_var.cpp
+    ${CPP_INCLUDE_DIR}/cpp/risk/jump_detector.cpp
+)
+
+# 执行模块
+set(EXEC_SOURCES
+    ${CPP_INCLUDE_DIR}/cpp/execution/twap_adaptive.cpp
+    ${CPP_INCLUDE_DIR}/cpp/execution/iceberg_slicer.cpp
+)
+
+# 学习模块
+set(LEARNING_SOURCES
+    ${CPP_INCLUDE_DIR}/cpp/learning/ftrl_learner.cpp
+)
+
+# SIMD 优化模块
+set(SIMD_SOURCES
+    ${CPP_INCLUDE_DIR}/cpp/simd/vector_math.cpp
+)
+
+# 监控模块（硬监视器）
+set(MONITOR_SOURCES
+    ${CPP_INCLUDE_DIR}/cpp/monitoring/hard_watcher.cpp
+)
+
+# 网络模块（根据选项启用）
+set(NET_SOURCES "")
+if(USE_AF_XDP)
+    find_library(XDP_LIB xdp)
+    find_library(BPF_LIB bpf)
+    if(XDP_LIB AND BPF_LIB)
+        list(APPEND NET_SOURCES
+            ${CPP_INCLUDE_DIR}/cpp/net/af_xdp_recv.cpp
+        )
+        add_definitions(-DFIRESEED_USE_AF_XDP)
+        message(STATUS "AF_XDP enabled")
+    else()
+        message(WARNING "AF_XDP requested but required libraries not found, disabled")
+    endif()
+endif()
+# 用户态TCP栈始终编译（无额外依赖）
+list(APPEND NET_SOURCES ${CPP_INCLUDE_DIR}/cpp/net/tcp_userstack.cpp)
+
+# ONNX Runtime 推理模块（可选）
+set(ONNX_SOURCES "")
+if(USE_ONNX_RUNTIME)
+    find_package(onnxruntime QUIET)
+    if(onnxruntime_FOUND)
+        list(APPEND ONNX_SOURCES ${CPP_INCLUDE_DIR}/cpp/learning/vib_inference.cpp)
+        add_definitions(-DFIRESEED_USE_ONNX)
+        message(STATUS "ONNX Runtime enabled for C++ inference")
+    else()
+        message(WARNING "ONNX Runtime not found, C++ inference disabled")
+    endif()
 endif()
 
-# OpenMP (可选，用于加速某些计算)
-find_package(OpenMP)
-if(OpenMP_CXX_FOUND)
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${OpenMP_CXX_FLAGS}")
+# 汇总所有源文件
+set(ALL_SOURCES
+    ${CORE_SOURCES}
+    ${RISK_SOURCES}
+    ${EXEC_SOURCES}
+    ${LEARNING_SOURCES}
+    ${SIMD_SOURCES}
+    ${MONITOR_SOURCES}
+    ${NET_SOURCES}
+    ${ONNX_SOURCES}
+)
+
+# ###############################
+# 构建目标：Python 扩展模块
+# ###############################
+pybind11_add_module(fire_seed_cpp MODULE ${ALL_SOURCES})
+
+# 链接必要的系统库
+target_link_libraries(fire_seed_cpp PRIVATE
+    Threads::Threads
+    ${MATH_LIB}
+)
+
+# 如果使用了 AF_XDP，链接相关库
+if(USE_AF_XDP AND XDP_LIB AND BPF_LIB)
+    target_link_libraries(fire_seed_cpp PRIVATE ${XDP_LIB} ${BPF_LIB})
 endif()
 
-# --- 公用头文件目录 -------------------------------------------------------------
-set(PUBLIC_INCLUDES
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/shared_memory
-    ${CMAKE_CURRENT_SOURCE_DIR}/risk
-    ${CMAKE_CURRENT_SOURCE_DIR}/execution
-    ${CMAKE_CURRENT_SOURCE_DIR}/learning
-    ${CMAKE_CURRENT_SOURCE_DIR}/monitoring
-)
-
-# --- 各子模块的源码组织 ---------------------------------------------------------
-
-# 共享内存与内存池
-add_library(shm_utils STATIC
-    shared_memory/shm_queue.cpp
-    shared_memory/shm_manager.cpp
-    memory_pool/slab_allocator.cpp
-    utils/cache_aligned.cpp
-)
-target_include_directories(shm_utils PUBLIC ${PUBLIC_INCLUDES})
-target_link_libraries(shm_utils PUBLIC pthread rt)
-
-# 风险计算核心
-add_library(risk_engine STATIC
-    risk/incremental_covar.cpp
-    risk/evt_var.cpp
-    risk/realtime_guard.cpp
-    risk/jump_detector.cpp
-    risk/monte_carlo.cpp
-)
-target_include_directories(risk_engine PUBLIC ${PUBLIC_INCLUDES})
-target_link_libraries(risk_engine PUBLIC shm_utils)
-if(OpenMP_CXX_FOUND)
-    target_link_libraries(risk_engine PUBLIC OpenMP::OpenMP_CXX)
+# 如果使用了 ONNX Runtime，链接其库
+if(USE_ONNX_RUNTIME AND onnxruntime_FOUND)
+    target_link_libraries(fire_seed_cpp PRIVATE onnxruntime::onnxruntime)
 endif()
 
-# 执行算法
-add_library(execution_engine STATIC
-    execution/twap_adaptive.cpp
-    execution/sor_dynamic.cpp
-    execution/iceberg_slicer.cpp
-)
-target_include_directories(execution_engine PUBLIC ${PUBLIC_INCLUDES})
-target_link_libraries(execution_engine PUBLIC shm_utils)
+# 为 SIMD 模块添加编译器标志
+target_compile_options(fire_seed_cpp PRIVATE -mfma -mavx2)
 
-# 在线学习
-add_library(learning_engine STATIC
-    learning/ftrl_learner.cpp
-    learning/meta_learner.cpp
-    learning/stacking_ensemble.cpp
-)
-target_include_directories(learning_engine PUBLIC ${PUBLIC_INCLUDES})
-if(OpenMP_CXX_FOUND)
-    target_link_libraries(learning_engine PUBLIC OpenMP::OpenMP_CXX)
-endif()
-
-# 硬件监视器
-add_library(hard_watcher STATIC
-    monitoring/hard_watcher.cpp
-)
-target_include_directories(hard_watcher PUBLIC ${PUBLIC_INCLUDES})
-target_link_libraries(hard_watcher PUBLIC shm_utils)
-
-# 序列化与工具
-add_library(core_utils STATIC
-    utils/msgpack_serializer.cpp
-    utils/async_logger.cpp
-)
-target_include_directories(core_utils PUBLIC ${PUBLIC_INCLUDES})
-target_link_libraries(core_utils PUBLIC pthread)
-
-# --- Python 绑定模块 (pybind11) ------------------------------------------------
-pybind11_add_module(fire_seed_core
-    bindings.cpp
-)
-target_include_directories(fire_seed_core PRIVATE ${PUBLIC_INCLUDES})
-target_link_libraries(fire_seed_core PRIVATE
-    shm_utils
-    risk_engine
-    execution_engine
-    learning_engine
-    hard_watcher
-    core_utils
+# 设置 Python 扩展模块后缀（确保可被 Python 导入）
+set_target_properties(fire_seed_cpp PROPERTIES
+    SUFFIX ".so"
+    POSITION_INDEPENDENT_CODE ON
 )
 
-# 安装目标 (可选)
-install(TARGETS fire_seed_core DESTINATION lib/python/fire_seed)
+# ###############################
+# 安装规则
+# ###############################
+# 将编译产物安装到 Python 项目根目录（与 main.py 同层）
+install(TARGETS fire_seed_cpp
+    LIBRARY DESTINATION ${CMAKE_SOURCE_DIR}
+    ARCHIVE DESTINATION ${CMAKE_SOURCE_DIR}
+)
 
-# --- 测试 (可选) ---------------------------------------------------------------
-option(BUILD_TESTS "构建单元测试" OFF)
+# ###############################
+# 测试（可选）
+# ###############################
+option(BUILD_TESTS "Build C++ unit tests" OFF)
 if(BUILD_TESTS)
     enable_testing()
-    add_subdirectory(tests/cpp)
+    find_package(GTest REQUIRED)
+    add_subdirectory(tests)
 endif()
 
-# 打印配置信息
-message(STATUS "FireSeed Core Build Configuration:")
-message(STATUS "  C++ Standard: C++20")
-message(STATUS "  Build Type: ${CMAKE_BUILD_TYPE}")
-message(STATUS "  AVX2 Support: ${COMPILER_SUPPORTS_AVX2}")
-message(STATUS "  OpenMP: ${OpenMP_CXX_FOUND}")
-message(STATUS "  pybind11: ${pybind11_FOUND}")
+message(STATUS "FireSeed C++ module configured successfully")
