@@ -1,234 +1,169 @@
 # =============================================================================
-# 火种系统 · 策略参数池 (strategy_params.yaml)
-# 本文件定义所有策略模板的默认参数，支持金丝雀发布、A/B测试及版本管理。
-# 修改后可通过热重载即时生效，无需重启引擎。
+# 火种系统 (FireSeed) 策略参数配置
+# =============================================================================
+# 本文件定义所有策略的核心参数，支持按周期、行情模式（趋势/震荡）分层配置。
+# 系统运行时通过策略管理器动态读取这些参数，并可在幽灵影子中热校验。
 # =============================================================================
 
-# ----------------------------- 全局默认模式 -----------------------------
-global:
-  mode: moderate                     # 策略模式: aggressive (激进) | moderate (平稳)
-  version: "3.0.0"                  # 配置版本
-  last_updated: "2026-04-27"        # 最后更新日期
+# ---------------------------------------------------------------------------
+# 全局默认值 (当各策略未显式指定时使用)
+# ---------------------------------------------------------------------------
+global_defaults:
+  base_lot: 0.01            # 基础手数 (BTCUSDT)
+  max_leverage: 3           # 最大杠杆倍数
+  stop_mode: dynamic_atr    # 止损模式: fixed / dynamic_atr / pid_adaptive
+  take_profit_mode: volume_decay  # 止盈模式: fixed / volume_decay / multi_stage
 
-# ----------------------------- 激进与平稳模式配置映射 -----------------------------
-mode_profiles:
+# ---------------------------------------------------------------------------
+# 1分钟趋势压榨策略 (FireSeed 1m Trend)  -- 多模式共存参数
+# ---------------------------------------------------------------------------
+trend_1m:
+  # 通用参数
+  enabled: true
+  description: "四维共振进场+盈利加仓+非线性紧缩止损"
+  max_layers_hard: 20          # 硬性最大加仓次数
+  min_bars_between_adds: 3     # 加仓最小冷却K线数
+
+  # 激进模式参数 (strategy_mode: aggressive)
   aggressive:
-    score_threshold_long: 58         # 做多评分阈值 (满分100)
-    score_threshold_short: 42        # 做空评分阈值
-    position_multiplier: 1.2         # 仓位乘数
-    cooldown_bars: 2                 # 加仓冷却K线数
-    stop_atr_mult: 1.3               # 止损ATR倍数
-    max_entries: 3                   # 最大加仓次数
-    resonance_boost: 1.25            # 共振系数放大
+    entry:
+      resonance_prob_threshold: 58            # 四维共振最低评分阈值 (0-100)
+      obi_min: 0.30                            # 订单簿不平衡最低值
+      trend_freq_min: 0.008                    # 锁相环最低频率
+      volume_ratio_min: 1.0                   # 成交量相对20均线最低倍数
+    add_position:
+      profit_atr_threshold: 0.6              # 浮盈达到ATR倍数触发加仓
+      lot_ratios: [1.0, 1.2, 1.0, 0.7, 0.4, 0.4] # 第N次加仓手数相对首仓比例
+      cooldown_bar_factor: 1                 # 冷却K线数 = 当前层数 + 此值
+      max_risk_pct: 0.025                    # 总浮动亏损权益占比上限
+    stop_loss:
+      base_atr_mult: 1.3                     # 初始止损ATR倍数
+      min_atr_mult: 0.35                     # 最紧止损ATR倍数
+      layer_decay: 0.18                      # 每加一层止损衰减系数
+      profit_decay: 0.06                     # 每多1倍浮盈ATR，止损衰减系数
+    exhaustion:
+      enable_rsi_divergence: true
+      enable_delta_divergence: true
+      partial_close_pct: 0.5                 # T-1阶段平仓比例
+      final_close_pct: 1.0                   # T-0阶段平仓剩余全部
+
+  # 稳健模式参数 (strategy_mode: moderate)
   moderate:
-    score_threshold_long: 65
-    score_threshold_short: 35
-    position_multiplier: 1.0
-    cooldown_bars: 3
-    stop_atr_mult: 1.5
-    max_entries: 2
-    resonance_boost: 1.15
+    entry:
+      resonance_prob_threshold: 65
+      obi_min: 0.40
+      trend_freq_min: 0.015
+      volume_ratio_min: 1.3
+    add_position:
+      profit_atr_threshold: 0.8
+      lot_ratios: [1.0, 1.0, 0.8, 0.5, 0.3, 0.3]
+      cooldown_bar_factor: 2
+      max_risk_pct: 0.015
+    stop_loss:
+      base_atr_mult: 1.5
+      min_atr_mult: 0.4
+      layer_decay: 0.15
+      profit_decay: 0.04
+    exhaustion:
+      enable_rsi_divergence: true
+      enable_delta_divergence: true
+      partial_close_pct: 0.6
+      final_close_pct: 1.0
 
-# ----------------------------- 多周期策略配置 -----------------------------
-timeframes:
-  1m:
-    enabled: true
-    engine: trend                    # 趋势引擎类型
-    atr_period: 5
-    stop_multiplier: 1.5
-    max_entries: 3
-    cooldown_bars: 2
-    hull_ma_period: 9
-    weight_sets:                     # 不同市场状态下的因子权重集
-      trend:                         # 趋势市场
-        trend_strength: 0.30
-        vib_pressure: 0.25
-        ob_micro: 0.20
-        retest_quality: 0.15
-        volume_pulse: 0.10
-      oscillation:                   # 震荡市场
-        trend_strength: 0.10
-        vib_pressure: 0.15
-        ob_micro: 0.35
-        range_position: 0.25
-        pinbar: 0.15
-      high_vol:                      # 高波动市场
-        trend_strength: 0.15
-        vib_pressure: 0.20
-        vol_adapt: 0.30
-        env_regime: 0.20
-        risk_budget: 0.15
-  3m:
-    enabled: true
-    engine: trend
-    atr_period: 10
-    stop_multiplier: 1.8
-    max_entries: 2
-    cooldown_bars: 4
-    hull_ma_period: 12
-    weight_sets:
-      trend:
-        trend_strength: 0.35
-        vib_pressure: 0.20
-        ob_micro: 0.15
-        energy_ray: 0.15
-        env_regime: 0.15
-  5m:
-    enabled: true
-    engine: trend
-    atr_period: 14
-    stop_multiplier: 2.0
-    max_entries: 1
-    cooldown_bars: 6
-    hull_ma_period: 21
-    weight_sets:
-      trend:
-        trend_strength: 0.40
-        env_regime: 0.25
-        vol_adapt: 0.20
-        funding_env: 0.15
-  15m:
-    enabled: true
-    engine: macro                    # 宏观守护引擎
-    atr_period: 20
-    stop_multiplier: 3.0
-    max_entries: 1
-    cooldown_bars: 8
-    weight_sets:
-      trend:
-        trend_strength: 0.35
-        macro_factors: 0.30          # 稳定币市值、ETF净流入等
-        env_regime: 0.20
-        vol_adapt: 0.15
-
-# ----------------------------- 趋势策略子模块参数 -----------------------------
-trend_following:
-  entry_confirm_ticks: 3             # 突破确认Tick数
-  obi_entry_threshold_long: 0.4      # OBI做多阈值
-  obi_entry_threshold_short: -0.4    # OBI做空阈值
-  breakout_volume_mult: 1.5          # 突破成交量放大倍数要求
-  retest_score_strong: 0.75          # 回踩强加仓分界
-  retest_score_weak: 0.5             # 回踩弱加仓分界
-  exhaustion_flat_coeff: 0.75        # 衰减平仓系数 μ
-  cvd_acceleration_window: 10        # CVD加速度窗长(秒)
-  delta_divergence_threshold: 0.5    # Delta散度预警阈值
-  pid_kp: 0.6
-  pid_ki: 0.1
-  pid_kd: 0.2
-  trailing_stop_activation_profit: 0.3  # 移动止损触发所需浮盈百分比
-
-# ----------------------------- 震荡策略子模块参数 -----------------------------
+# ---------------------------------------------------------------------------
+# 震荡马丁策略 (Oscillation Martingale)
+# ---------------------------------------------------------------------------
 oscillation:
-  choppiness_threshold: 61.8         # CI震荡判定阈值
-  range_atr_mult: 1.5                # 网格边界ATR倍数
-  grid_levels: 3                     # 网格层数
-  obi_extreme_long: -0.5             # 下沿做多OBI极值
-  obi_extreme_short: 0.5             # 上沿做空OBI极值
-  take_profit_mid_pct: 0.3           # 首批止盈百分比 (MA12中线)
-  take_profit_far_pct: 0.5           # 二批止盈百分比 (区间上/下轨)
-  stop_outside_pct: 0.3              # 边界外止损偏移
-  tick_scalp_enabled: true            # 是否启用Tick级刮头皮
-  tick_scalp_consecutive: 5           # 连续同向笔数触发
-  tick_scalp_volume_mult: 1.5
-  tick_scalp_fixed_tp: 0.5           # 固定止盈百分比
+  enabled: true
+  description: "基于震荡识别、OBI极端值、动态ATR阶梯加仓的均值回归策略"
+  entry:
+    ci_min: 55.0               # Choppiness Index 最低值
+    hurst_bf_max: 3.0          # 赫斯特指数贝叶斯因子最大值 (反持久判定)
+    obi_long_threshold: -0.4   # 做多要求 OBI < -0.4 (极端卖压)
+    obi_short_threshold: 0.4   # 做空要求 OBI > 0.4
+    volume_spike_ratio: 1.3    # 成交量突增倍数
+    pin_bar_lower_wick_ratio: 0.7  # 下影线占比阈值
+  grid:
+    atr_band_mult: 1.5         # 区间宽度 = MA12 +/- ATR*band_mult
+    base_lot: 0.01
+    max_layers: 8              # 最大加仓次数
+    lot_growth: 1.3            # 加仓手数增长系数 (相对前一仓)
+    stop_loss: "区间边界外1.5倍ATR"  # 止损描述
+    tp_mode: "均价止盈"         # 止盈模式
+    tp_atr_mult: 0.5           # 止盈 ATR 倍数
+  risk:
+    daily_loss_limit_pct: 0.015   # 单日亏损占比上限
+    cool_after_consecutive_stop: 2  # 连续止损后冷却小时数
 
-# ----------------------------- 资金费率套利子模块参数 -----------------------------
-funding_arbitrage:
-  capital_allocation: 0.20           # 资金分配比例
-  entry_rate_positive: 0.15          # 正费率入场阈值 (%)
-  entry_rate_negative: -0.10         # 负费率入场阈值 (%)
-  basis_exit_pct: 0.5                # 基差扩大止盈/止损
-  max_holding_hours: 8
-  min_funding_rate_profit: 0.03      # 回归目标
+# ---------------------------------------------------------------------------
+# 资金费率套利策略
+# ---------------------------------------------------------------------------
+funding_arb:
+  enabled: true
+  description: "现货+合约对冲，赚取极端资金费率"
+  entry:
+    positive_rate_threshold: 0.0015   # 正费率入场阈值
+    negative_rate_threshold: -0.0010  # 负费率入场阈值
+    min_basis_pct: 0.2                # 最小基差要求
+  exit:
+    funding_back_to: 0.0003           # 费率回归至该水平出场
+    max_hold_hours: 8                 # 最长持仓时间
+    basis_emergency_close: 0.5        # 基差扩大至该百分比强制退出
+  capital_allocation: 0.20            # 占总权益的20%资金池
 
-# ----------------------------- 极端行情策略库参数 -----------------------------
-extreme_scenarios:
-  volatility_arbitrage:
-    enabled: true
-    trigger_atr_mult: 3.0            # 波动率超常触发倍数
-    stop_width: 0.03                 # 宽止损百分比
-    position_scale: 0.1              # 极小仓位
-  black_swan_recovery:
-    enabled: false                   # 默认关闭，需通过宏观情景激活
-    trigger_mmd: 5.0                 # 分布偏差马氏距离阈值
+# ---------------------------------------------------------------------------
+# 极端行情策略库 (黑天鹅/波动率套利)
+# ---------------------------------------------------------------------------
+extreme:
+  volatility_arb:
+    enabled: false                     # 默认不启用，由事件触发
+    trigger_vix_spike: 3.0            # 波动率突然飙升倍数
+    auto_activate: true                # 是否自动激活
+    position:
+      type: "strangle"                # 策略类型: 宽跨式
+      max_margin_pct: 0.10            # 最大保证金占比
+    exit:
+      vix_drop_ratio: 0.5             # 波动率回落比例
+      time_limit_hours: 24
 
-# ----------------------------- 学习与进化时段参数 -----------------------------
-learning_window:
-  start_hour: 1                      # 凌晨1点
-  start_minute: 30
-  end_hour: 4
-  end_minute: 30
-  nightmare_vol_mult: 2.0            # 惊梦波动率倍数
-  learning_mode_risk_reduction: 0.5  # 学习时段仓位减半
-  learning_mode_stop_mult: 0.7       # 止损收紧系数
+# ---------------------------------------------------------------------------
+# 参数版本管理与影子验证
+# ---------------------------------------------------------------------------
+shadow_validation:
+  # 新参数或策略上线前必须在幽灵环境中运行的最低小时数
+  min_hours: 24
+  # 统计显著性检验标准
+  t_test_alpha: 0.05
+  # 是否要求在所有市场状态下夏普均非负
+  require_regime_non_negative: true
+  # 悲观滑点调整系数 (在幽灵模拟中的滑点惩罚)
+  pessimistic_slippage_factor: 1.3
 
-# ----------------------------- 自进化引擎参数 -----------------------------
-evolution:
-  genetic_algorithm:
-    population_size: 50
-    generations: 20
-    immigration_rate: 0.15           # 外来野化基因比例
-    mutation_rate: 0.1
-    crossover_rate: 0.7
-  shadow_validation:
-    min_days: 7                      # 最小验证天数
-    significance_level: 0.05         # t检验α
-    impact_simulation: true
-    pessimistic_mode: true           # 悲观滑点实例
-  llm_factor_generation:
-    max_retries: 3
-    sandbox_timeout_sec: 30
-    economic_filter: true
-    monotonicity_test: true          # 单调性测试
+# ---------------------------------------------------------------------------
+# 因子权重校准 (动态权重引擎核心参数)
+# ---------------------------------------------------------------------------
+weight_calibration:
+  update_interval_hours: 24          # 权重更新间隔
+  ic_window_days: 20                 # IC计算窗口
+  decay_halflife: 15                 # 指数衰减半衰期 (天)
+  l2_lambda: 0.3                     # 权重平滑L2正则化强度
+  vol_freeze_percentile: 0.80        # 波动率超过历史80%分位时冻结权重
+  min_ic_threshold: 0.02             # 最低IC阈值，低于此值的因子权重不提升
+  fdr_q: 0.1                         # 错误发现率控制q值
+  conditional_fuzzy: true            # 是否启用模糊隶属度平滑
 
-# ----------------------------- 风控全局参数（引用risk_limits.yaml的默认值覆盖） -----------------------------
-risk_controls:
-  daily_loss_limit: 0.05             # 单日亏损硬性限额 (5%)
-  max_total_drawdown: 0.15           # 总回撤熔断
-  circuit_breaker_level1_amp: 0.03   # 一级熔断振幅
-  circuit_breaker_level2_amp: 0.05   # 二级熔断振幅
-  liquidity_depth_min_ratio: 0.5     # 深度衰减最低比值
-  max_slippage_per_trade: 0.0015     # 最大允许滑点
-
-# ----------------------------- 金丝雀发布参数 -----------------------------
-canary:
-  stages:
-    - weight: 0.01                   # 1%资金
-      duration_minutes: 1440         # 24小时
-    - weight: 0.10
-      duration_minutes: 1440
-    - weight: 1.0
-      duration_minutes: 0            # 全量后持续观察
-  health_checks:
-    min_sharpe: 0.5
-    max_drawdown: 0.05
-    min_winrate: 0.40
-    psi_limit: 0.25
-
-# ----------------------------- 多因子信号库开关（可动态组合） -----------------------------
-factor_toggles:
-  obi: true
-  obi_accel: true
-  cvd: true
-  cvd_accel: true
-  vib_buy_pressure: true
-  vib_sell_pressure: true
-  pll_frequency: true
-  pll_lock: true
-  hurst_bf: true
-  retest_score: true
-  volume_spike: true
-  iceberg_detect: true
-  pinbar: true
-  funding_rate_env: true
-  stablecoin_flow: false             # 默认关闭以节省计算
-  eft_flow: false
-  sentiment_nlp: false
-
-# ----------------------------- 策略组合优化参数 -----------------------------
-portfolio_optimizer:
-  method: "risk_parity"              # 可选: markowitz, risk_parity, equal_weight
-  rebalance_interval_minutes: 30
-  max_correlation: 0.7               # 策略间最大允许相关系数
-  dynamic_allocation: true
-  top_n_strategies: 5
+# ---------------------------------------------------------------------------
+# 多周期仲裁器参数
+# ---------------------------------------------------------------------------
+arbiter:
+  veto:
+    confidence_percentile: 95        # 大周期否决置信度分位数
+    cooldown_seconds: 1800           # 否决冷却期 (30分钟)
+    veto_correct_rate_freeze: 0.40   # 若否决后小周期正确率超40%，冻结否决
+  resonance:
+    min_effectiveness_ratio: 1.3     # 共振有效性比率阈值
+    min_confidence_above_median: true # 各周期评分需高于自身历史中位数
+    max_multiplier: 1.6              # 最大共振乘数
+  pre_veto:
+    enable: true                     # 启用大周期预判否决
+    completion_weight_factor: 0.7    # K线完成度权重衰减
