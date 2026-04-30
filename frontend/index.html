@@ -1,0 +1,599 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=yes, viewport-fit=cover">
+  <title>火种 · 交易生命体</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    }
+    body {
+      background: linear-gradient(145deg, #f4f7fc 0%, #e9eef4 100%);
+      min-height: 100vh;
+      padding-top: 54px;
+      display: flex;
+      flex-direction: column;
+      font-size: 0.9rem;
+      transition: filter 0.3s;
+    }
+    .welcome-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(255,255,255,0.98);
+      backdrop-filter: blur(20px);
+      z-index: 9999;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      opacity: 1;
+      transition: opacity 0.8s;
+    }
+    .welcome-overlay.hidden { opacity: 0; pointer-events: none; }
+    .welcome-text {
+      font-size: 2.2rem;
+      font-weight: 700;
+      background: linear-gradient(135deg, #2563eb, #0ea5e9);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      animation: welcomePulse 1.5s ease-in-out infinite;
+    }
+    @keyframes welcomePulse {
+      0% { transform: scale(1); }
+      50% { transform: scale(1.05); }
+      100% { transform: scale(1); }
+    }
+    .top-bar-fixed {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      z-index: 1000;
+      background: rgba(255,255,255,0.92);
+      backdrop-filter: blur(12px);
+      border-bottom: 1px solid rgba(0,0,0,0.05);
+      box-shadow: 0 4px 12px rgba(0,0,0,0.03);
+      padding: 4px 16px;
+    }
+    .top-status-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      white-space: nowrap;
+      font-size: 0.7rem;
+      font-weight: 600;
+      color: #1e293b;
+      gap: 12px;
+    }
+    .led {
+      display: inline-block;
+      width: 8px; height: 8px; border-radius: 50%; margin-right: 4px;
+    }
+    .led.green { background: #10b981; box-shadow: 0 0 8px #10b981; }
+    .led.yellow { background: #f59e0b; box-shadow: 0 0 8px #f59e0b; }
+    .led.red { background: #ef4444; box-shadow: 0 0 8px #ef4444; }
+    .marquee-fixed {
+      position: fixed;
+      top: 28px; left: 0; right: 0; z-index: 999;
+      background: #121826; color: #e2e8f0;
+      padding: 4px 16px; font-size: 0.65rem; white-space: nowrap;
+      overflow: hidden; border-bottom: 1px solid #2d3748;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+    }
+    .marquee-content {
+      display: inline-block; animation: scroll 25s linear infinite;
+    }
+    .marquee-content span { margin-right: 32px; }
+    .marquee-content i { color: #fbbf24; margin-right: 6px; }
+    @keyframes scroll { 0% { transform: translateX(0); } 100% { transform: translateX(-50%); } }
+    .page-container { width: 100%; padding: 0 12px; flex: 1; }
+    .cards-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 12px;
+    }
+    .card {
+      background: rgba(255,255,255,0.96);
+      backdrop-filter: blur(8px);
+      border-radius: 15px;
+      padding: 14px;
+      border: 1px solid rgba(255,255,255,0.9);
+      box-shadow: 0 12px 22px -8px rgba(0,0,0,0.06);
+      transition: all 0.25s;
+      cursor: pointer;
+      position: relative;
+      overflow: hidden;
+    }
+    .card:hover { transform: translateY(-2px); box-shadow: 0 18px 30px -8px rgba(0,0,0,0.12); border-color: #d9e2ef; }
+    .card:active { transform: scale(0.995); }
+    .card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+    .card-title { font-size: 0.9rem; font-weight: 700; color: #0b1120; }
+    .card-icon {
+      width: 32px; height: 32px; border-radius: 10px; display: flex; align-items: center; justify-content: center;
+      color: white; font-size: 16px; box-shadow: 0 8px 14px rgba(0,0,0,0.1);
+      background: linear-gradient(145deg, #3b82f6, #0ea5e9);
+    }
+    .row-flex { display: flex; justify-content: space-between; align-items: center; margin: 4px 0; }
+    .label { font-size: 0.7rem; color: #475569; font-weight: 500; }
+    .value { font-size: 0.85rem; font-weight: 700; color: #0f172a; text-align: right; }
+    .progress-wrap { margin: 4px 0; }
+    .progress-label { display: flex; justify-content: space-between; font-size: 0.65rem; color: #334155; }
+    .progress-bar { height: 5px; background: #e2e8f0; border-radius: 8px; overflow: hidden; }
+    .progress-fill { height: 100%; border-radius: 8px; transition: width 0.4s; }
+    .btn {
+      padding: 8px 14px; border-radius: 20px; font-weight: 600; border: none; cursor: pointer;
+      font-size: 0.75rem; background: #f1f5f9; color: #1e293b; transition: all 0.2s;
+    }
+    .btn-primary { background: #2563eb; color: white; }
+    .btn-switch { background: #10b981; color: white; }
+    .btn-switch.live { background: #ef4444; }
+    .card-emergency { background: #dc2626 !important; border-color: #b91c1c !important; color: white; }
+    .card-emergency .card-title, .card-emergency .label, .card-emergency .value { color: white; }
+    .order-card-span { grid-row: span 2; }
+    .behavior-log {
+      margin-top: 16px;
+      background: rgba(255,255,255,0.96); border-radius: 15px; padding: 10px 14px;
+      border: 1px solid rgba(255,255,255,0.9); box-shadow: 0 12px 22px -8px rgba(0,0,0,0.06);
+      position: relative;
+    }
+    .log-filter-btn {
+      position: absolute; top: 10px; right: 14px;
+      background: #e2e8f0; border: none; border-radius: 12px; padding: 4px 14px;
+      font-size: 0.7rem; font-weight: 600; cursor: pointer; transition: background 0.2s;
+    }
+    .log-filter-btn:hover { background: #cbd5e1; }
+    .log-dropdown {
+      position: absolute; top: 38px; right: 14px;
+      background: white; border-radius: 12px; box-shadow: 0 10px 25px rgba(0,0,0,0.1);
+      border: 1px solid #e2e8f0; z-index: 20; display: none; flex-direction: column;
+      min-width: 140px; padding: 4px 0;
+    }
+    .log-dropdown.show { display: flex; }
+    .log-dropdown button {
+      background: none; border: none; padding: 8px 16px; text-align: left;
+      font-size: 0.75rem; cursor: pointer; transition: background 0.15s;
+    }
+    .log-dropdown button:hover { background: #f1f5f9; }
+    .log-list { display: flex; flex-direction: column; max-height: 280px; overflow: hidden; }
+    .log-item {
+      font-size: 10px; color: #334155; padding: 3px 0;
+      border-bottom: 1px solid #f1f5f9; display: flex; align-items: baseline;
+      gap: 6px; animation: fadeSlideIn 0.2s;
+    }
+    @keyframes fadeSlideIn { 0% { opacity:0; transform:translateY(-4px); } 100% { opacity:1; transform:translateY(0); } }
+    .log-time { font-weight: 600; color: #64748b; min-width: 50px; }
+    .log-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+    .dot-strategy { background: #3b82f6; } .dot-risk { background: #ef4444; }
+    .dot-agent { background: #8b5cf6; } .dot-exec { background: #f59e0b; }
+    .dot-system { background: #10b981; }
+    .floating-btns {
+      position: fixed; bottom: 24px; right: 20px; display: flex; flex-direction: column;
+      gap: 12px; z-index: 1100;
+    }
+    .float-btn {
+      width: 48px; height: 48px; border-radius: 15px; border: none;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 20px; cursor: pointer; box-shadow: 0 14px 28px rgba(37,99,235,0.3);
+      background: rgba(37,99,235,0.9); backdrop-filter: blur(8px); color: white;
+      transition: all 0.2s;
+    }
+    .float-btn.ai-btn { background: rgba(14,165,233,0.9); }
+    .float-btn:hover { transform: scale(1.05); }
+    .float-btn:active { transform: scale(0.95); }
+    .secondary-page { display: none; }
+    .secondary-page.active { display: block; }
+    .sub-cards-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 12px;
+    }
+    @media (max-width: 768px) {
+      .sub-cards-grid { grid-template-columns: repeat(2, 1fr); }
+      .floating-btns { bottom: 16px; right: 10px; }
+    }
+    .ai-chat-card {
+      position: fixed; bottom: 100px; right: 20px;
+      width: 340px; max-height: 450px; background: white;
+      border-radius: 15px; box-shadow: 0 20px 40px rgba(0,0,0,0.15);
+      display: none; flex-direction: column; z-index: 1200;
+      overflow: hidden; border: 1px solid #e2e8f0;
+    }
+    .ai-chat-card.active { display: flex; }
+    .ai-chat-header {
+      padding: 12px; font-weight: 700; border-bottom: 1px solid #e2e8f0;
+      display: flex; justify-content: space-between; align-items: center;
+    }
+    .ai-chat-body { flex: 1; padding: 12px; overflow-y: auto; font-size: 0.8rem; }
+    .ai-chat-input { display: flex; border-top: 1px solid #e2e8f0; }
+    .ai-chat-input input { flex: 1; border: none; padding: 12px; outline: none; }
+    .ai-chat-input button { background: #2563eb; color: white; border: none; padding: 0 16px; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <div class="welcome-overlay" id="welcomeOverlay">
+    <div class="welcome-text">欢迎来到火种交易生命体</div>
+  </div>
+
+  <div class="top-bar-fixed">
+    <div class="top-status-row">
+      <span><span class="label">BIN</span> <span class="led green" id="ledLat"></span><span id="latText">12ms</span></span>
+      <span><span class="label">LOSS</span> <span id="lossText">0.02%</span></span>
+      <span><span class="label">CPU</span> <span id="cpuVal">22%</span></span>
+      <span><span class="label">MEM</span> <span id="memVal">3.2/8G</span></span>
+      <span><span class="label">SSD</span> <span id="diskVal">41%</span></span>
+    </div>
+  </div>
+
+  <div class="marquee-fixed">
+    <div class="marquee-content" id="marqueeInner">
+      <span><i class="fas fa-chart-line"></i> BTC 63200 · 趋势延续</span>
+      <span><i class="fas fa-shield"></i> 回撤 4.2% / 预警 8%</span>
+      <span><i class="fas fa-crown"></i> 权重得分 8.6</span>
+      <span><i class="fas fa-clock"></i> 下次议会 03:12:45</span>
+      <span><i class="fas fa-moon"></i> 学习守卫 休眠中</span>
+    </div>
+  </div>
+
+  <div id="appRoot" class="page-container">
+    <div id="homePage">
+      <div class="cards-grid" id="mainCards"></div>
+      <div class="behavior-log" id="behaviorLogContainer"></div>
+    </div>
+    <div id="detailPage" class="secondary-page"></div>
+  </div>
+
+  <div class="floating-btns">
+    <button class="float-btn ai-btn" id="aiToggleBtn" title="火种助手">AI</button>
+    <button class="float-btn" id="backBtn" style="display:none;" title="返回主界面"><i class="fas fa-arrow-left"></i></button>
+  </div>
+
+  <div class="ai-chat-card" id="aiChatCard">
+    <div class="ai-chat-header">
+      <span>火种助手</span>
+      <button style="background:none;border:none;cursor:pointer;" id="aiCloseBtn"><i class="fas fa-times"></i></button>
+    </div>
+    <div class="ai-chat-body" id="aiChatBody">
+      <div>🤖 你好，我是火种助手。可以向我查询系统状态、分析订单或调整策略。</div>
+    </div>
+    <div class="ai-chat-input">
+      <input type="text" id="aiInput" placeholder="输入指令...">
+      <button id="aiSendBtn">发送</button>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/petite-vue@0.4.1/dist/petite-vue.iife.js"></script>
+  <script>
+    // ---------- 欢迎动画 ----------
+    setTimeout(() => {
+      document.getElementById('welcomeOverlay').classList.add('hidden');
+    }, 2000);
+
+    // ---------- 模拟数据 ----------
+    const mockData = {
+      account: { equity: 531200, available: 412000, pnl: 14200, marginRate: '245%', netRate: '92%', fundingCost: -320 },
+      risk: { drawdown: 4.2, drawdownWarn: 8, dailyLoss: 1.8, dailyLimit: 5, var99: 12600, cvar: 15800 },
+      trades: { today: 16, winRate: 74, profit: 14200 },
+      mode: { broker: 'virtual', strategy: 'moderate', currentAccount: 'main' },
+      accounts: ['main', 'sub1', 'sub2', 'sub3'],
+      health: { score: 88, cpuTemp: '52°C', diskIO: '12ms', uptime: '7d 3h', status: '良好' },
+      entropy: { score: 42, redundantCode: '3.2%', unusedFactors: 5, evolveFailRate: '18%', shadowReject: '22%', agentAbstain: '4%' },
+      ai: { upload: 78, decision: 82, learn: 45 },
+      council: { dominant: '屯币者', bias: '偏多', consensus: 78, next: '03:12:45' },
+      recentTrades: [
+        { time:'14:35', pair:'BTCUSDT', side:'多', price:63250, qty:0.10, pnl:'+$180' },
+        { time:'14:32', pair:'BTCUSDT', side:'多', price:63200.5, qty:0.12, pnl:'+$340' },
+        { time:'14:28', pair:'ETHUSDT', side:'空', price:4210.2, qty:1.5, pnl:'+$220' },
+        { time:'14:15', pair:'BTCUSDT', side:'多', price:63150, qty:0.14, pnl:'+$180' },
+        { time:'13:50', pair:'SOLUSDT', side:'多', price:142.3, qty:20, pnl:'-$45' },
+        { time:'13:30', pair:'BTCUSDT', side:'空', price:63080, qty:0.1, pnl:'+$120' },
+        { time:'13:10', pair:'ETHUSDT', side:'多', price:4180, qty:2.0, pnl:'+$300' },
+        { time:'12:45', pair:'BTCUSDT', side:'空', price:62900, qty:0.05, pnl:'+$80' },
+        { time:'12:20', pair:'SOLUSDT', side:'空', price:140.5, qty:15, pnl:'+$65' },
+        { time:'11:55', pair:'ETHUSDT', side:'多', price:4150, qty:1.8, pnl:'-$200' },
+        { time:'11:30', pair:'BTCUSDT', side:'多', price:62800, qty:0.2, pnl:'+$500' },
+        { time:'10:50', pair:'BTCUSDT', side:'空', price:62750, qty:0.08, pnl:'-$90' },
+      ],
+    };
+
+    const logPools = {
+      order: [
+        { time:'14:35', dot:'dot-exec', msg:'订单成交 BTCUSDT 多 0.1 @63250' },
+        { time:'14:32', dot:'dot-exec', msg:'订单成交 BTCUSDT 多 0.12 @63200.5' },
+        { time:'14:28', dot:'dot-exec', msg:'订单成交 ETHUSDT 空 1.5 @4210.2' },
+      ],
+      system: [{ time:'14:30', dot:'dot-system', msg:'系统自检通过 CNN/SHM/DB' }],
+      agent: [{ time:'14:10', dot:'dot-agent', msg:'监察者：OBI因子PSI异常 0.38' }],
+      risk: [{ time:'14:22', dot:'dot-risk', msg:'流动性监控: 深度下降 8%' }],
+      evolution: [{ time:'03:15', dot:'dot-strategy', msg:'新因子进入影子验证' }],
+      council: [{ time:'02:30', dot:'dot-agent', msg:'议会投票通过 风险预算上调' }],
+      shadow: [{ time:'01:00', dot:'dot-strategy', msg:'幽灵对比: 新版夏普 1.35 vs 旧版 1.28' }],
+      strategy: [{ time:'14:32', dot:'dot-strategy', msg:'四维共振评分71 触发做多' }],
+    };
+
+    let currentLogFilter = 'order';
+    let navStack = [];
+
+    function getLogs(filter) { return logPools[filter] || []; }
+    function getFilterLabel(key) {
+      const map = { order:'订单管理', system:'系统状态', agent:'智能体', risk:'风险评估', evolution:'进化管理', council:'议会状态', shadow:'影子模式', strategy:'策略状态' };
+      return map[key] || key;
+    }
+
+    // ---------- 渲染主界面 ----------
+    function renderMainCards() {
+      const grid = document.getElementById('mainCards');
+      const mode = mockData.mode;
+      const acc = mockData.account;
+      const risk = mockData.risk;
+      const trades = mockData.trades;
+      const health = mockData.health;
+      const entropy = mockData.entropy;
+      const ai = mockData.ai;
+      const council = mockData.council;
+      grid.innerHTML = `
+        <div class="card" onclick="navigateTo('accountDetail')">
+          <div class="card-header"><span class="card-title">账户仪表盘</span><div class="card-icon"><i class="fas fa-wallet"></i></div></div>
+          <div class="row-flex"><span class="label">总权益</span><span class="value">$${(acc.equity/1000).toFixed(1)}k</span></div>
+          <div class="row-flex"><span class="label">浮动盈亏</span><span class="value" style="color:#10b981;">+$${(acc.pnl/1000).toFixed(1)}k</span></div>
+          <div class="row-flex"><span class="label">保证金率</span><span class="value">${acc.marginRate}</span></div>
+          <div class="row-flex"><span class="label">当前账户</span><span class="value">${mode.currentAccount}</span></div>
+          <button class="btn btn-switch" onclick="event.stopPropagation(); switchAccount();" style="margin-top:6px;width:100%;">切换账户</button>
+        </div>
+        <div class="card" onclick="navigateTo('tradesStats')">
+          <div class="card-header"><span class="card-title">交易统计</span><div class="card-icon" style="background:linear-gradient(145deg,#ea580c,#c2410c);"><i class="fas fa-chart-simple"></i></div></div>
+          <div class="row-flex"><span class="label">今日成交</span><span class="value">${trades.today}笔</span></div>
+          <div class="row-flex"><span class="label">胜率</span><span class="value">${trades.winRate}%</span></div>
+          <div class="row-flex"><span class="label">盈利</span><span class="value" style="color:#10b981;">+$${trades.profit.toLocaleString()}</span></div>
+          <button class="btn btn-switch ${mode.broker==='live'?'live':''}" id="btnBroker" onclick="event.stopPropagation(); toggleBroker();" style="margin-top:6px;width:100%;">${mode.broker==='virtual'?'虚拟':'实盘'}</button>
+        </div>
+        <div class="card" onclick="navigateTo('risk')">
+          <div class="card-header"><span class="card-title">风险监控</span><div class="card-icon" style="background:linear-gradient(145deg,#f97316,#ea580c);"><i class="fas fa-shield-halved"></i></div></div>
+          <div class="progress-wrap"><div class="progress-label"><span>回撤 ${risk.drawdown}%</span><span>预警 ${risk.drawdownWarn}%</span></div><div class="progress-bar"><div class="progress-fill" style="width:${(risk.drawdown/risk.drawdownWarn)*100}%; background:#f59e0b;"></div></div></div>
+          <div class="progress-wrap"><div class="progress-label"><span>日亏损 ${risk.dailyLoss}%</span><span>熔断 ${risk.dailyLimit}%</span></div><div class="progress-bar"><div class="progress-fill" style="width:${(risk.dailyLoss/risk.dailyLimit)*100}%; background:#ef4444;"></div></div></div>
+        </div>
+        <div class="card card-emergency" onclick="emergencyClose()">
+          <div class="card-header"><span class="card-title">紧急干预</span></div>
+          <div class="row-flex"><span class="label">一键平仓</span><span class="value">全部</span></div>
+        </div>
+        <div class="card" style="cursor:default;">
+          <div class="card-header"><span class="card-title">收益曲线</span></div>
+          <div style="height:100px;"><canvas id="miniChart"></canvas></div>
+        </div>
+        <div class="card order-card-span" id="orderCard">
+          <div class="card-header"><span class="card-title">订单管理</span><div class="card-icon" style="background:linear-gradient(145deg,#0ea5e9,#0284c7);"><i class="fas fa-list-check"></i></div></div>
+          <div style="max-height:310px; overflow-y:auto;" id="orderListContainer"></div>
+        </div>
+        <div class="card" onclick="navigateTo('aiEvolution')">
+          <div class="card-header"><span class="card-title">AI上进心</span><div class="card-icon" style="background:linear-gradient(145deg,#dc2626,#b91c1c);"><i class="fas fa-rocket"></i></div></div>
+          <div class="progress-wrap"><div class="progress-label"><span>决策</span><span>${ai.decision}%</span></div><div class="progress-bar"><div class="progress-fill" style="width:${ai.decision}%;"></div></div></div>
+          <div class="progress-wrap"><div class="progress-label"><span>学习</span><span>${ai.learn}%</span></div><div class="progress-bar"><div class="progress-fill" style="width:${ai.learn}%; background:#10b981;"></div></div></div>
+        </div>
+        <div class="card" onclick="navigateTo('entropy')">
+          <div class="card-header"><span class="card-title">系统熵值</span><div class="card-icon" style="background:linear-gradient(145deg,#a855f7,#7c3aed);"><i class="fas fa-chaos"></i></div></div>
+          <div class="row-flex"><span class="label">熵增指数</span><span class="value">${entropy.score}/100</span></div>
+          <div class="progress-wrap"><div class="progress-bar"><div class="progress-fill" style="width:${entropy.score}%; background:#a855f7;"></div></div></div>
+          <div class="row-flex"><span class="label">冗余代码</span><span class="value">${entropy.redundantCode}</span></div>
+          <div class="row-flex"><span class="label">未用因子</span><span class="value">${entropy.unusedFactors}</span></div>
+        </div>
+        <div class="card" onclick="navigateTo('health')">
+          <div class="card-header"><span class="card-title">系统健康度</span><div class="card-icon" style="background:linear-gradient(145deg,#10b981,#059669);"><i class="fas fa-heartbeat"></i></div></div>
+          <div class="row-flex"><span class="label">健康评分</span><span class="value">${health.score}/100</span></div>
+          <div class="progress-wrap"><div class="progress-bar"><div class="progress-fill" style="width:${health.score}%; background:#10b981;"></div></div></div>
+          <div class="row-flex"><span class="label">CPU温度</span><span class="value">${health.cpuTemp}</span></div>
+          <div class="row-flex"><span class="label">磁盘IO</span><span class="value">${health.diskIO}</span></div>
+          <div class="row-flex"><span class="label">运行时间</span><span class="value">${health.uptime}</span></div>
+        </div>
+        <div class="card" style="grid-column: span 2;" onclick="navigateTo('systemEnv')">
+          <div class="card-header"><span class="card-title">系统环境</span><div class="card-icon" style="background:#0f172a;"><i class="fas fa-microchip"></i></div></div>
+          <div class="row-flex"><span class="label">版本 v3.0.0-spartan</span><span class="value">点击进入</span></div>
+        </div>
+      `;
+      renderOrderList();
+      setTimeout(renderMiniChart, 50);
+    }
+
+    function renderOrderList() {
+      const container = document.getElementById('orderListContainer');
+      if (!container) return;
+      const trades = mockData.recentTrades.slice(0, 12);
+      container.innerHTML = trades.map(t => `
+        <div class="row-flex" style="font-size:0.7rem; padding:3px 0;">
+          <span>${t.time}</span>
+          <span style="color:${t.side==='多'?'#10b981':'#ef4444'};">${t.side}</span>
+          <span>${t.pair}</span>
+          <span style="color:${t.pnl.startsWith('+')?'#10b981':'#ef4444'};">${t.pnl}</span>
+        </div>
+      `).join('');
+    }
+
+    function renderMiniChart() {
+      const canvas = document.getElementById('miniChart');
+      if (!canvas) return;
+      const ctx = canvas.getContext('2d');
+      const data = [];
+      for (let i=30; i>=0; i--) data.push(500000 + (Math.random()-0.4)*10000);
+      if (canvas._chart) canvas._chart.destroy();
+      canvas._chart = new Chart(ctx, {
+        type: 'line',
+        data: {
+          labels: Array.from({length:31}, (_,i)=>''),
+          datasets: [{
+            data,
+            borderColor: '#2563eb',
+            borderWidth: 2,
+            pointRadius: 0,
+            tension: 0.3,
+            fill: false
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: { legend:{display:false}, tooltip:{enabled:false} },
+          scales: { x:{display:false}, y:{display:false} }
+        }
+      });
+    }
+
+    // ---------- 行为日志 ----------
+    function renderBehaviorLog() {
+      const container = document.getElementById('behaviorLogContainer');
+      const logs = getLogs(currentLogFilter);
+      container.innerHTML = `
+        <h3 style="margin-bottom:8px;">📋 行为日志</h3>
+        <button class="log-filter-btn" id="logFilterBtn">${getFilterLabel(currentLogFilter)} <i class="fas fa-chevron-down"></i></button>
+        <div class="log-dropdown" id="logDropdown">
+          ${['order','system','agent','risk','evolution','council','shadow','strategy'].map(k => `
+            <button onclick="switchLogFilter('${k}')">${getFilterLabel(k)}</button>
+          `).join('')}
+        </div>
+        <div class="log-list" id="logList"></div>
+      `;
+      document.getElementById('logFilterBtn').addEventListener('click', (e) => {
+        e.stopPropagation();
+        document.getElementById('logDropdown').classList.toggle('show');
+      });
+      document.addEventListener('click', () => {
+        document.getElementById('logDropdown')?.classList.remove('show');
+      });
+      const list = document.getElementById('logList');
+      list.innerHTML = logs.map(l => `
+        <div class="log-item">
+          <span class="log-time">${l.time}</span>
+          <span class="log-dot ${l.dot}"></span>
+          <span>${l.msg}</span>
+        </div>
+      `).join('');
+    }
+
+    window.switchLogFilter = function(key) {
+      currentLogFilter = key;
+      renderBehaviorLog();
+    };
+
+    // ---------- 二级页面 ----------
+    function renderSystemEnvPage() {
+      const detail = document.getElementById('detailPage');
+      const programs = [
+        { name:'系统日志中心', icon:'fa-scroll', bg:'#0f172a', status:'正常运行' },
+        { name:'多周期状态', icon:'fa-wave-square', bg:'#8b5cf6', status:'1m多 3m多' },
+        { name:'AI上进心', icon:'fa-rocket', bg:'#dc2626', status:'决策82%' },
+        { name:'进化议会', icon:'fa-users', bg:'#8b5cf6', status:'屯币者主导' },
+        { name:'学习成果', icon:'fa-moon', bg:'#059669', status:'2个新因子' },
+        { name:'消息中心', icon:'fa-bell', bg:'#f59e0b', status:'3条未读' },
+        { name:'系统自检', icon:'fa-check-circle', bg:'#10b981', status:'全部通过' },
+        { name:'策略矩阵', icon:'fa-chess-board', bg:'#2563eb', status:'4个运行中' },
+        { name:'风险矩阵', icon:'fa-shield-halved', bg:'#ef4444', status:'VaR 12.6k' },
+        { name:'测试中心', icon:'fa-flask', bg:'#a855f7', status:'最后测试: 06:00' },
+        { name:'API管理', icon:'fa-key', bg:'#f97316', status:'3密钥有效' },
+        { name:'配置管理', icon:'fa-sliders', bg:'#64748b', status:'已保存' },
+        { name:'仓位管理', icon:'fa-boxes', bg:'#0ea5e9', status:'总敞口 0.26BTC' },
+        { name:'行为日志', icon:'fa-scroll', bg:'#334155', status:'归档中' },
+        { name:'外部审计', icon:'fa-check-double', bg:'#d946ef', status:'62天后' },
+        { name:'学习守卫', icon:'fa-brain', bg:'#10b981', status:'休眠中' },
+        { name:'云存储', icon:'fa-cloud', bg:'#38bdf8', status:'已同步' },
+        { name:'系统熵值', icon:'fa-chaos', bg:'#7c3aed', status:'42/100' },
+        { name:'版本与OTA', icon:'fa-code-branch', bg:'#1e293b', status:'v3.0.0-spartan' },
+        { name:'订单管理', icon:'fa-list-check', bg:'#0ea5e9', status:'12笔记录' },
+      ];
+      detail.innerHTML = `
+        <h2 style="margin:16px 0;">系统环境 · 二级模块</h2>
+        <div class="sub-cards-grid">
+          ${programs.map(p => `
+            <div class="card" onclick="navigateTo('${p.name}')">
+              <div class="card-header">
+                <span class="card-title">${p.name}</span>
+                <div class="card-icon" style="background:${p.bg};"><i class="fas ${p.icon}"></i></div>
+              </div>
+              <div class="row-flex"><span class="label">最近状态</span><span class="value">${p.status}</span></div>
+            </div>
+          `).join('')}
+        </div>
+      `;
+    }
+
+    function navigateTo(key) {
+      if (key === 'systemEnv') {
+        document.getElementById('homePage').style.display = 'none';
+        document.getElementById('detailPage').classList.add('active');
+        document.getElementById('backBtn').style.display = 'flex';
+        renderSystemEnvPage();
+        navStack.push('systemEnv');
+      } else if (key === 'home') {
+        document.getElementById('homePage').style.display = 'block';
+        document.getElementById('detailPage').classList.remove('active');
+        document.getElementById('backBtn').style.display = 'none';
+        navStack = [];
+      } else if (key === 'health') {
+        // 模拟运行检测
+        mockData.health.score = Math.floor(Math.random() * 15) + 80;
+        mockData.health.cpuTemp = (45 + Math.random() * 20).toFixed(0) + '°C';
+        renderMainCards();
+      } else {
+        alert(`进入 ${key} 页面 (开发中)`);
+      }
+    }
+
+    document.getElementById('backBtn').addEventListener('click', () => navigateTo('home'));
+
+    window.toggleBroker = function() {
+      mockData.mode.broker = mockData.mode.broker === 'virtual' ? 'live' : 'virtual';
+      renderMainCards();
+    };
+
+    window.switchAccount = function() {
+      const idx = mockData.accounts.indexOf(mockData.mode.currentAccount);
+      const nextIdx = (idx + 1) % mockData.accounts.length;
+      mockData.mode.currentAccount = mockData.accounts[nextIdx];
+      renderMainCards();
+    };
+
+    window.emergencyClose = function() {
+      if (confirm('确认一键平仓所有持仓？')) alert('平仓指令已发送');
+    };
+
+    // ---------- AI助手 ----------
+    document.getElementById('aiToggleBtn').addEventListener('click', () => {
+      document.getElementById('aiChatCard').classList.toggle('active');
+    });
+    document.getElementById('aiCloseBtn').addEventListener('click', () => {
+      document.getElementById('aiChatCard').classList.remove('active');
+    });
+    document.getElementById('aiSendBtn').addEventListener('click', () => {
+      const input = document.getElementById('aiInput');
+      const msg = input.value.trim();
+      if (!msg) return;
+      const body = document.getElementById('aiChatBody');
+      body.innerHTML += `<div style="margin:4px 0"><strong>你:</strong> ${msg}</div>`;
+      input.value = '';
+      setTimeout(() => {
+        body.innerHTML += `<div style="margin:4px 0; color:#2563eb;"><strong>火种:</strong> 收到，正在处理 "${msg}"。</div>`;
+        body.scrollTop = body.scrollHeight;
+      }, 300);
+    });
+
+    // ---------- 状态栏更新 ----------
+    setInterval(() => {
+      document.getElementById('latText').innerText = (10+Math.floor(Math.random()*20)) + 'ms';
+      const loss = (Math.random()*0.1).toFixed(2);
+      document.getElementById('lossText').innerText = loss + '%';
+      document.getElementById('cpuVal').innerText = (20+Math.floor(Math.random()*30)) + '%';
+      document.getElementById('memVal').innerText = (3.0+Math.random()*1.5).toFixed(1) + '/8G';
+      document.getElementById('diskVal').innerText = (40+Math.floor(Math.random()*10)) + '%';
+      const led = document.getElementById('ledLat');
+      const lat = parseInt(document.getElementById('latText').innerText);
+      led.className = 'led ' + (lat < 30 ? 'green' : lat < 60 ? 'yellow' : 'red');
+    }, 3000);
+
+    // 初始渲染
+    renderMainCards();
+    renderBehaviorLog();
+  </script>
+</body>
+</html>
+```
