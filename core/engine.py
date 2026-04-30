@@ -1,121 +1,346 @@
 #!/usr/bin/env python3
 """
-火种核心交易引擎
-- 异步事件驱动
-- 管理多周期策略实例
-- 热插拔支持
-- 学习时段自动降级
-"""
-import asyncio
-import signal
-import sys
-import argparse
-from pathlib import Path
-from datetime import datetime
+火种系统 (FireSeed) 核心交易引擎
+==================================
+主事件循环负责：
+- 行情接收与分发 (多交易所、多周期)
+- 感知层调用 (粒子滤波、锁相环、VIB)
+- 策略决策 (多因子评分、仲裁、状态机)
+- 风险校验 (硬实时C++模块 + Python风控)
+- 订单执行 (网关、TWAP、冰山)
+- 幽灵影子管理
+- 行为日志记录
+- 每日任务调度
 
-# 本地模块
-from core.data_feed import DataFeed
+运行方式:
+    python engine.py --mode live    # 实盘
+    python engine.py --mode virtual # 虚拟盘
+    python engine.py --mode ghost   # 幽灵回放
+"""
+
+import asyncio
+import os
+import signal
+import time
+import traceback
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Dict, Optional, Any
+
+# ---------- 火种核心模块 ----------
+from config.loader import ConfigLoader
+from core.data_feed import MarketDataFeed
 from core.order_manager import OrderManager
 from core.execution import ExecutionGateway
 from core.risk_monitor import RiskMonitor
-from core.scorecard import FusionScoreCard
-from core.multi_tf_arbiter_v2 import CognitivelyEnhancedArbiter
-from core.self_check import run_self_check
-from core.daily_tasks import schedule_daily_tasks
-from core.intelligent_learning_guard import LearningGuard
+from core.scorecard import DynamicScoreCard
+from core.perception import PerceptionFusion
+from core.state_machine import TradingStateMachine
+from core.conditional_weight import ConditionalWeightEngine
+from core.multi_tf_arbiter_v2 import MultiTFArbiter
+from core.context_isolator import ContextFactory
+from core.continuous_position import ContinuousPositionController
 from core.plugin_manager import PluginManager
-from config.settings import load_settings
+from core.self_check import SystemSelfCheck
+from core.daily_tasks import DailyTaskScheduler
+from core.intelligent_learning_guard import LearningGuard
+from core.behavioral_logger import BehavioralLogger, EventType
+from core.lazy_evaluator import LazyFactorEvaluator
+from core.compute_scheduler import ComputeScheduler
+from core.copy_trading import CopyTradingEngine
+from agents.council import AgentCouncil
+from ghost.shadow_manager import ShadowManager
+from ota.updater import OTAUpdater
+from cold_storage.archiver import ColdArchiver
+from assistant.llm_gateway import LLMGateway
+from integrations.messenger_hub import MessengerHub
+from core.notifier import SystemNotifier
+from utils.logger import setup_logging
+
+# 尝试加载C++高性能模块
+try:
+    from cpp.bindings import RealtimeGuard, JumpDetector, IncrementalCovariance  # type: ignore
+    CPP_AVAILABLE = True
+except ImportError:
+    CPP_AVAILABLE = False
+    RealtimeGuard = None
+    JumpDetector = None
+    IncrementalCovariance = None
+
 
 class FireSeedEngine:
-    def __init__(self, config_path: str):
-        self.settings = load_settings(config_path)
-        self.running = True
-        self.data_feed = DataFeed(self.settings)
-        self.order_manager = OrderManager()
-        self.executor = ExecutionGateway(self.order_manager, self.data_feed)
-        self.risk_monitor = RiskMonitor()
-        self.scorecard = FusionScoreCard()
-        self.arbiter = CognitivelyEnhancedArbiter()
-        self.learning_guard = LearningGuard()
-        self.plugin_manager = PluginManager()
-        self._shutdown_event = asyncio.Event()
+    """火种交易引擎单例"""
 
-    async def initialize(self):
-        """异步初始化各个模块"""
-        await self.data_feed.start()
-        self.plugin_manager.discover_and_load()
-        self.risk_monitor.initialize()
-        # 启动每日任务调度
-        asyncio.create_task(schedule_daily_tasks(self))
-        # 启动每小时自检
-        asyncio.create_task(self._periodic_self_check())
+    def __init__(self, config_path: str = "config/settings.yaml"):
+        self.config = ConfigLoader(config_path)
+        self.log = setup_logging("engine", self.config.get("system.log_level", "INFO"))
+        self._running = True
+        self._shutting_down = False
 
-    async def _periodic_self_check(self):
-        while self.running:
-            await asyncio.sleep(3600)
-            report = run_self_check(self)
-            if not report['healthy']:
-                self.risk_monitor.trigger_alert("自检失败", report)
+        # ------------------------- 核心组件 -------------------------
+        self.data_feed = MarketDataFeed(self.config)
+        self.order_mgr = OrderManager(self.config)
+        self.execution = ExecutionGateway(self.config, self.order_mgr)
+        self.risk_monitor = RiskMonitor(self.config, self.order_mgr)
+        self.scorecard = DynamicScoreCard(self.config)
+        self.perception = PerceptionFusion(self.config)
+        self.state_machine = TradingStateMachine(self.config)
+        self.weight_engine = ConditionalWeightEngine(self.config)
+        self.arbiter = MultiTFArbiter(self.config)
+        self.ctx_factory = ContextFactory(self.config)
+        self.position_ctrl = ContinuousPositionController(self.config)
+        self.plugin_mgr = PluginManager(self.config)
+        self.self_check = SystemSelfCheck(self.config)
+        self.daily_tasks = DailyTaskScheduler(self.config)
+        self.learning_guard = LearningGuard(self.config)
+        self.behavior_log = BehavioralLogger()
+        self.lazy_evaluator = LazyFactorEvaluator(self.config)
+        self.compute_scheduler = ComputeScheduler(self.config)
+        self.copy_trading = CopyTradingEngine(self.config)
 
-    async def on_tick(self, tick):
-        """行情更新入口"""
-        if not self.running:
-            return
+        # 智能体议会
+        self.agent_council = AgentCouncil(self.config)
+        # 幽灵影子
+        self.shadow_mgr = ShadowManager(self.config)
+        # OTA
+        self.ota_updater = OTAUpdater(self.config)
+        # 冷存储
+        self.cold_archiver = ColdArchiver(self.config)
+        # LLM网关
+        self.llm_gateway = LLMGateway(self.config)
+        # 消息推送
+        self.messenger = MessengerHub(self.config)
+        self.notifier = SystemNotifier(self.messenger)
 
-        # 学习时段自动降级
-        if self.learning_guard.is_night_time:
-            self.learning_guard.apply_night_mode(self)
-        elif self.learning_guard.check_nightmare(tick.volatility, self.data_feed.avg_volatility):
-            self.learning_guard.wake_up(self)
+        # ------------------------- C++ 模块 (可选) -------------------------
+        self.cpp_guard: Optional[RealtimeGuard] = None
+        self.cpp_jump: Optional[JumpDetector] = None
+        self.cpp_covar: Optional[IncrementalCovariance] = None
+        if CPP_AVAILABLE:
+            self.cpp_guard = RealtimeGuard()
+            self.cpp_jump = JumpDetector()
+            self.cpp_covar = IncrementalCovariance(20)
+            self.log.info("C++ 高性能模块加载成功")
 
-        # 多周期计算与仲裁
-        signals = {}
-        for tf in self.active_timeframes:
-            signal = self.scorecard.evaluate(tick, tf)
-            if signal:
-                self.arbiter.collect_signal(tf, signal)
+        # 运行模式: live / virtual / ghost
+        self.mode = self.config.get("system.mode", "virtual")
+        # 注册信号处理
+        signal.signal(signal.SIGTERM, self._signal_handler)
+        signal.signal(signal.SIGINT, self._signal_handler)
 
-        final_signal = self.arbiter.evaluate(position_state=self.order_manager.position)
-        if final_signal:
-            await self.executor.execute(final_signal)
+    def _signal_handler(self, signum, frame):
+        self.log.warning(f"接收到信号 {signum}，开始优雅退出...")
+        self._running = False
 
     async def run(self):
-        """主循环"""
-        await self.initialize()
-        self.running = True
-        while self.running:
+        """主事件循环"""
+        self.log.info(f"火种引擎启动于 {self.mode} 模式")
+
+        # 启动数据源
+        await self.data_feed.start()
+        # 启动C++实时保护线程
+        if self.cpp_guard:
+            self.cpp_guard.start()
+        # 启动后台任务
+        asyncio.create_task(self._background_tasks())
+        # 启动OTA检查
+        asyncio.create_task(self._ota_check_loop())
+        # 启动冷归档
+        asyncio.create_task(self._cold_archive_loop())
+
+        # 最后记录时间戳
+        last_minute = None
+
+        while self._running:
             try:
-                tick = await self.data_feed.get_next_tick()
-                await self.on_tick(tick)
+                # 获取当前Tick
+                tick = await self.data_feed.get_next_tick(timeout=0.5)
+                if tick is None:
+                    continue
+
+                now = tick.timestamp
+                current_minute = now.replace(second=0, microsecond=0)
+
+                # 每分钟执行一次 (新K线闭合)
+                if current_minute != last_minute:
+                    last_minute = current_minute
+                    await self._on_new_minute(tick)
+                else:
+                    # 同1分钟内，做高频轻量处理 (仅更新部分指标)
+                    await self._on_tick(tick)
+
+                # 心跳写入C++监视器
+                if self.cpp_guard:
+                    self.cpp_guard.heartbeat()
+
+                # 行为日志推送 (可选，避免每Tick推送)
+                if self.behavior_log.should_flush():
+                    await self.behavior_log.flush_to_frontend()
+
+            except asyncio.CancelledError:
+                break
             except Exception as e:
-                self.risk_monitor.log_error(e)
+                self.log.error(f"主循环异常: {e}\n{traceback.format_exc()}")
                 await asyncio.sleep(0.1)
 
-    async def shutdown(self):
-        """优雅退出"""
-        self.running = False
+        await self._shutdown()
+
+    async def _on_new_minute(self, tick):
+        """每分钟K线闭合时执行的主要逻辑"""
+        try:
+            tf = "1m"
+            ctx = self.ctx_factory.get(tf)
+            ctx.add_kline(tick.ohlc)
+
+            # 1. 系统自检
+            health = self.self_check.run()
+            if health.status != "OK":
+                self.behavior_log.log(EventType.SYSTEM, "SelfCheck", f"异常: {health.status}")
+                await self.notifier.alert_health(health)
+
+            # 2. 跳跃检测 (防止插针干扰)
+            if self.cpp_jump and self.cpp_jump.detect(tick.returns[-10:]):
+                self.behavior_log.log(EventType.RISK, "JumpDetect", "检测到异常跳跃，冻结感知层")
+                self.perception.freeze()
+
+            # 3. 感知层推理
+            pll_state = self.perception.update_pll(ctx)
+            heston_state = self.perception.update_particle_filter(ctx)
+            vib_state = self.perception.update_vib(ctx)
+
+            # 4. 市场状态判定
+            regime = self.state_machine.determine_regime(pll_state, heston_state, vib_state, ctx)
+
+            # 5. 震荡过滤器
+            ci = self.state_machine.choppiness_index(ctx)
+            is_oscillation = self.state_machine.is_oscillation(ci, pll_state, hurst_bf=heston_state.hurst_bf)
+
+            # 6. 因子评分 (惰性求值: 仅当可能有信号时才全量计算)
+            if self.lazy_evaluator.should_full_evaluate(regime, ctx):
+                factor_scores = self.lazy_evaluator.evaluate_all(ctx, pll_state, heston_state, vib_state)
+                weights = self.weight_engine.get_weights(regime)
+                score = self.scorecard.compute(factor_scores, weights)
+            else:
+                score = self.scorecard.last_score  # 使用上一帧评分
+
+            # 7. 策略决策
+            signal = None
+            if not is_oscillation and score > self.scorecard.threshold_long:
+                signal = {"direction": "LONG", "score": score, "confidence": self._calc_confidence(pll_state)}
+            elif not is_oscillation and score < self.scorecard.threshold_short:
+                signal = {"direction": "SHORT", "score": score, "confidence": self._calc_confidence(pll_state)}
+
+            # 8. 多周期仲裁
+            self.arbiter.collect_signal(tf, signal)
+            final_signal = self.arbiter.evaluate()
+
+            # 9. 风险校验
+            if final_signal and not self.risk_monitor.approve(final_signal):
+                self.behavior_log.log(EventType.RISK, "RiskReject", f"评分{final_signal.get('score')}被风控否决")
+                final_signal = None
+
+            # 10. 执行订单
+            if final_signal:
+                await self._execute_signal(final_signal, tick, ctx)
+
+            # 11. 幽灵影子更新
+            await self.shadow_mgr.tick(tick)
+
+            # 12. 智能体议会决策 (每5分钟)
+            if tick.timestamp.minute % 5 == 0:
+                await self.agent_council.deliberate(ctx)
+
+            # 13. 学习时段检查
+            await self.learning_guard.check_and_handle()
+
+            # 14. 行为日志记录
+            self.behavior_log.log(EventType.SIGNAL, "Engine", f"分钟闭合处理完成, 评分={score:.1f}, 信号={'有' if final_signal else '无'}")
+
+        except Exception as e:
+            self.log.error(f"每分钟处理异常: {e}")
+
+    async def _on_tick(self, tick):
+        """Tick级别快速处理 (无损实时性)"""
+        # 仅更新C++风控模块、移动止损等
+        if self.cpp_guard:
+            self.cpp_guard.feed_price(tick.last_price, tick.bid, tick.ask)
+        # 更新止损 (若持仓)
+        if self.order_mgr.has_position():
+            self.risk_monitor.update_trailing_stop(tick.last_price)
+
+    async def _execute_signal(self, signal: dict, tick, ctx):
+        """执行交易指令"""
+        try:
+            size = self.position_ctrl.calc_size(signal, self.order_mgr.get_equity())
+            order = self.execution.create_order(
+                symbol=self.config.get("trading.symbol"),
+                direction=signal["direction"],
+                size=size,
+                price=tick.last_price,
+                order_type="LIMIT" if self.mode == "virtual" else "SMART"
+            )
+            if order:
+                self.behavior_log.log(EventType.ORDER, "Execution", f"下单: {signal['direction']} {size} @ {tick.last_price}")
+                # 多账户跟单
+                await self.copy_trading.replicate(order)
+        except Exception as e:
+            self.log.error(f"下单执行失败: {e}")
+
+    def _calc_confidence(self, pll_state) -> float:
+        """基于锁相环锁相质量计算置信度"""
+        if pll_state.snr_db > 10:
+            return 0.9
+        elif pll_state.snr_db > 6:
+            return 0.7
+        return 0.3
+
+    async def _background_tasks(self):
+        """后台定时任务"""
+        while self._running:
+            now = datetime.now()
+            # 每日凌晨3点执行
+            if now.hour == 3 and now.minute == 0:
+                self.daily_tasks.run()
+                await asyncio.sleep(60)
+            await asyncio.sleep(30)
+
+    async def _ota_check_loop(self):
+        """OTA更新检查循环"""
+        while self._running:
+            await self.ota_updater.check_and_update()
+            await asyncio.sleep(3600)  # 每小时检查一次
+
+    async def _cold_archive_loop(self):
+        """冷数据归档循环"""
+        while self._running:
+            await self.cold_archiver.archive_expired()
+            await asyncio.sleep(3600)
+
+    async def _shutdown(self):
+        """优雅关闭"""
+        self.log.info("正在关闭引擎...")
+        self._shutting_down = True
+        # 平掉所有仓位 (如果配置要求)
+        if self.config.get("system.flat_on_exit", True) and self.mode == "live":
+            await self.execution.close_all()
+        # 停止数据源
         await self.data_feed.stop()
-        self.order_manager.cancel_all()
-        self.plugin_manager.unload_all()
-        self._shutdown_event.set()
+        # 保存状态
+        self.weight_engine.save()
+        self.behavior_log.flush_to_db()
+        self.log.info("引擎已安全退出")
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description='火种核心引擎')
-    parser.add_argument('--config', type=str, default='config/settings.yaml',
-                        help='配置文件路径')
-    return parser.parse_args()
-
-
+# ================== 入口 ==================
 async def main():
-    args = parse_args()
-    engine = FireSeedEngine(args.config)
+    import argparse
+    parser = argparse.ArgumentParser(description="火种量化引擎")
+    parser.add_argument("--mode", type=str, default="virtual", choices=["live", "virtual", "ghost"], help="运行模式")
+    parser.add_argument("--config", type=str, default="config/settings.yaml", help="配置文件路径")
+    args = parser.parse_args()
 
-    # 注册信号处理
-    loop = asyncio.get_event_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, lambda: asyncio.create_task(engine.shutdown()))
-
+    engine = FireSeedEngine(config_path=args.config)
+    engine.mode = args.mode
     await engine.run()
 
 
