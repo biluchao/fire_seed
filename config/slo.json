@@ -1,102 +1,107 @@
 {
-  "version": "1.0.0",
-  "description": "火种系统服务等级目标 (SLO)",
+  "document": "FireSeed System - Service Level Objectives",
+  "version": "3.0.0-spartan",
+  "last_updated": "2026-04-30T00:00:00Z",
   "objectives": [
     {
-      "name": "订单执行延迟",
-      "metric": "order_execution_latency_ms",
-      "description": "从策略发出信号到订单提交至交易所API的端到端延迟",
-      "percentile": 99,
-      "threshold_ms": 50,
-      "window": "5m",
-      "alert_threshold_ms": 80,
-      "evaluation_period": "1h",
-      "breach_consequence": "告警并收紧止损倍数10%"
-    },
-    {
-      "name": "数据接收延迟",
-      "metric": "data_receive_latency_ms",
-      "description": "从交易所行情生成到火种本地处理的延迟",
-      "percentile": 95,
-      "threshold_ms": 200,
-      "window": "1m",
-      "alert_threshold_ms": 500,
-      "evaluation_period": "1h",
-      "breach_consequence": "提升至备线路或降级为保守信号"
-    },
-    {
-      "name": "系统可用性",
-      "metric": "uptime_percentage",
-      "description": "核心交易环路正常运行时间占比",
-      "target": 99.5,
-      "window": "30d",
-      "evaluation_period": "1d",
-      "alert_threshold": 99.0,
-      "breach_consequence": "触发人工介入检查，暂停自动进化功能"
-    },
-    {
-      "name": "策略信号质量",
-      "metric": "rolling_sharpe_24h",
-      "description": "最近24小时策略信号模拟成交的滚动夏普比率",
-      "threshold": 0.0,
-      "window": "24h",
-      "evaluation_period": "1h",
-      "alert_threshold": -0.5,
-      "breach_consequence": "暂停该策略开仓，通知哥德尔监视者评估"
-    },
-    {
-      "name": "最大连续亏损",
-      "metric": "consecutive_loss_count",
-      "description": "同一策略连续亏损笔数",
-      "threshold": 5,
-      "window": "24h",
-      "evaluation_period": "实时",
-      "alert_threshold": 4,
-      "breach_consequence": "自动冻结策略、降权、启动熔断审查"
-    },
-    {
-      "name": "API请求错误率",
-      "metric": "api_error_rate",
-      "description": "交易所API返回非2xx的比例",
-      "threshold": 1.0,
+      "id": "SLO-001",
+      "name": "Overall System Availability",
+      "description": "The proportion of time the trading engine and API are accepting orders and processing market data.",
+      "target": 99.9,
       "unit": "percent",
-      "window": "5m",
-      "evaluation_period": "30m",
+      "evaluation_window": "30d",
+      "alert_threshold": 99.5,
+      "alert_severity": "critical"
+    },
+    {
+      "id": "SLO-002",
+      "name": "Order Gateway Latency (P99)",
+      "description": "The 99th percentile latency from signal generation to order submission, measured at the C++ gateway.",
+      "target": 1.0,
+      "unit": "milliseconds",
+      "evaluation_window": "1h",
       "alert_threshold": 5.0,
-      "breach_consequence": "切换至备用交易所、暂停新订单、通知运维"
+      "alert_severity": "warning"
     },
     {
-      "name": "内存泄漏检测",
-      "metric": "memory_growth_rate_mb_per_hour",
-      "description": "核心进程内存占用增长率",
-      "threshold": 50,
-      "window": "1h",
-      "evaluation_period": "6h",
-      "alert_threshold": 100,
-      "breach_consequence": "记录堆栈、计划夜间重启"
+      "id": "SLO-003",
+      "name": "WebSocket Data Feed Latency (P95)",
+      "description": "The 95th percentile time between exchange tick generation and arrival in the shared memory queue.",
+      "target": 10.0,
+      "unit": "milliseconds",
+      "evaluation_window": "1h",
+      "alert_threshold": 50.0,
+      "alert_severity": "warning"
     },
     {
-      "name": "模型预测偏差",
-      "metric": "psi_score",
-      "description": "特征稳定性指标 (PSI) 最大变化值",
-      "threshold": 0.25,
-      "window": "1d",
-      "evaluation_period": "1d",
-      "alert_threshold": 0.30,
-      "breach_consequence": "自动降权、触发特征重新评估"
+      "id": "SLO-004",
+      "name": "Trading Engine Loop Jitter (P99)",
+      "description": "The 99th percentile deviation from the expected 1-second tick processing interval.",
+      "target": 2.0,
+      "unit": "milliseconds",
+      "evaluation_window": "15m",
+      "alert_threshold": 10.0,
+      "alert_severity": "warning"
+    },
+    {
+      "id": "SLO-005",
+      "name": "Risk Monitor Evaluation Latency (P99)",
+      "description": "The 99th percentile time taken by the C++ risk module to compute VaR and check all limits.",
+      "target": 0.5,
+      "unit": "milliseconds",
+      "evaluation_window": "1h",
+      "alert_threshold": 2.0,
+      "alert_severity": "critical"
+    },
+    {
+      "id": "SLO-006",
+      "name": "API Error Rate",
+      "description": "The proportion of API requests (both internal and exchange-facing) that result in errors (HTTP 5xx or exchange error codes).",
+      "target": 0.01,
+      "unit": "percent",
+      "evaluation_window": "1h",
+      "alert_threshold": 0.5,
+      "alert_severity": "warning"
+    },
+    {
+      "id": "SLO-007",
+      "name": "Data Consistency Check Pass Rate",
+      "description": "The percentage of daily reconciliation checks where local trade records exactly match the exchange's official records.",
+      "target": 99.99,
+      "unit": "percent",
+      "evaluation_window": "24h",
+      "alert_threshold": 99.9,
+      "alert_severity": "critical"
+    },
+    {
+      "id": "SLO-008",
+      "name": "Evolution Safety Rollback Rate",
+      "description": "The number of automatic strategy rollbacks triggered per day due to canary or shadow validation failures. A high rate indicates instability in the evolution pipeline.",
+      "target": 1,
+      "unit": "count_per_day",
+      "evaluation_window": "24h",
+      "alert_threshold": 3,
+      "alert_severity": "warning"
+    },
+    {
+      "id": "SLO-009",
+      "name": "Cold Storage Archive Success Rate",
+      "description": "The percentage of attempted log and data uploads to cloud object storage that complete successfully.",
+      "target": 99.9,
+      "unit": "percent",
+      "evaluation_window": "24h",
+      "alert_threshold": 99.5,
+      "alert_severity": "warning"
+    },
+    {
+      "id": "SLO-010",
+      "name": "Ghost Validation Completion Rate",
+      "description": "The percentage of ghost validation tasks that run to completion within their allocated time window (24h). Premature terminations indicate resource contention.",
+      "target": 98.0,
+      "unit": "percent",
+      "evaluation_window": "7d",
+      "alert_threshold": 90.0,
+      "alert_severity": "warning"
     }
-  ],
-  "compliance": {
-    "evaluation_schedule": "0 * * * *",
-    "reporting_channel": "telegram",
-    "default_action_on_breach": "记录并告警",
-    "auto_remediation": true,
-    "remediation_limits": {
-      "max_stop_adjust_pct": 15,
-      "max_auto_suspensions_per_day": 3
-    }
-  },
-  "created": "2025-04-01T00:00:00Z",
-  "last_updated": "2025-07-14T12:00:00Z",
-  "maintainer": "fire_seed_core_team"
+  ]
 }
