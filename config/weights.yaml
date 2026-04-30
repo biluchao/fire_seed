@@ -1,125 +1,48 @@
 # =============================================================================
-# 火种系统 · 动态权重配置文件 (weights.yaml)
+# 火种系统 (FireSeed) 因子权重配置
 # =============================================================================
-# 
-# 此文件由权重校准师 (WeightCalibrator) 自动维护，同时支持手动编辑作为初始值。
-# 每次更新后会触发热重载，评分卡 (FusionScoreCard) 将立即使用新权重。
-# 
-# 权重设计原则：
-#   - 核心因子 (core_factors) 总权重锚定在 60%，辅助因子 (auxiliary_factors) 锚定在 40%
-#   - 互补性惩罚：若两个因子互信息 > 0.6，较低权重的因子将被再压制 30%
-#   - 波动率门控：当市场波动率超过历史 80% 分位时，权重更新冻结
-#   - 状态分离：可针对不同市场状态 (trend / oscillation / high_vol / low_vol) 维护独立权重集
-#
-# 版本号与更新时间戳用于 OTA 升级和幽灵验证的权重溯源。
+# 本文件由条件权重引擎 (ConditionalWeightEngine) 自动生成与维护，
+# 每次权重更新后将覆盖写入，并保留最近 5 个版本快照于 config/archived_weights/。
+# 手工编辑需谨慎，修改后将在下一个 K 线闭合时触发热重载。
 # =============================================================================
 
-version: "2.1.0"
-last_updated: "2025-04-26T03:00:00Z"
-description: "默认混合风格权重 (均衡适应趋势与震荡)"
+# 权重配置版本 (格式: 年月日-序号，自动递增)
+version: "20260430-01"
 
-# -----------------------------------------------------------------------------
-# 全局默认权重（当对应状态的专属权重数据不足时回退使用）
-# -----------------------------------------------------------------------------
-default:
-  core_factors:
-    trend_strength: 0.25         # 锁相环频率 × 粒子滤波瞬时夏普
-    vib_pressure: 0.20           # VIB 买压/卖压 (订单簿深层语义)
-    regime_fit: 0.15             # 赫斯特指数贝叶斯因子 + 震荡过滤器 CI
+# 权重最近一次计算的时间戳 (ISO 8601)
+last_calibrated: "2026-04-30T02:15:00+08:00"
 
-  auxiliary_factors:
-    obi_acceleration: 0.10       # OBI 二阶导 (买卖压力加速度)
-    retest_quality: 0.08         # 回踩质量评分 (回调成交量衰减 + K线实体 + 弹性)
-    funding_env: 0.07            # 资金费率与基差环境
-    volume_pulse: 0.05           # 成交量脉冲异常检测
-    pinbar: 0.05                 # Pin Bar 形态识别
-    iceberg_detect: 0.05         # 冰山订单检测
+# 当前权重适用的市场状态 (若使用模糊隶属度，则此项为空)
+current_regime: "trend"
 
-  # 扣分项 (不参与权重归一化，直接对最终得分施加乘法惩罚)
-  penalties:
-    delta_divergence: 0.9        # Delta 散度确认：得分 × 0.9
-    oi_divergence: 0.9           # 持仓量背离：得分 × 0.9
-    high_funding_risk: 0.8       # 极端资金费率风险：得分 × 0.8
+# 权重校准时的IC计算窗口 (天)
+calibration_window: 20
 
-# -----------------------------------------------------------------------------
-# 状态专属权重 (市场状态由感知层判定后动态切换)
-# -----------------------------------------------------------------------------
-state_specific:
-  # 趋势市：核心因子权重进一步提升，辅助因子中方向性强的获得更高权重
-  trend:
-    core_factors:
-      trend_strength: 0.30
-      vib_pressure: 0.18
-      regime_fit: 0.12
-    auxiliary_factors:
-      obi_acceleration: 0.10
-      retest_quality: 0.10       # 趋势中回踩确认更关键
-      funding_env: 0.07
-      volume_pulse: 0.03
-      pinbar: 0.05
-      iceberg_detect: 0.05
+# ---------------------------------------------------------------------------
+# 核心因子 (总权重约 60%)
+# 这些因子直接决定趋势方向与市场结构，任何修改需通过幽灵验证。
+# ---------------------------------------------------------------------------
+core_factors:
+  trend_strength: 0.25               # 锁相环频率 × 粒子滤波瞬时夏普
+  vib_pressure: 0.20                 # VIB 深度学习提取的买卖压力
+  regime_fit: 0.15                   # 赫斯特指数 + 震荡过滤器组合状态匹配度
 
-  # 震荡市：微观结构因子权重上升，趋势因子权重下降
-  oscillation:
-    core_factors:
-      trend_strength: 0.15
-      vib_pressure: 0.20
-      regime_fit: 0.25           # 震荡识别权重加大
-    auxiliary_factors:
-      obi_acceleration: 0.12
-      retest_quality: 0.05
-      funding_env: 0.10
-      volume_pulse: 0.05
-      pinbar: 0.08               # 震荡边界 Pin Bar 更有效
-      iceberg_detect: 0.05
+# ---------------------------------------------------------------------------
+# 辅助因子 (总权重约 40%)
+# 提供确认或否决，单独不能主导决策。
+# ---------------------------------------------------------------------------
+auxiliary_factors:
+  obi_accel: 0.10                    # 订单簿不平衡 (OBI) 的二阶导 / 加速度
+  retest_quality: 0.08               # 回踩 MA12 质量评分 (成交量衰减+弹性)
+  funding_env: 0.07                  # 资金费率环境得分 (方向一致性)
+  volume_pulse: 0.05                 # 成交量脉冲强度 (当前量 / 均量)
+  pinbar: 0.05                       # Pin Bar / 下影线反转信号强度
+  iceberg_detect: 0.05               # 冰山订单检测概率 (挂单墙被蚕食)
+  macro_event_risk: 0.05             # 宏观经济日历事件风险惩罚因子 (反向)
 
-  # 高波动：风控因子权重上升，信号类因子权重普遍下调（由波动率门控自动调整风险乘数）
-  high_volatility:
-    core_factors:
-      trend_strength: 0.20
-      vib_pressure: 0.15
-      regime_fit: 0.10
-    auxiliary_factors:
-      obi_acceleration: 0.05
-      retest_quality: 0.05
-      funding_env: 0.15          # 高波时资金费率重要
-      volume_pulse: 0.10
-      pinbar: 0.05
-      iceberg_detect: 0.05
-
-  # 低波动：所有因子灵敏度提高，核心因子权重集中
-  low_volatility:
-    core_factors:
-      trend_strength: 0.28
-      vib_pressure: 0.22
-      regime_fit: 0.10
-    auxiliary_factors:
-      obi_acceleration: 0.08
-      retest_quality: 0.08
-      funding_env: 0.05
-      volume_pulse: 0.02
-      pinbar: 0.07
-      iceberg_detect: 0.10       # 低波时冰山订单更显眼
-
-# -----------------------------------------------------------------------------
-# 因子互信息矩阵 (由冗余审计官定期更新，用于互补性惩罚)
-# 键格式: "factor_A|factor_B"
-# 值: 归一化互信息 (0~1)
-# -----------------------------------------------------------------------------
-mutual_information:
-  "trend_strength|vib_pressure": 0.45
-  "obi_acceleration|vib_pressure": 0.65    # 超过0.6，obi_acceleration 将被惩罚
-  "obi_acceleration|volume_pulse": 0.55
-  "retest_quality|pinbar": 0.30
-  "retest_quality|regime_fit": 0.20
-  "funding_env|vib_pressure": 0.15
-
-# -----------------------------------------------------------------------------
-# 权重更新约束 (由权重校准师读取，防止过拟合漂移)
-# -----------------------------------------------------------------------------
-update_constraints:
-  max_daily_change: 0.15          # 单因子权重日变化上限 (±15%)
-  min_ic_samples: 10              # 最少需要多少个交易日 IC 才允许更新
-  ic_decay_halflife: 15           # IC 指数衰减半衰期 (天)
-  volatility_freeze_percentile: 0.80  # 波动率超过80%分位时冻结权重
-  l2_regularization: 0.30         # 新权重向旧权重的回归系数 (0~1, 越高越平滑)
+# ---------------------------------------------------------------------------
+# 因子状态备注
+# ---------------------------------------------------------------------------
+factor_notes:
+  obi_v2: "因 PSI > 0.25 已被冻结，权重置零，等待下个校准周期复查。"
+  volatility_v2: "因波动率门控触发，权重临时冻结，当前值为 0.00。"
