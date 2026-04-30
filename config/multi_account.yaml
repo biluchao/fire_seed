@@ -1,0 +1,95 @@
+# =============================================================================
+# 火种系统 (FireSeed) 多账户跟单配置
+# =============================================================================
+# 主账户下单后，子账户按此配置中的跟随比例自动复制订单。
+# 每个子账户拥有独立的 API 密钥、仓位限制和风险控制。
+# 敏感凭证通过环境变量注入，禁止硬编码于此文件。
+# =============================================================================
+
+# 是否启用多账户跟单系统
+enabled: false
+
+# 主账户标识 (用于日志和前端账户切换显示)
+master_account: "main"
+
+# 子账户列表，最多支持 6 个
+accounts:
+  - name: "sub1"
+    # 币安 API 密钥 (通过环境变量注入)
+    api_key: ${SUB1_API_KEY}
+    api_secret: ${SUB1_API_SECRET}
+    # 跟单比例：1.0 表示与主账户完全相同的手数
+    follow_ratio: 1.0
+    # 该子账户单个品种最大仓位占比 (保证金占子账户权益的比例)
+    max_single_position_pct: 50
+    # 该子账户总杠杆倍数上限
+    max_leverage: 3
+    # 是否允许该子账户独立加仓 (若为 false，则仅复制主账户开仓，不复制加仓)
+    allow_add_position: true
+    # 是否允许该子账户独立平仓 (若为 false，则平仓指令也完全跟随主账户)
+    allow_manual_close: false
+
+  - name: "sub2"
+    api_key: ${SUB2_API_KEY}
+    api_secret: ${SUB2_API_SECRET}
+    follow_ratio: 0.5
+    max_single_position_pct: 40
+    max_leverage: 2
+    allow_add_position: true
+    allow_manual_close: false
+
+  - name: "sub3"
+    api_key: ${SUB3_API_KEY}
+    api_secret: ${SUB3_API_SECRET}
+    follow_ratio: 0.8
+    max_single_position_pct: 30
+    max_leverage: 3
+    allow_add_position: false
+    allow_manual_close: false
+
+  - name: "sub4"
+    api_key: ${SUB4_API_KEY}
+    api_secret: ${SUB4_API_SECRET}
+    follow_ratio: 0.3
+    max_single_position_pct: 25
+    max_leverage: 1
+    allow_add_position: false
+    allow_manual_close: true
+
+  - name: "sub5"
+    api_key: ${SUB5_API_KEY}
+    api_secret: ${SUB5_API_SECRET}
+    follow_ratio: 1.2
+    max_single_position_pct: 45
+    max_leverage: 3
+    allow_add_position: true
+    allow_manual_close: false
+
+  - name: "sub6"
+    api_key: ${SUB6_API_KEY}
+    api_secret: ${SUB6_API_SECRET}
+    follow_ratio: 0.1
+    max_single_position_pct: 10
+    max_leverage: 1
+    allow_add_position: false
+    allow_manual_close: false
+
+# 全局跟单系统风险控制
+global_risk:
+  # 任一子账户当日亏损超过此比例，立即停止该子账户跟单
+  max_daily_loss_pct: 0.03
+  # 跟单系统的最大总杠杆倍数 (所有子账户净敞口之和 / 总权益)
+  max_total_leverage: 5
+  # 子账户连接失败最大重试次数
+  max_connection_retries: 3
+  # 重试间隔 (秒)
+  retry_delay_sec: 5
+  # 是否在主账户平仓时强制平掉所有子账户的对应仓位
+  force_close_on_master_flat: true
+
+# 前端显示
+display:
+  # 是否在主界面账户仪表盘卡片下方显示账户切换按钮
+  show_switch_button: true
+  # 切换时需要输入的二次验证密码 (若启用)
+  require_password_for_switch: true
