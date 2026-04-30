@@ -1,341 +1,353 @@
-#!/bin/bash
-# =============================================================================
-# 火种系统 一键部署脚本 (Fire Seed Deploy Script)
-# 适用环境: Ubuntu 22.04 LTS, 4核8G
-# 执行方式: chmod +x deploy.sh && sudo ./deploy.sh
-# =============================================================================
-
+#!/usr/bin/env bash
+# ================================================================
+# 火种系统 (FireSeed) 一键部署脚本
+# 适用于 Ubuntu 22.04 / 24.04 LTS x86_64
+# 功能：
+#   1. 环境检测与系统依赖安装
+#   2. Python 虚拟环境创建与 pip 依赖安装
+#   3. C++ 模块编译 (pybind11)
+#   4. 配置文件初始化 (从 .env.example 交互式生成 .env)
+#   5. SQLite 数据库初始化
+#   6. 日志轮转配置
+#   7. 系统服务安装 (systemd)
+#   8. 最终健康检查
+# ================================================================
 set -euo pipefail
 
-# 颜色定义
+# ----- 颜色定义 -----
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
 
-# 日志文件
-LOGFILE="/var/log/fire_seed_deploy.log"
+# ----- 全局变量 -----
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_NAME="fire_seed"
+PROJECT_USER="${SUDO_USER:-$USER}"
+PYTHON_BIN="python3.12"
+VENV_DIR="$SCRIPT_DIR/venv"
+LOG_DIR="/var/log/$PROJECT_NAME"
+CONFIG_DIR="$SCRIPT_DIR/config"
+REQUIREMENTS="$SCRIPT_DIR/requirements.txt"
+CMAKE_BUILD_DIR="$SCRIPT_DIR/cpp/build"
 
-# 系统用户 (推荐非root运行，但脚本需root权限进行部分操作)
-SERVICE_USER="fire_seed"
-SERVICE_GROUP="fire_seed"
-INSTALL_DIR="/opt/fire_seed"
-VENV_DIR="${INSTALL_DIR}/venv"
-CONFIG_DIR="${INSTALL_DIR}/config"
-DATA_DIR="/var/lib/fire_seed"
-LOG_DIR="/var/log/fire_seed"
+# ----- 辅助函数 -----
+log_info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
+log_warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $*"; }
+log_step()  { echo -e "${CYAN}[STEP]${NC} $*"; }
 
-# 需要的系统包
-SYSTEM_PACKAGES=(
-    python3.10 python3.10-venv python3.10-dev
-    cmake gcc g++ make
-    libboost-all-dev libeigen3-dev
-    libpython3.10-dev
-    docker.io docker-compose
-    supervisor nginx
-    curl wget git
-    libssl-dev
-)
-
-echo -e "${BLUE}============================================${NC}"
-echo -e "${BLUE}       火种系统 一键部署脚本开始${NC}"
-echo -e "${BLUE}============================================${NC}"
-
-# ---------------------------------------------------------------------------
-# 1. 环境检查
-# ---------------------------------------------------------------------------
+# 判断是否以 root 运行
 check_root() {
     if [[ $EUID -ne 0 ]]; then
-        echo -e "${RED}[错误] 请使用 sudo 运行此脚本。${NC}"
+        log_error "请使用 sudo 运行此脚本，例如: sudo bash deploy.sh"
         exit 1
     fi
 }
 
-check_ubuntu_version() {
-    if [[ -f /etc/os-release ]]; then
-        . /etc/os-release
-        if [[ "$ID" != "ubuntu" || "$VERSION_ID" != "22.04" ]]; then
-            echo -e "${YELLOW}[警告] 推荐 Ubuntu 22.04，当前为 $ID $VERSION_ID，可能不兼容。${NC}"
-        fi
-    else
-        echo -e "${YELLOW}[警告] 无法检测操作系统版本。${NC}"
+# 检查 Ubuntu 版本
+check_os() {
+    if [[ ! -f /etc/os-release ]]; then
+        log_error "无法识别操作系统，需要 Ubuntu 22.04 或 24.04"
+        exit 1
     fi
+    source /etc/os-release
+    if [[ "$ID" != "ubuntu" ]]; then
+        log_error "此脚本仅支持 Ubuntu，当前系统: $ID"
+        exit 1
+    fi
+    local major_ver="${VERSION_ID%%.*}"
+    if [[ "$major_ver" -lt 22 ]]; then
+        log_warn "推荐 Ubuntu 22.04 或更高版本，当前版本: $VERSION_ID"
+        read -p "是否继续？(y/N) " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then exit 1; fi
+    fi
+    log_info "操作系统检查通过: $PRETTY_NAME"
 }
 
-check_resources() {
-    CPU_CORES=$(nproc)
-    TOTAL_MEM=$(free -m | awk '/^Mem:/{print $2}')
-    DISK_FREE=$(df -BG / | awk 'NR==2 {print $4}' | sed 's/G//')
-    echo -e "${GREEN}[信息] CPU核心: $CPU_CORES${NC}"
-    echo -e "${GREEN}[信息] 内存: ${TOTAL_MEM}MB${NC}"
-    echo -e "${GREEN}[信息] 可用磁盘: ${DISK_FREE}GB${NC}"
-
-    if [[ $CPU_CORES -lt 4 ]]; then
-        echo -e "${YELLOW}[警告] 推荐4核以上CPU，当前为$CPU_CORES核，可能影响性能。${NC}"
+# 检查硬件资源 (内存至少 6GB，CPU 至少 4 核)
+check_hardware() {
+    local mem_total_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+    local mem_total_gb=$((mem_total_kb / 1024 / 1024))
+    local cpu_cores=$(nproc)
+    if [[ $mem_total_gb -lt 6 ]]; then
+        log_warn "内存为 ${mem_total_gb}GB，建议至少 8GB。继续可能出现性能问题。"
     fi
-    if [[ $TOTAL_MEM -lt 7500 ]]; then
-        echo -e "${YELLOW}[警告] 推荐8GB以上内存，当前为${TOTAL_MEM}MB。${NC}"
+    if [[ $cpu_cores -lt 4 ]]; then
+        log_warn "CPU 核心数为 ${cpu_cores}，建议至少 4 核。"
     fi
-    if [[ $DISK_FREE -lt 20 ]]; then
-        echo -e "${YELLOW}[警告] 可用磁盘空间不足20GB，请清理后再试。${NC}"
-    fi
+    log_info "硬件资源: CPU ${cpu_cores} 核, 内存 ${mem_total_gb}GB"
 }
 
-# ---------------------------------------------------------------------------
-# 2. 安装系统依赖
-# ---------------------------------------------------------------------------
+# 安装系统包
 install_system_deps() {
-    echo -e "${BLUE}[步骤 1/7] 更新系统包并安装依赖...${NC}"
+    log_step "更新 apt 源并安装系统依赖..."
     apt-get update -qq
-    apt-get install -y -qq "${SYSTEM_PACKAGES[@]}"
-
-    # 启动Docker服务
-    systemctl start docker
-    systemctl enable docker
-
-    echo -e "${GREEN}[完成] 系统依赖已安装。${NC}"
+    apt-get install -y -qq \
+        build-essential \
+        cmake \
+        g++ \
+        gdb \
+        make \
+        pkg-config \
+        python3.12 \
+        python3.12-dev \
+        python3.12-venv \
+        libssl-dev \
+        libffi-dev \
+        libbz2-dev \
+        libreadline-dev \
+        libsqlite3-dev \
+        libncursesw5-dev \
+        libgdbm-dev \
+        liblzma-dev \
+        zlib1g-dev \
+        uuid-dev \
+        libpython3.12 \
+        docker.io \
+        redis-server \
+        logrotate \
+        curl \
+        git \
+        ufw \
+        > /dev/null
+    log_info "系统依赖安装完成。"
+    # 确保 docker 服务启动
+    systemctl enable --now docker || true
+    systemctl enable --now redis-server || true
 }
 
-# ---------------------------------------------------------------------------
-# 3. 创建系统用户和目录
-# ---------------------------------------------------------------------------
-create_user_and_dirs() {
-    echo -e "${BLUE}[步骤 2/7] 创建服务用户和目录...${NC}"
-
-    # 创建服务用户（如果不存在）
-    if ! id -u $SERVICE_USER >/dev/null 2>&1; then
-        useradd -r -m -d /home/$SERVICE_USER -s /bin/bash $SERVICE_USER
-        echo -e "${GREEN}[信息] 用户 $SERVICE_USER 已创建。${NC}"
+# 检查 Python 版本
+setup_python() {
+    log_step "配置 Python 环境..."
+    if ! command -v python3.12 &> /dev/null; then
+        log_error "Python 3.12 未安装，请检查。"
+        exit 1
     fi
-
-    # 创建必要目录
-    mkdir -p $INSTALL_DIR $CONFIG_DIR $DATA_DIR $LOG_DIR
-    mkdir -p ${INSTALL_DIR}/cpp/build
-    mkdir -p ${INSTALL_DIR}/strategies
-    mkdir -p ${INSTALL_DIR}/tests
-
-    # 设置权限
-    chown -R $SERVICE_USER:$SERVICE_GROUP $INSTALL_DIR
-    chown -R $SERVICE_USER:$SERVICE_GROUP $DATA_DIR
-    chown -R $SERVICE_USER:$SERVICE_GROUP $LOG_DIR
-
-    echo -e "${GREEN}[完成] 目录结构已创建。${NC}"
-}
-
-# ---------------------------------------------------------------------------
-# 4. 部署应用代码
-# ---------------------------------------------------------------------------
-deploy_code() {
-    echo -e "${BLUE}[步骤 3/7] 部署应用代码...${NC}"
-
-    # 假设脚本在项目根目录执行
-    SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-    if [[ "$SCRIPT_DIR" != "$INSTALL_DIR" ]]; then
-        cp -r "$SCRIPT_DIR"/* "$INSTALL_DIR"/
-    fi
-
-    # 确保关键脚本存在
-    if [[ ! -f "$INSTALL_DIR/start.sh" ]]; then
-        echo -e "${YELLOW}[警告] start.sh 不存在，将自动创建。${NC}"
-        cat > "$INSTALL_DIR/start.sh" << 'EOF'
-#!/bin/bash
-cd /opt/fire_seed
-source venv/bin/activate
-python core/engine.py &
-EOF
-        chmod +x "$INSTALL_DIR/start.sh"
-    fi
-
-    chown -R $SERVICE_USER:$SERVICE_GROUP "$INSTALL_DIR"
-    echo -e "${GREEN}[完成] 代码部署至 $INSTALL_DIR。${NC}"
-}
-
-# ---------------------------------------------------------------------------
-# 5. 配置Python虚拟环境与依赖
-# ---------------------------------------------------------------------------
-setup_python_env() {
-    echo -e "${BLUE}[步骤 4/7] 配置Python虚拟环境...${NC}"
+    log_info "Python: $(python3.12 --version)"
 
     # 创建虚拟环境
-    python3.10 -m venv "$VENV_DIR"
-    source "$VENV_DIR/bin/activate"
-
-    # 升级pip
-    pip install --upgrade pip setuptools wheel
-
-    # 安装Python依赖
-    if [[ -f "$INSTALL_DIR/requirements.txt" ]]; then
-        pip install -r "$INSTALL_DIR/requirements.txt"
+    if [[ ! -d "$VENV_DIR" ]]; then
+        python3.12 -m venv "$VENV_DIR"
+        log_info "虚拟环境创建于 $VENV_DIR"
     else
-        echo -e "${YELLOW}[警告] requirements.txt 未找到，安装核心依赖。${NC}"
-        pip install numpy pandas scipy scikit-learn torch pybind11 \
-            ccxt fastapi uvicorn websockets pyyaml python-dotenv bcrypt
+        log_info "虚拟环境已存在，跳过创建。"
     fi
 
-    deactivate
-    echo -e "${GREEN}[完成] Python环境配置完毕。${NC}"
+    # 激活并升级 pip
+    source "$VENV_DIR/bin/activate"
+    pip install --upgrade pip setuptools wheel
+    log_info "pip 升级完成。"
 }
 
-# ---------------------------------------------------------------------------
-# 6. 编译C++模块
-# ---------------------------------------------------------------------------
-compile_cpp() {
-    echo -e "${BLUE}[步骤 5/7] 编译C++模块...${NC}"
+# 安装 Python 依赖
+install_python_deps() {
+    log_step "安装 Python 依赖..."
+    source "$VENV_DIR/bin/activate"
+    if [[ -f "$REQUIREMENTS" ]]; then
+        pip install -r "$REQUIREMENTS"
+        log_info "Python 依赖安装完成。"
+    else
+        log_error "找不到 requirements.txt"
+        exit 1
+    fi
+}
 
-    BUILD_DIR="$INSTALL_DIR/cpp/build"
-    mkdir -p "$BUILD_DIR"
-    cd "$BUILD_DIR"
-
-    cmake .. -DCMAKE_BUILD_TYPE=Release -DPython3_ROOT_DIR="$VENV_DIR"
+# 编译 C++ 模块
+build_cpp() {
+    log_step "编译 C++ 高性能模块..."
+    mkdir -p "$CMAKE_BUILD_DIR"
+    cd "$CMAKE_BUILD_DIR"
+    cmake .. -DCMAKE_BUILD_TYPE=Release
     make -j$(nproc)
-
-    cd "$INSTALL_DIR"
-    echo -e "${GREEN}[完成] C++模块编译完成。${NC}"
+    log_info "C++ 模块编译完成。"
+    cd "$SCRIPT_DIR"
 }
 
-# ---------------------------------------------------------------------------
-# 7. 配置系统参数
-# ---------------------------------------------------------------------------
-configure_system() {
-    echo -e "${BLUE}[步骤 6/7] 配置系统参数...${NC}"
-
-    # 交互式设置API密钥（如果尚未配置）
-    SETTINGS_FILE="$CONFIG_DIR/settings.yaml"
-    if [[ ! -f "$SETTINGS_FILE" ]]; then
-        echo -e "${YELLOW}[配置] 未发现 settings.yaml，创建默认配置。${NC}"
-        cat > "$SETTINGS_FILE" << EOF
-# 火种全局配置
-exchange:
-  binance:
-    api_key: "YOUR_API_KEY"
-    api_secret: "YOUR_API_SECRET"
-    testnet: false
-  bybit:  # 备用
-    api_key: ""
-    api_secret: ""
-strategy_mode: "moderate"   # aggressive / moderate
-learning_time:
-  start_hour: 1
-  start_minute: 30
-  end_hour: 4
-  end_minute: 30
-risk_limits:
-  max_drawdown: 0.15
-  daily_loss_limit: 0.05
-EOF
-        echo -e "${YELLOW}[注意] 请编辑 $SETTINGS_FILE 填入API密钥。${NC}"
+# 初始化配置文件
+init_config() {
+    log_step "初始化配置文件..."
+    if [[ ! -f "$SCRIPT_DIR/.env" ]]; then
+        if [[ -f "$SCRIPT_DIR/.env.example" ]]; then
+            cp "$SCRIPT_DIR/.env.example" "$SCRIPT_DIR/.env"
+            log_warn ".env 文件已从 .env.example 创建，请编辑填入实际 API 密钥。"
+        else
+            touch "$SCRIPT_DIR/.env"
+            log_warn "生成空 .env 文件，请手动配置 API 密钥。"
+        fi
+    else
+        log_info ".env 文件已存在，跳过。"
     fi
 
-    # 设置前端操作密码
-    AUTH_FILE="$CONFIG_DIR/auth.yaml"
-    if [[ ! -f "$AUTH_FILE" ]]; then
-        read -sp "请设置前端操作密码: " FRONT_PASS
-        echo
-        # 使用Python生成bcrypt哈希
-        source "$VENV_DIR/bin/activate"
-        HASH=$(python -c "import bcrypt; print(bcrypt.hashpw('$FRONT_PASS'.encode(), bcrypt.gensalt()).decode())")
-        deactivate
-        cat > "$AUTH_FILE" << EOF
-# 前端操作密码哈希
-password_hash: "$HASH"
-EOF
-        echo -e "${GREEN}[完成] 密码已设置。${NC}"
+    # 确保配置文件目录存在
+    mkdir -p "$CONFIG_DIR"
+    if [[ ! -f "$CONFIG_DIR/settings.yaml" ]]; then
+        cp "$CONFIG_DIR/settings.yaml.example" "$CONFIG_DIR/settings.yaml" 2>/dev/null || true
     fi
+}
 
-    # 启用日志轮转
-    cat > /etc/logrotate.d/fire_seed << EOF
-/var/log/fire_seed/*.log {
+# 初始化数据库
+init_database() {
+    log_step "初始化 SQLite 数据库..."
+    source "$VENV_DIR/bin/activate"
+    python3 -c "
+import sqlite3, os
+db_path = os.path.join('$SCRIPT_DIR', 'data', 'fire_seed.db')
+os.makedirs(os.path.dirname(db_path), exist_ok=True)
+conn = sqlite3.connect(db_path)
+conn.execute('''
+CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL,
+    type TEXT,
+    module TEXT,
+    content TEXT,
+    snapshot TEXT
+)
+''')
+conn.execute('''
+CREATE TABLE IF NOT EXISTS archive_index (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    filename TEXT UNIQUE,
+    cloud_key TEXT,
+    uploaded_at REAL
+)
+''')
+conn.commit()
+conn.close()
+print('数据库初始化完成:', db_path)
+" || log_warn "数据库初始化失败，请检查 Python 环境。"
+}
+
+# 配置日志轮转
+setup_logrotate() {
+    log_step "配置日志轮转..."
+    mkdir -p "$LOG_DIR"
+    chown -R "$PROJECT_USER:$PROJECT_USER" "$LOG_DIR" 2>/dev/null || true
+    cat > /etc/logrotate.d/fire_seed <<EOF
+$LOG_DIR/*.log {
     daily
     rotate 30
     compress
     delaycompress
     missingok
     notifempty
-    create 640 $SERVICE_USER $SERVICE_GROUP
-    postrotate
-        systemctl reload fire_seed 2>/dev/null || true
-    endscript
+    copytruncate
+    maxsize 100M
 }
 EOF
-
-    # 内核参数优化 (大页内存需要硬件支持)
-    if grep -q "hugepages" /proc/cpuinfo; then
-        echo "vm.nr_hugepages = 512" >> /etc/sysctl.conf
-        sysctl -p
-    fi
-
-    echo -e "${GREEN}[完成] 系统配置完成。${NC}"
+    log_info "日志轮转配置已写入 /etc/logrotate.d/fire_seed"
 }
 
-# ---------------------------------------------------------------------------
-# 8. 启动服务
-# ---------------------------------------------------------------------------
-setup_service() {
-    echo -e "${BLUE}[步骤 7/7] 配置systemd服务并启动...${NC}"
-
-    # 创建 systemd 服务文件
-    cat > /etc/systemd/system/fire_seed.service << EOF
+# 安装 systemd 服务
+install_service() {
+    log_step "安装 systemd 服务..."
+    cat > /etc/systemd/system/fire_seed.service <<EOF
 [Unit]
-Description=Fire Seed Trading System
-After=network.target docker.service
-Requires=docker.service
+Description=FireSeed Quant Trading System
+After=network.target redis-server.service docker.service
+Requires=redis-server.service
 
 [Service]
 Type=simple
-User=$SERVICE_USER
-Group=$SERVICE_GROUP
-WorkingDirectory=$INSTALL_DIR
-ExecStart=/bin/bash $INSTALL_DIR/start.sh
-ExecStop=/bin/bash $INSTALL_DIR/stop.sh
+User=$PROJECT_USER
+WorkingDirectory=$SCRIPT_DIR
+EnvironmentFile=$SCRIPT_DIR/.env
+ExecStart=$VENV_DIR/bin/python $SCRIPT_DIR/core/main.py
 Restart=on-failure
-RestartSec=10
-LimitNOFILE=65536
-CPUQuota=80%
-MemoryMax=7G
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-    # 重载systemd
     systemctl daemon-reload
     systemctl enable fire_seed.service
-    systemctl start fire_seed.service
-
-    echo -e "${GREEN}[完成] 火种系统已启动。${NC}"
+    log_info "systemd 服务已安装并启用 (fire_seed.service)"
 }
 
-# ---------------------------------------------------------------------------
-# 主流程
-# ---------------------------------------------------------------------------
+# 创建数据目录并调整权限
+setup_permissions() {
+    log_step "设置文件权限..."
+    chown -R "$PROJECT_USER:$PROJECT_USER" "$SCRIPT_DIR" 2>/dev/null || true
+    mkdir -p "$SCRIPT_DIR/data"
+    chmod 755 "$SCRIPT_DIR"
+    log_info "权限设置完成。"
+}
+
+# 最后健康检查
+final_check() {
+    log_step "执行最终健康检查..."
+    local errors=0
+
+    # 检查 Python 虚拟环境
+    if [[ ! -f "$VENV_DIR/bin/python" ]]; then
+        log_error "Python 虚拟环境缺失"
+        ((errors++))
+    fi
+
+    # 检查 C++ 编译产物
+    if [[ ! -f "$CMAKE_BUILD_DIR/libfire_seed_cpp.so" ]] && [[ ! -f "$CMAKE_BUILD_DIR/fire_seed_cpp.*" ]]; then
+        log_warn "未检测到 C++ 编译产物，请检查编译是否成功。"
+    fi
+
+    # 检查 .env 是否已配置
+    if [[ -f "$SCRIPT_DIR/.env" ]]; then
+        source "$SCRIPT_DIR/.env"
+        if [[ -z "${BINANCE_API_KEY:-}" ]]; then
+            log_warn "BINANCE_API_KEY 未设置，系统将无法连接交易所。"
+        fi
+    else
+        log_error ".env 文件不存在"
+        ((errors++))
+    fi
+
+    if [[ $errors -eq 0 ]]; then
+        log_info "所有检查通过，系统已准备就绪。"
+    else
+        log_warn "存在 $errors 个问题，请检查日志并修正。"
+    fi
+}
+
+# ----- 主流程 -----
 main() {
+    echo -e "${CYAN}"
+    echo "======================================="
+    echo "  火种量化系统 - 一键部署"
+    echo "  FireSeed v3.0.0-spartan"
+    echo "======================================="
+    echo -e "${NC}"
+
     check_root
-    check_ubuntu_version
-    check_resources
+    check_os
+    check_hardware
+
+    # 询问是否继续
+    read -p "按回车开始部署，或 Ctrl+C 取消..." 
 
     install_system_deps
-    create_user_and_dirs
-    deploy_code
-    setup_python_env
-    compile_cpp
-    configure_system
-    setup_service
+    setup_python
+    install_python_deps
+    build_cpp
+    init_config
+    init_database
+    setup_logrotate
+    setup_permissions
+    install_service
+    final_check
 
-    # 输出访问信息
-    IP_ADDR=$(hostname -I | awk '{print $1}')
-    echo -e "\n${GREEN}============================================${NC}"
-    echo -e "${GREEN}       火种系统部署成功！${NC}"
-    echo -e "${GREEN}============================================${NC}"
-    echo -e "${BLUE}访问地址: http://${IP_ADDR}:8000${NC}"
-    echo -e "${BLUE}日志路径: $LOG_DIR${NC}"
-    echo -e "${BLUE}可用命令:${NC}"
-    echo -e "${BLUE}  查看状态: systemctl status fire_seed${NC}"
-    echo -e "${BLUE}  停止服务: systemctl stop fire_seed${NC}"
-    echo -e "${BLUE}  启动服务: systemctl start fire_seed${NC}"
-    echo -e "${BLUE}  查看日志: journalctl -u fire_seed -f${NC}"
-    echo -e "${GREEN}============================================${NC}"
+    echo ""
+    echo -e "${GREEN}======================================"
+    echo "  部署完成！"
+    echo "  请编辑 .env 填入交易所 API 密钥"
+    echo "  启动服务: sudo systemctl start fire_seed"
+    echo "  查看状态: sudo systemctl status fire_seed"
+    echo "  访问面板: http://<服务器IP>:8000"
+    echo "======================================${NC}"
 }
 
-# 执行主函数
-main "$@" 2>&1 | tee "$LOGFILE"
+main "$@"
