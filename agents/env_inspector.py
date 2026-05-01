@@ -2,14 +2,9 @@
 """
 火种系统 (FireSeed) 环境检察官智能体 (EnvInspector)
 =====================================================
-全天候监控服务器物理与操作系统层面的健康状态，包括：
-- CPU 使用率、温度、频率调节
-- 物理内存与 SWAP 使用
-- 磁盘使用率与 I/O 延迟
-- 网络链路质量（丢包率、重传率）
-- 系统时钟同步（NTP 状态）
-- 共享内存段状态
-- 发现异常时生成分级告警并推送至消息渠道
+全天候监控服务器物理与操作系统层面的健康状态。
+世界观：物理主义 — 一切问题终将表现为物理参数异常。
+在议会中主要充当挑战者角色，当环境指标恶化时强制否决交易提案。
 """
 
 import asyncio
@@ -26,6 +21,43 @@ import psutil
 from core.behavioral_logger import BehavioralLogger, EventType, EventLevel
 from core.notifier import SystemNotifier
 
+# ---- 世界观框架 ----
+try:
+    from agents.worldview import (
+        WorldViewAgent, WorldViewManifesto, WorldView
+    )
+except ImportError:
+    # 轻量回退：允许在不依赖完整 worldview 模块时仍可独立测试
+    class WorldViewAgent:
+        def __init__(self, manifesto=None): self.manifesto = manifesto
+        def propose(self, perception): raise NotImplementedError
+        def challenge(self, other_proposal, my_worldview): raise NotImplementedError
+
+    class WorldViewManifesto:
+        def __init__(self, worldview=None, core_belief="", primary_optimization_target="",
+                     adversary_worldview=None, forbidden_data_source=None, time_scale="1m"):
+            self.worldview = worldview
+            self.core_belief = core_belief
+            self.primary_optimization_target = primary_optimization_target
+            self.adversary_worldview = adversary_worldview
+            self.forbidden_data_source = forbidden_data_source or set()
+            self.time_scale = time_scale
+
+    class WorldView:
+        PHYSICALISM = "物理主义"
+        MECHANICAL_MATERIALISM = "机械唯物主义"
+        EVOLUTIONISM = "进化论"
+        EXISTENTIALISM = "存在主义"
+        SKEPTICISM = "怀疑论"
+        INCOMPLETENESS = "不完备定理"
+        OCCAMS_RAZOR = "奥卡姆剃刀"
+        BAYESIANISM = "贝叶斯主义"
+        HERMENEUTICS = "诠释学"
+        PLURALISM = "多元主义"
+        HISTORICISM = "历史主义"
+        HOLISM = "整体论"
+
+
 logger = logging.getLogger("fire_seed.env_inspector")
 
 
@@ -39,43 +71,99 @@ class EnvAlert:
     suggestion: str = ""
 
 
-class EnvInspector:
+class EnvInspector(WorldViewAgent):
     """
     环境检察官智能体。
-    以固定间隔扫描操作系统与硬件指标，输出诊断报告与告警。
+    世界观：物理主义 — 硬件状态决定一切。
+    守护服务器物理健康，极端情况下可以否决议会提案。
     """
 
     def __init__(self,
                  behavior_log: Optional[BehavioralLogger] = None,
                  notifier: Optional[SystemNotifier] = None,
                  check_interval_sec: int = 60):
-        """
-        :param behavior_log: 全系统行为日志实例
-        :param notifier:     消息推送器
-        :param check_interval_sec: 定时检查间隔（秒）
-        """
+        # 构建物理主义宣言
+        manifesto = WorldViewManifesto(
+            worldview=WorldView.PHYSICALISM,
+            core_belief="一切系统问题最终都会表现为CPU、内存、磁盘或网络的物理异常",
+            primary_optimization_target="uptime / error_count",
+            adversary_worldview=WorldView.MECHANICAL_MATERIALISM,
+            forbidden_data_source={"KLINE", "ORDERBOOK", "POSITION"},
+            time_scale="1m"
+        )
+        super().__init__(manifesto)
+
         self.behavior_log = behavior_log
         self.notifier = notifier
         self.check_interval = check_interval_sec
 
-        # 历史告警列表（内存）
         self._alerts: List[EnvAlert] = []
-        # 上一次检查时间
         self._last_check = 0.0
-
-        # 连续异常计数器（用于去重）
         self._consecutive_issues: Dict[str, int] = {}
-
-        # 网络历史（用于判断趋势）
         self._net_drop_history: deque = deque(maxlen=60)
         self._net_retrans_history: deque = deque(maxlen=60)
 
-    # ======================== 主诊断入口 ========================
-    async def evaluate(self) -> Dict[str, Any]:
+        # 上一次环境综合风险评分 (0-1)
+        self._current_risk_score = 0.0
+
+    # ======================== 世界观接口：提议 ========================
+    def propose(self, perception: Dict = None) -> Dict:
         """
-        执行一次全面的硬件环境诊断。
-        返回结构化诊断报告，推送异常告警。
+        物理主义者提案：基于当前环境健康度，给出环境风险评分。
+        该提案本身不直接产生交易信号，但风险评分会被议会参考。
         """
+        self.evaluate()  # 刷新环境数据
+        risk = self._current_risk_score
+        return {
+            "direction": 0,                     # 中性无方向
+            "confidence": risk,                 # 风险越高越不适宜交易
+            "type": "environmental_risk",
+            "source": "EnvInspector",
+            "detail": f"环境风险评分 {risk:.2f}",
+        }
+
+    # ======================== 世界观接口：挑战 ========================
+    def challenge(self, other_proposal: Dict, my_worldview=None) -> Dict:
+        """
+        从物理主义角度挑战其他智能体的提案。
+        当前环境恶化时，直接否决高风险交易方向。
+        :return: {'veto': bool, 'reason': str}
+        """
+        # 刷新最新环境状态
+        self.evaluate()
+        risk = self._current_risk_score
+
+        # 环境健康时通过
+        if risk < 0.4:
+            return {"veto": False, "reason": "环境物理指标正常"}
+
+        # 环境轻度恶化：仅否决高杠杆或大仓位建议
+        if risk < 0.7:
+            proposal_dir = other_proposal.get("direction", 0)
+            if proposal_dir != 0:
+                return {
+                    "veto": True,
+                    "reason": f"环境风险 {risk:.2f}，物理世界不支持新开仓位",
+                }
+            return {"veto": False, "reason": "风险可控"}
+
+        # 环境严重恶化：无条件否决
+        return {
+            "veto": True,
+            "reason": f"物理环境严重恶化 (风险 {risk:.2f})，所有交易提案必须暂停",
+        }
+
+    # ======================== 主诊断评估 ========================
+    async def evaluate_async(self) -> Dict[str, Any]:
+        """异步执行环境检查（供外部调用）"""
+        now = time.time()
+        if now - self._last_check < self.check_interval:
+            return {"status": "throttled"}
+        self._last_check = now
+        return self.evaluate()
+
+    def evaluate(self) -> Dict[str, Any]:
+        """执行一次全面的硬件环境诊断（同步，供内部使用）"""
         now = time.time()
         if now - self._last_check < self.check_interval:
             return {"status": "throttled"}
@@ -84,26 +172,36 @@ class EnvInspector:
         alerts: List[EnvAlert] = []
         self._run_checks(alerts)
 
+        # 计算综合风险评分
+        self._current_risk_score = self._calc_risk_score(alerts)
+
         # 推送告警
         for alert in alerts:
             self._emit_alert(alert)
 
-        # 写入行为日志
         if self.behavior_log:
             self.behavior_log.log(
                 EventType.SYSTEM, "EnvInspector",
-                f"环境检查完成，告警: {len(alerts)}"
+                f"环境检查完成，告警: {len(alerts)}, 风险评分: {self._current_risk_score:.2f}"
             )
 
-        # 清理旧告警
         if len(self._alerts) > 200:
             self._alerts = self._alerts[-200:]
 
         return {
             "status": "WARNING" if alerts else "OK",
             "alerts": [self._alert_to_dict(a) for a in alerts[-10:]],
-            "timestamp": datetime.now().isoformat()
+            "risk_score": self._current_risk_score,
+            "timestamp": datetime.now().isoformat(),
         }
+
+    def _calc_risk_score(self, alerts: List[EnvAlert]) -> float:
+        """从告警等级计算综合环境风险得分"""
+        if not alerts:
+            return 0.0
+        weights = {EventLevel.CRITICAL: 0.4, EventLevel.WARN: 0.2, EventLevel.INFO: 0.05}
+        score = sum(weights.get(a.level, 0.05) for a in alerts)
+        return min(1.0, score)
 
     # ======================== 具体检查项 ========================
     def _run_checks(self, alerts: List[EnvAlert]) -> None:
@@ -115,8 +213,6 @@ class EnvInspector:
         self._check_shm(alerts)
 
     def _check_cpu(self, alerts: List[EnvAlert]) -> None:
-        """CPU 使用率、温度、降频"""
-        # 使用率
         cpu_pct = psutil.cpu_percent(interval=0.1)
         if cpu_pct > 90:
             alerts.append(EnvAlert(
@@ -125,8 +221,6 @@ class EnvInspector:
                 message=f"CPU 使用率 {cpu_pct:.1f}% 超过 90%",
                 suggestion="检查是否有异常进程占用"
             ))
-
-        # 温度（需 lm-sensors，psutil 可读取部分平台）
         try:
             temps = psutil.sensors_temperatures()
             for name, entries in temps.items():
@@ -140,8 +234,6 @@ class EnvInspector:
                         ))
         except Exception:
             pass
-
-        # 降频检查
         freq = psutil.cpu_freq()
         if freq and freq.max and freq.current < freq.max * 0.5:
             alerts.append(EnvAlert(
@@ -152,7 +244,6 @@ class EnvInspector:
             ))
 
     def _check_memory(self, alerts: List[EnvAlert]) -> None:
-        """内存与 SWAP 使用"""
         mem = psutil.virtual_memory()
         if mem.percent > 90:
             alerts.append(EnvAlert(
@@ -161,9 +252,7 @@ class EnvInspector:
                 message=f"内存使用 {mem.percent:.1f}% (剩余 {mem.available/(1024**3):.1f}GB)",
                 suggestion="考虑增加内存或关闭非必要服务"
             ))
-
         swap = psutil.swap_memory()
-        # SWAP 使用超过 100MB 视为异常
         if swap.used > 100 * 1024 * 1024:
             alerts.append(EnvAlert(
                 level=EventLevel.WARN,
@@ -171,8 +260,6 @@ class EnvInspector:
                 message=f"SWAP 已使用 {swap.used/(1024**2):.0f}MB，可能导致性能下降",
                 suggestion="检查内存压力，避免频繁换页"
             ))
-
-        # 大页检查（/proc/meminfo）
         try:
             with open('/proc/meminfo') as f:
                 for line in f:
@@ -190,7 +277,6 @@ class EnvInspector:
             pass
 
     def _check_disk(self, alerts: List[EnvAlert]) -> None:
-        """磁盘使用率与 I/O 延迟"""
         for part in psutil.disk_partitions(all=False):
             try:
                 usage = psutil.disk_usage(part.mountpoint)
@@ -204,21 +290,12 @@ class EnvInspector:
             except Exception:
                 pass
 
-        # 磁盘 I/O 延迟（仅 Linux）
-        try:
-            io_counters = psutil.disk_io_counters()
-            # 此处无法直接获取延迟，仅记录占位
-        except Exception:
-            pass
-
     def _check_network(self, alerts: List[EnvAlert]) -> None:
-        """网络链路质量"""
         try:
             stats = psutil.net_io_counters(pernic=True)
             for iface, s in stats.items():
                 if iface == 'lo':
                     continue
-                # 丢包率
                 drop_pct = (s.dropin + s.dropout) / max(s.packets_recv + s.packets_sent, 1) * 100
                 self._net_drop_history.append(drop_pct)
                 if drop_pct > 1.0:
@@ -228,12 +305,10 @@ class EnvInspector:
                         message=f"网卡 {iface} 丢包率 {drop_pct:.2f}%",
                         suggestion="检查物理链路与交换机"
                     ))
-                # 重传率（TCP 层面，psutil 未直接提供，可略）
         except Exception:
             pass
 
     def _check_clock(self, alerts: List[EnvAlert]) -> None:
-        """系统时钟同步状态"""
         try:
             import subprocess
             result = subprocess.run(
@@ -248,34 +323,23 @@ class EnvInspector:
                     suggestion="启用 NTP 同步以保持时间精度"
                 ))
         except Exception:
-            # 非 systemd 环境忽略
             pass
 
     def _check_shm(self, alerts: List[EnvAlert]) -> None:
-        """共享内存使用情况"""
         try:
             import subprocess
-            result = subprocess.run(
-                ['ipcs', '-m', '-u'],
-                capture_output=True, text=True, timeout=2
-            )
-            # 简单解析（不作复杂处理）
-            if 'max total' in result.stdout.lower():
-                pass  # 未来可更详细解析
+            subprocess.run(['ipcs', '-m', '-u'], capture_output=True, text=True, timeout=2)
+            # 解析占位，生产可进一步分析
         except Exception:
             pass
 
     # ======================== 告警处理 ========================
     def _emit_alert(self, alert: EnvAlert) -> None:
-        """记录并推送告警"""
         self._alerts.append(alert)
-
-        # 去重：同一来源连续出现时降低推送频率
         key = f"{alert.source}_{alert.level.value}"
         self._consecutive_issues[key] = self._consecutive_issues.get(key, 0) + 1
         if self._consecutive_issues[key] % 3 != 0:
-            return  # 每3次重复才推送
-
+            return
         if self.notifier:
             asyncio.ensure_future(
                 self.notifier.send_alert(
@@ -295,12 +359,11 @@ class EnvInspector:
             "suggestion": alert.suggestion,
         }
 
-    # ======================== 查询接口 ========================
     def get_recent_alerts(self, limit: int = 20) -> List[Dict]:
         return [self._alert_to_dict(a) for a in self._alerts[-limit:]]
 
+    # ======================== 独立运行循环 (兼容旧调用) ========================
     async def run_loop(self) -> None:
-        """独立运行循环（可选）"""
         while True:
-            await self.evaluate()
+            await self.evaluate_async()
             await asyncio.sleep(self.check_interval)
