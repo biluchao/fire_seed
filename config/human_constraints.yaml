@@ -1,0 +1,46 @@
+# =============================================================================
+# 火种系统 (FireSeed) 人类智慧注入铁律库
+# =============================================================================
+# 本文件由 HWIP 季度审计流程生成并维护，严禁系统自动修改。
+# 所有已生效约束将在每次策略决策前作为无条件前置检查执行。
+
+constraints:
+  - id: "HWIP-2025-Q1-001"
+    date: "2025-03-15"
+    auditor: "张三"
+    rule: "当比特币30天年化波动率低于20%时，趋势策略的最大杠杆强制降为1.5倍。"
+    reason: "低波动环境下趋势策略盈亏比显著下降，需主动降低风险敞口。"
+    condition:
+      metric: "btc_30d_volatility"
+      operator: "<"
+      threshold: 0.20
+    action:
+      type: "force_param"
+      target: "strategy.trend.max_leverage"
+      value: 1.5
+
+  - id: "HWIP-2025-Q1-002"
+    date: "2025-03-15"
+    auditor: "张三"
+    rule: "在美股财报季（1月/4月/7月/10月的前两周）期间，禁止使用激进策略模式。"
+    reason: "财报季比特币与美股的相关性显著上升，产生外部未建模风险。"
+    condition:
+      metric: "current_month"
+      operator: "in"
+      value: [1, 4, 7, 10]
+      day_range: [1, 14]
+    action:
+      type: "force_mode"
+      value: "moderate"
+
+  - id: "HWIP-2025-Q1-003"
+    date: "2025-03-15"
+    auditor: "李四"
+    rule: "因子 'order_book_slope_v2' 在震荡市中的IC已低于0.01，将权重永久降为辅助因子且不允许自动恢复。"
+    reason: "该因子在近期震荡环境中持续失效，需等待市场结构恢复。"
+    condition:
+      regime: "oscillation"
+    action:
+      type: "freeze_factor"
+      target: "order_book_slope_v2"
+      weight: 0.0
