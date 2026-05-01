@@ -2,232 +2,191 @@
 """
 火种系统 (FireSeed) 监察者智能体 (Sentinel)
 =============================================
-全天候监控系统运行状态，包含：
-- 关键进程存活 (引擎、C++守护进程、Redis、Docker)
-- 系统资源 (CPU、内存、磁盘、SWAP)
-- 网络延迟与丢包率
-- API 限频与错误率
-- 数据库连接与日志写入
-- 熔断、回撤、策略异常等交易指标
+世界观：机械唯物主义
+核心信仰：系统是可由独立组件分解的钟表，任何故障均可定位。
+优化目标：-log(F1_score) 宁可误报不可漏报。
+专属数据源：系统资源、进程状态、API 限频、数据库响应。
+禁止数据源：K 线、订单簿、价格数据。
+时间尺度：15 秒。
 
-发现异常时生成分级告警并推送至消息渠道。
+在议会中，监察者根据系统整体健康度提出风险预警建议，
+并从资源可行性角度挑战其他智能体的激进提案。
 """
 
 import asyncio
 import logging
 import time
-from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from api.server import get_engine, get_config
+import psutil
+
+from agents.worldview import WorldView, WorldViewManifesto, WorldViewAgent
+from agents.extreme_rewards import ExtremeRewardFunctions
 from core.behavioral_logger import BehavioralLogger, EventType, EventLevel
-from core.self_check import SystemSelfCheck
 from core.notifier import SystemNotifier
+from core.self_check import SystemSelfCheck
 
 logger = logging.getLogger("fire_seed.sentinel")
 
 
-@dataclass
-class HealthAlert:
-    """健康告警条目"""
-    timestamp: datetime = field(default_factory=datetime.now)
-    level: EventLevel = EventLevel.INFO
-    source: str = ""
-    message: str = ""
-    suggestion: str = ""
-    acknowledged: bool = False
-
-
-class SentinelAgent:
+class SentinelAgent(WorldViewAgent):
     """
     监察者智能体。
-    以固定间隔扫描系统各维度，生成综合健康报告。
-    可在引擎后台线程中运行，也可按需调用。
+    继承 WorldViewAgent，以机械唯物主义视角监控系统组件状态。
     """
 
     def __init__(self,
                  behavior_log: Optional[BehavioralLogger] = None,
-                 notifier: Optional[SystemNotifier] = None,
-                 check_interval_sec: int = 15):
-        """
-        :param behavior_log: 全系统行为日志实例
-        :param notifier:     消息推送器
-        :param check_interval_sec: 定时检查间隔（秒）
-        """
+                 notifier: Optional[SystemNotifier] = None):
+        # 构建世界观宣言
+        manifesto = WorldViewManifesto(
+            worldview=WorldView.MECHANICAL_MATERIALISM,
+            core_belief="系统是可分解为独立组件的钟表，故障可定位",
+            primary_optimization_target=ExtremeRewardFunctions.REWARD_MAP[
+                WorldView.MECHANICAL_MATERIALISM
+            ]["formula"],
+            adversary_worldview=WorldView.HOLISM,  # 与整体论对立
+            forbidden_data_source={"KLINE", "ORDERBOOK", "PRICE"},
+            exclusive_data_source={"SYSTEM_METRICS", "PROCESS_STATE", "API_LIMIT", "DB_RESPONSE"},
+            time_scale="15s"
+        )
+        super().__init__(manifesto)
+
         self.behavior_log = behavior_log
         self.notifier = notifier
-        self.check_interval = check_interval_sec
-
-        # 历史告警列表（内存）
-        self._alerts: List[HealthAlert] = []
-        # 上一次检查时间
-        self._last_check = 0.0
-        # 自检模块
         self._self_check = SystemSelfCheck()
+        self._last_health_report = None
 
-        # 连续异常计数器（用于避免重复告警）
-        self._consecutive_issues: Dict[str, int] = {}
+    # ======================== 议会接口 ========================
+    def propose(self, perception: Dict) -> Dict:
+        """
+        基于当前系统组件状态生成提案。
+        返回：{"direction": 1/-1/0, "confidence": 0-1, "reason": str}
+        """
+        # 运行系统自检
+        health_report = self._self_check.run()
+        self._last_health_report = health_report
 
-    # ======================== 主入口 ========================
+        # 计算健康评分
+        score = health_report.score
+
+        # 根据健康度确定方向与置信度
+        if score >= 80:
+            direction = 1   # 系统健康，倾向正常交易
+            confidence = 0.8
+            reason = f"系统健康评分 {score}，各组件运行正常"
+        elif score >= 60:
+            direction = 0   # 中性，建议谨慎
+            confidence = 0.6
+            reason = f"系统健康评分 {score}，部分组件有轻微异常"
+        elif score >= 40:
+            direction = -1  # 建议减仓/防御
+            confidence = 0.75
+            reason = f"系统健康评分 {score}，多个组件告警，建议降低风险暴露"
+        else:
+            direction = -1
+            confidence = 0.9
+            reason = f"系统健康评分 {score}，严重故障风险，强烈建议暂停交易"
+
+        return {
+            "direction": direction,
+            "confidence": confidence,
+            "reason": reason,
+            "source": "Sentinel",
+            "health_score": score,
+            "timestamp": datetime.now().isoformat()
+        }
+
+    def challenge(self, other_proposal: Dict, my_worldview: WorldView) -> Dict:
+        """
+        从机械唯物主义视角挑战其他智能体的提案。
+        主要检查提案是否与当前系统资源状态相容。
+        返回：{"veto": bool, "reason": str, "confidence_adjustment": float}
+        """
+        challenges = []
+        veto = False
+
+        # 获取当前系统资源状态
+        cpu_pct = psutil.cpu_percent(interval=0.1)
+        mem_pct = psutil.virtual_memory().percent
+        disk_pct = psutil.disk_usage('/').percent
+
+        proposed_direction = other_proposal.get("direction", 0)
+        proposed_confidence = other_proposal.get("confidence", 0.5)
+
+        # 如果提案是激进做多或做空，但系统资源紧张，则挑战
+        if proposed_direction != 0 and proposed_confidence > 0.7:
+            if cpu_pct > 85:
+                challenges.append(f"CPU 使用率 {cpu_pct:.1f}%，可能影响交易延迟")
+                veto = True
+            if mem_pct > 90:
+                challenges.append(f"内存使用率 {mem_pct:.1f}%，SWAP 风险升高")
+                veto = True
+            if disk_pct > 92:
+                challenges.append(f"磁盘使用率 {disk_pct:.1f}%，日志写入可能阻塞")
+                veto = True
+
+        # 检查数据库连接（若可用）
+        try:
+            import sqlite3
+            db_path = "data/fire_seed.db"
+            if not __import__('os').path.exists(db_path):
+                challenges.append("数据库文件缺失，订单记录可能不完整")
+                veto = True
+            else:
+                conn = sqlite3.connect(db_path)
+                conn.execute("SELECT 1")
+                conn.close()
+        except Exception as e:
+            challenges.append(f"数据库连接异常: {str(e)[:50]}")
+            veto = True
+
+        # 如果提案来自非机械唯物主义者，监察者会从系统稳定性角度质疑
+        if other_proposal.get("source") not in ("Sentinel",):
+            if not self._is_system_stable():
+                challenges.append("近期系统资源波动较大，不适合执行高风险提案")
+                veto = True
+
+        reason = "; ".join(challenges) if challenges else "系统资源充裕，提案可行"
+
+        return {
+            "veto": veto,
+            "reason": reason,
+            "challenges": challenges,
+            "confidence_adjustment": -0.2 if veto else 0.0
+        }
+
+    # ======================== 内部判断方法 ========================
+    def _is_system_stable(self) -> bool:
+        """检查系统近期是否稳定（无大幅波动）"""
+        try:
+            # 获取1分钟平均负载
+            load1 = psutil.getloadavg()[0]
+            cpu_count = psutil.cpu_count()
+            if cpu_count and load1 / cpu_count > 2.0:
+                return False
+            # 内存是否持续增长
+            return True
+        except Exception:
+            return True
+
+    # ======================== 供外部调用的健康评估 ========================
     async def evaluate(self) -> Dict[str, Any]:
         """
-        执行一次全面健康评估。
-        返回结构化健康报告，并推送异常告警。
+        执行一次传统的健康评估（兼容旧接口）。
+        返回结构化报告。
         """
-        now = time.time()
-        # 频率控制（避免高频重复检查）
-        if now - self._last_check < self.check_interval:
-            return {"status": "throttled"}
-
-        self._last_check = now
-        report = self._self_check.run()  # 核心系统自检
-
-        alerts = []
-        # 遍历自检报告中的异常项
-        for check in report.checks:
-            if check.status == "ERROR":
-                alert = HealthAlert(
-                    level=EventLevel.CRITICAL,
-                    source=check.name,
-                    message=check.message,
-                    suggestion="请立即检查相关模块"
-                )
-                alerts.append(alert)
-            elif check.status == "WARNING":
-                alert = HealthAlert(
-                    level=EventLevel.WARN,
-                    source=check.name,
-                    message=check.message,
-                    suggestion="关注趋势，必要时手动介入"
-                )
-                alerts.append(alert)
-
-        # 额外维度：策略与风险指标
-        await self._check_strategy_health(alerts)
-
-        # 合并告警并推送
-        for alert in alerts:
-            self._emit_alert(alert)
-
-        # 写入行为日志
-        if self.behavior_log:
-            self.behavior_log.log(
-                EventType.SYSTEM,
-                "Sentinel",
-                f"健康检查完成，评分={report.score}，告警={len(alerts)}",
-                snapshot={"score": report.score, "alerts": len(alerts)}
-            )
-
-        # 清理过时告警（保留最近200条）
-        if len(self._alerts) > 200:
-            self._alerts = self._alerts[-200:]
-
+        health_report = self._self_check.run()
         return {
-            "health_score": report.score,
-            "status": report.status,
-            "alerts": [self._alert_to_dict(a) for a in alerts[-10:]],
-            "timestamp": report.timestamp
+            "health_score": health_report.score,
+            "status": health_report.status,
+            "checks": [{"name": c.name, "status": c.status, "message": c.message}
+                       for c in health_report.checks],
+            "timestamp": datetime.now().isoformat()
         }
 
-    # ======================== 策略与风险检测 ========================
-    async def _check_strategy_health(self, alerts: List[HealthAlert]) -> None:
-        """检查策略层面的健康度（需从引擎获取数据）"""
-        try:
-            engine = get_engine()
-            if engine is None:
-                return
-
-            # 检查日亏损是否接近熔断
-            risk = engine.risk_monitor
-            cb = risk.circuit_breaker
-            if cb.level >= 1:
-                alerts.append(HealthAlert(
-                    level=EventLevel.WARN if cb.level == 1 else EventLevel.CRITICAL,
-                    source="熔断监控",
-                    message=f"当前熔断级别 {cb.level}: {cb.reason}",
-                    suggestion="检查仓位与风险敞口"
-                ))
-
-            # 检查是否连续亏损
-            daily_stats = engine.order_mgr.get_daily_trading_stats()
-            if daily_stats.get("realized_pnl", 0) < -500:
-                alerts.append(HealthAlert(
-                    level=EventLevel.WARN,
-                    source="策略绩效",
-                    message=f"今日亏损 {daily_stats['realized_pnl']:.0f} USDT",
-                    suggestion="考虑暂停或缩减仓位"
-                ))
-
-            # 检查API错误率
-            api_err_rate = getattr(engine.execution, 'error_rate', 0.0)
-            if api_err_rate > 0.02:
-                alerts.append(HealthAlert(
-                    level=EventLevel.WARN,
-                    source="API错误率",
-                    message=f"错误率 {api_err_rate*100:.1f}%",
-                    suggestion="检查交易所连接与限频状态"
-                ))
-
-        except Exception as e:
-            logger.warning(f"策略健康检查异常: {e}")
-
-    # ======================== 告警推送 ========================
-    def _emit_alert(self, alert: HealthAlert) -> None:
-        """记录告警并推送至消息渠道"""
-        # 连续相同告警去重：如果30秒内已经发送过相同来源的告警，跳过
-        recent_key = f"{alert.source}_{alert.level.value}"
-        if recent_key in self._consecutive_issues:
-            self._consecutive_issues[recent_key] += 1
-            if self._consecutive_issues[recent_key] % 5 != 0:  # 每5次重复才再次通知
-                return
-        else:
-            self._consecutive_issues[recent_key] = 1
-
-        self._alerts.append(alert)
-
-        # 推送至消息渠道
-        if self.notifier:
-            asyncio.ensure_future(
-                self.notifier.send_alert(
-                    level=alert.level.value,
-                    title=f"监察者告警 [{alert.source}]",
-                    body=f"{alert.message}\n建议: {alert.suggestion}"
-                )
-            )
-
-    @staticmethod
-    def _alert_to_dict(alert: HealthAlert) -> Dict[str, Any]:
-        return {
-            "timestamp": alert.timestamp.isoformat(),
-            "level": alert.level.value,
-            "source": alert.source,
-            "message": alert.message,
-            "suggestion": alert.suggestion,
-        }
-
-    # ======================== 告警查询 ========================
-    def get_recent_alerts(self, limit: int = 20, level: Optional[str] = None) -> List[Dict]:
-        """获取最近的健康告警"""
-        result = []
-        for alert in reversed(self._alerts):
-            if level and alert.level.value != level:
-                continue
-            result.append(self._alert_to_dict(alert))
-            if len(result) >= limit:
-                break
-        return result
-
-    def acknowledge(self, index: int) -> bool:
-        """确认一条告警为已知"""
-        if 0 <= index < len(self._alerts):
-            self._alerts[index].acknowledged = True
-            return True
-        return False
-
-    # ======================== 定时循环 (可由外部协程驱动) ========================
-    async def run_loop(self):
-        """如果需要独立运行循环，可使用此方法"""
-        while True:
-            await self.evaluate()
-            await asyncio.sleep(self.check_interval)
+    # ======================== 生命周期 ========================
+    def terminate(self) -> None:
+        """优雅清理资源"""
+        pass
