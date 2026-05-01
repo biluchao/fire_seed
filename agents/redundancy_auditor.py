@@ -2,6 +2,7 @@
 """
 火种系统 (FireSeed) 冗余审计官智能体 (RedundancyAuditor)
 ============================================================
+奥卡姆剃刀世界观：简洁是真理的标志，冗余是熵的征兆。
 定期扫描项目代码库与配置文件，检测并报告：
 - 未被调用的函数与类
 - 未被引用的配置项
@@ -9,47 +10,63 @@
 - 重复代码片段
 - 冗余导入
 
-可集成到夜间任务调度，帮助保持系统清洁度与低熵值。
+在对抗式议会中，提出基于代码清洁度的提案，并对其他智能体的复杂提案行使否决权。
 """
 
 import ast
+import asyncio
 import logging
 import os
 import re
+import time
 from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import yaml
 
+from agents.worldview import WorldViewAgent, WorldViewManifesto, WorldView
+from core.behavioral_logger import BehavioralLogger, EventType, EventLevel
+from core.notifier import SystemNotifier
+
 logger = logging.getLogger("fire_seed.redundancy_auditor")
 
 
-class RedundancyAuditor:
+class RedundancyAuditor(WorldViewAgent):
     """
-    冗余审计官智能体。
-    用法：
-        auditor = RedundancyAuditor(root="/path/to/project")
-        report = auditor.scan_all()
-        print(report["dead_code_score"])
+    冗余审计官智能体 - 奥卡姆剃刀世界观。
+    负责保持代码库的清洁，通过定期扫描推动简化。
     """
 
-    def __init__(self, root: str = ".", behavior_log=None):
-        """
-        :param root: 项目根目录路径
-        :param behavior_log: 可选的行为日志实例
-        """
+    def __init__(
+        self,
+        root: str = ".",
+        behavior_log: Optional[BehavioralLogger] = None,
+        notifier: Optional[SystemNotifier] = None,
+        check_interval_sec: int = 86400,  # 默认每日扫描一次
+    ):
+        manifesto = WorldViewManifesto(
+            worldview=WorldView.OCCAMS_RAZOR,
+            core_belief="简洁是真理的标志，冗余是熵的征兆",
+            primary_optimization_target="-code_lines",
+            adversary_worldview=WorldView.PLURALISM,
+            forbidden_data_source={"ALL_MARKET_DATA"},
+            exclusive_data_source={"SOURCE_CODE"},
+            time_scale="86400",
+        )
+        super().__init__(manifesto)
+
         self.root = Path(root)
         self.behavior_log = behavior_log
+        self.notifier = notifier
+        self.check_interval = check_interval_sec
 
         # 存储定义与调用关系
         self.defined_functions: Dict[str, List[Tuple[str, str, int]]] = defaultdict(list)
-        #              func_name -> [(file, func_name, line)]
         self.defined_classes: Dict[str, List[Tuple[str, str, int]]] = defaultdict(list)
         self.called_functions: Set[str] = set()
         self.used_classes: Set[str] = set()
-
-        # 空函数列表
         self.empty_functions: List[str] = []
 
         # 配置文件引用情况
@@ -59,7 +76,50 @@ class RedundancyAuditor:
         # 扫描结果
         self.issues: List[str] = []
 
-    # ======================== 主扫描方法 ========================
+        self._last_scan = 0.0
+
+    # ================== WorldViewAgent 接口实现 ==================
+    def propose(self, perception: Dict = None) -> Dict:
+        """
+        基于自身世界观提出决策建议。
+        返回当前代码冗余度评估，并给出清理建议。
+        """
+        # 确保扫描频率
+        now = time.time()
+        if now - self._last_scan < self.check_interval:
+            # 返回缓存的结果
+            return self._cached_proposal or self._create_empty_proposal()
+
+        report = self.scan_all()
+        self._cached_proposal = self._build_proposal(report)
+        self._last_scan = now
+        return self._cached_proposal
+
+    def challenge(self, other_proposal: Dict, my_worldview: WorldView = None) -> Dict:
+        """
+        从奥卡姆剃刀世界观挑战其他智能体的提案。
+        若提案会增加系统复杂度（引入新因子、新策略），则行使否决权。
+        """
+        veto = False
+        reason = ""
+        confidence_adjust = 0.0
+
+        # 检查提案是否涉及增加复杂度
+        proposal_type = other_proposal.get("type", "")
+        complexity_delta = other_proposal.get("complexity_delta", 0)
+
+        if proposal_type in ("new_strategy", "new_factor", "new_parameter"):
+            if complexity_delta > 0.2:
+                veto = True
+                reason = f"提案 '{proposal_type}' 增加系统复杂度 (Δ={complexity_delta:.2f})，违背奥卡姆剃刀原则"
+                confidence_adjust = -0.2
+            elif complexity_delta > 0.05:
+                reason = f"提案 '{proposal_type}' 轻微增加复杂度，建议审核其必要性"
+                confidence_adjust = -0.05
+
+        return {"veto": veto, "reason": reason, "confidence_adjustment": confidence_adjust}
+
+    # ================== 核心扫描逻辑 ==================
     def scan_all(self) -> Dict[str, Any]:
         """
         扫描整个项目并返回审计报告。
@@ -102,13 +162,13 @@ class RedundancyAuditor:
 
         if self.behavior_log:
             self.behavior_log.info(
-                EventType.AGENT, "RedundancyAuditor",
-                f"审计完成: 死代码评分 {dead_score}, 未用函数 {len(unused_funcs)}"
+                EventType.AGENT,
+                "RedundancyAuditor",
+                f"审计完成: 死代码评分 {dead_score}, 未用函数 {len(unused_funcs)}",
             )
 
         return report
 
-    # ======================== 内部扫描逻辑 ========================
     def _reset(self) -> None:
         self.defined_functions.clear()
         self.defined_classes.clear()
@@ -122,8 +182,10 @@ class RedundancyAuditor:
     def _is_excluded(self, path: Path) -> bool:
         """排除虚拟环境、缓存等目录"""
         parts = set(path.parts)
-        excluded = {"__pycache__", ".git", ".venv", "venv", "node_modules",
-                    ".eggs", "build", "dist", ".tox", ".mypy_cache", ".pytest_cache"}
+        excluded = {
+            "__pycache__", ".git", ".venv", "venv", "node_modules",
+            ".eggs", "build", "dist", ".tox", ".mypy_cache", ".pytest_cache",
+        }
         return bool(parts & excluded)
 
     def _scan_python_file(self, filepath: Path) -> None:
@@ -140,23 +202,17 @@ class RedundancyAuditor:
 
         rel_path = str(filepath.relative_to(self.root))
 
-        # 遍历 AST 收集定义和调用
         for node in ast.walk(tree):
             # 函数定义
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 func_name = node.name
-                self.defined_functions[func_name].append(
-                    (rel_path, func_name, node.lineno)
-                )
-                # 检查空函数体
+                self.defined_functions[func_name].append((rel_path, func_name, node.lineno))
                 if len(node.body) == 1 and isinstance(node.body[0], ast.Pass):
                     self.empty_functions.append(f"{rel_path}:{node.lineno} {func_name}")
 
             # 类定义
             elif isinstance(node, ast.ClassDef):
-                self.defined_classes[node.name].append(
-                    (rel_path, node.name, node.lineno)
-                )
+                self.defined_classes[node.name].append((rel_path, node.name, node.lineno))
 
             # 函数调用
             elif isinstance(node, ast.Call):
@@ -168,26 +224,13 @@ class RedundancyAuditor:
                 if func_name:
                     self.called_functions.add(func_name)
 
-            # 类使用 (简单检测实例化)
-            elif isinstance(node, ast.ClassDef):
-                # 类定义已经在上面处理，这里不需要
-                pass
-            # 同时也检查 Name 节点中可能引用的类（比如作为类型注解）
+            # 类使用 (简单检测 Name 节点)
             elif isinstance(node, ast.Name):
                 if node.id in self.defined_classes:
                     self.used_classes.add(node.id)
 
-        # 额外检查未使用的导入
-        self._check_unused_imports(tree, rel_path)
-
-    def _check_unused_imports(self, tree: ast.AST, rel_path: str) -> None:
-        """简单的未使用导入检查（占位）"""
-        # 实际实现较复杂，需要追踪作用域内的名称引用
-        # 这里仅忽略，避免影响主要功能
-        pass
-
     def _scan_config_files(self) -> None:
-        """扫描 YAML 配置文件，收集键并与代码中的引用进行对比"""
+        """扫描 YAML 配置文件，收集键并与代码引用对比"""
         config_files = list(self.root.rglob("*.yaml")) + list(self.root.rglob("*.yml"))
         for cfg_file in config_files:
             if self._is_excluded(cfg_file):
@@ -197,28 +240,83 @@ class RedundancyAuditor:
                     data = yaml.safe_load(f)
                 if not isinstance(data, dict):
                     continue
-                # 递归收集所有键路径
                 self._collect_config_keys(data, "")
             except Exception:
                 continue
 
-        # 在 Python 代码中搜索 yaml 键引用（简单字符串匹配）
+        # 在 Python 代码中搜索 yaml 键引用
         for py_file in self.root.rglob("*.py"):
             if self._is_excluded(py_file):
                 continue
             try:
                 text = py_file.read_text(encoding="utf-8")
                 for key in list(self.config_keys_defined):
-                    # 精确匹配键字符串的引用
                     if f"'{key}'" in text or f'"{key}"' in text:
                         self.config_keys_used.add(key)
             except Exception:
                 pass
 
     def _collect_config_keys(self, data: Dict[str, Any], prefix: str) -> None:
-        """递归收集配置键"""
         for key, value in data.items():
             full_key = f"{prefix}.{key}" if prefix else key
             self.config_keys_defined.add(full_key)
             if isinstance(value, dict):
                 self._collect_config_keys(value, full_key)
+
+    # ================== 提案构建 ==================
+    def _build_proposal(self, report: Dict) -> Dict:
+        """将扫描报告转换为议会提案"""
+        dead_score = report["dead_code_score"]
+        unused = report["unused_functions"]
+        recommendation = "maintain"
+
+        if dead_score < 40:
+            recommendation = "emergency_cleanup"
+            severity = EventLevel.CRITICAL
+        elif dead_score < 70:
+            recommendation = "cleanup"
+            severity = EventLevel.WARN
+        else:
+            severity = EventLevel.INFO
+
+        if self.notifier and recommendation != "maintain":
+            asyncio.ensure_future(
+                self.notifier.send_alert(
+                    level=severity.value,
+                    title=f"冗余审计 [{dead_score}/100]",
+                    body=f"发现 {len(unused)} 个未使用函数，建议 {recommendation}",
+                )
+            )
+
+        return {
+            "type": "redundancy_report",
+            "dead_code_score": dead_score,
+            "unused_functions_count": len(unused),
+            "empty_functions_count": len(report["empty_functions"]),
+            "recommendation": recommendation,
+            "complexity_delta": 0.0,  # 本提案不增加复杂度
+            "timestamp": datetime.now().isoformat(),
+        }
+
+    def _create_empty_proposal(self) -> Dict:
+        return {
+            "type": "redundancy_report",
+            "dead_code_score": 100,
+            "unused_functions_count": 0,
+            "empty_functions_count": 0,
+            "recommendation": "maintain",
+            "complexity_delta": 0.0,
+        }
+
+    # ================== 状态查询 ==================
+    def get_status(self) -> Dict[str, Any]:
+        return {
+            "worldview": self.manifesto.worldview.value,
+            "last_scan": datetime.fromtimestamp(self._last_scan).isoformat() if self._last_scan else None,
+            "dead_code_score": self._cached_proposal.get("dead_code_score") if hasattr(self, "_cached_proposal") else None,
+        }
+
+    async def run_loop(self) -> None:
+        while True:
+            self.propose()
+            await asyncio.sleep(self.check_interval)
