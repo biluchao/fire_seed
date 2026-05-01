@@ -8,14 +8,15 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# 全局编译优化
+# 默认构建类型为 Release
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
+# 基础优化选项
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
     add_compile_options(-O3 -DNDEBUG -march=native -mtune=native)
-    # 启用链接时优化
+    # 启用链接时优化 (IPO)
     if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.9")
         include(CheckIPOSupported)
         check_ipo_supported(RESULT ipo_supported OUTPUT ipo_output)
@@ -32,11 +33,7 @@ add_compile_options(-Wall -Wextra -Wpedantic -Wno-unused-parameter)
 # 查找必需依赖
 # ###############################
 find_package(pybind11 REQUIRED)
-
-# 线程库（某些C++运行时需要显式链接）
 find_package(Threads REQUIRED)
-
-# 数学库
 find_library(MATH_LIB m)
 if(NOT MATH_LIB)
     set(MATH_LIB "")
@@ -46,125 +43,94 @@ endif()
 # 可选依赖与功能开关
 # ###############################
 option(USE_AF_XDP "Enable AF_XDP acceleration (requires libxdp)" OFF)
-option(USE_ONNX_RUNTIME "Enable ONNX Runtime inline inference" OFF)
+option(USE_ONNX_RUNTIME "Enable ONNX Runtime inline inference" ON)
+option(USE_LARGE_PAGES "Link with libhugetlbfs for huge page support" OFF)
 
-# ###############################
-# 头文件包含路径
-# ###############################
-set(CPP_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR})
-include_directories(${CPP_INCLUDE_DIR})
+# ONNX Runtime (默认开启，若未找到则警告并禁用)
+set(ONNX_RUNTIME_LIBS "")
+if(USE_ONNX_RUNTIME)
+    find_path(ONNX_RUNTIME_INCLUDE_DIR onnxruntime_cxx_api.h)
+    find_library(ONNX_RUNTIME_LIBRARY onnxruntime)
+    if(ONNX_RUNTIME_INCLUDE_DIR AND ONNX_RUNTIME_LIBRARY)
+        message(STATUS "Found ONNX Runtime: ${ONNX_RUNTIME_LIBRARY}")
+        set(ONNX_RUNTIME_LIBS ${ONNX_RUNTIME_LIBRARY})
+        include_directories(${ONNX_RUNTIME_INCLUDE_DIR})
+        add_definitions(-DFIRESEED_USE_ONNX)
+    else()
+        message(WARNING "ONNX Runtime not found, VIB inference will be disabled")
+        set(USE_ONNX_RUNTIME OFF)
+    endif()
+endif()
 
-# ###############################
-# 源文件收集
-# ###############################
-# 核心公共源文件
-set(CORE_SOURCES
-    ${CPP_INCLUDE_DIR}/cpp/bindings.cpp
-)
-
-# 通用工具与数据结构
-set(UTIL_HEADERS
-    ${CPP_INCLUDE_DIR}/cpp/shared_memory/shm_queue.h
-    ${CPP_INCLUDE_DIR}/cpp/shared_memory/flat_msg.h
-    ${CPP_INCLUDE_DIR}/cpp/pool/slab_allocator.h
-)
-
-# 风险模块
-set(RISK_SOURCES
-    ${CPP_INCLUDE_DIR}/cpp/risk/incremental_covar.cpp
-    ${CPP_INCLUDE_DIR}/cpp/risk/evt_var.cpp
-    ${CPP_INCLUDE_DIR}/cpp/risk/jump_detector.cpp
-)
-
-# 执行模块
-set(EXEC_SOURCES
-    ${CPP_INCLUDE_DIR}/cpp/execution/twap_adaptive.cpp
-    ${CPP_INCLUDE_DIR}/cpp/execution/iceberg_slicer.cpp
-)
-
-# 学习模块
-set(LEARNING_SOURCES
-    ${CPP_INCLUDE_DIR}/cpp/learning/ftrl_learner.cpp
-)
-
-# SIMD 优化模块
-set(SIMD_SOURCES
-    ${CPP_INCLUDE_DIR}/cpp/simd/vector_math.cpp
-)
-
-# 监控模块（硬监视器）
-set(MONITOR_SOURCES
-    ${CPP_INCLUDE_DIR}/cpp/monitoring/hard_watcher.cpp
-)
-
-# 网络模块（根据选项启用）
-set(NET_SOURCES "")
+# AF_XDP (可选，默认关闭)
+set(XDP_LIBS "")
 if(USE_AF_XDP)
     find_library(XDP_LIB xdp)
     find_library(BPF_LIB bpf)
     if(XDP_LIB AND BPF_LIB)
-        list(APPEND NET_SOURCES
-            ${CPP_INCLUDE_DIR}/cpp/net/af_xdp_recv.cpp
-        )
+        set(XDP_LIBS ${XDP_LIB} ${BPF_LIB})
         add_definitions(-DFIRESEED_USE_AF_XDP)
         message(STATUS "AF_XDP enabled")
     else()
         message(WARNING "AF_XDP requested but required libraries not found, disabled")
+        set(USE_AF_XDP OFF)
     endif()
 endif()
-# 用户态TCP栈始终编译（无额外依赖）
-list(APPEND NET_SOURCES ${CPP_INCLUDE_DIR}/cpp/net/tcp_userstack.cpp)
 
-# ONNX Runtime 推理模块（可选）
-set(ONNX_SOURCES "")
-if(USE_ONNX_RUNTIME)
-    find_package(onnxruntime QUIET)
-    if(onnxruntime_FOUND)
-        list(APPEND ONNX_SOURCES ${CPP_INCLUDE_DIR}/cpp/learning/vib_inference.cpp)
-        add_definitions(-DFIRESEED_USE_ONNX)
-        message(STATUS "ONNX Runtime enabled for C++ inference")
+# 大页内存支持 (可选)
+if(USE_LARGE_PAGES)
+    find_library(HUGETLBFS_LIB hugetlbfs)
+    if(HUGETLBFS_LIB)
+        set(HUGETLBFS_LIBS ${HUGETLBFS_LIB})
+        add_definitions(-DUSE_HUGETLBFS)
+        message(STATUS "Huge page support enabled")
     else()
-        message(WARNING "ONNX Runtime not found, C++ inference disabled")
+        message(WARNING "libhugetlbfs not found")
     endif()
 endif()
 
-# 汇总所有源文件
-set(ALL_SOURCES
-    ${CORE_SOURCES}
-    ${RISK_SOURCES}
-    ${EXEC_SOURCES}
-    ${LEARNING_SOURCES}
-    ${SIMD_SOURCES}
-    ${MONITOR_SOURCES}
-    ${NET_SOURCES}
-    ${ONNX_SOURCES}
+# ###############################
+# 头文件包含目录
+# ###############################
+include_directories(${CMAKE_CURRENT_SOURCE_DIR})
+
+# ###############################
+# 源文件列表
+# ###############################
+# 主要绑定文件：将所有 C++ 模块直接包含进此翻译单元，避免重复编译
+# 模块的 .cpp 文件由 bindings.cpp 内部 #include，因此只需编译 bindings.cpp
+set(CORE_SOURCES
+    cpp/bindings.cpp
 )
+
+# 若启用 AF_XDP，需要额外编译独立的网络接收器（不被 bindings 包含）
+if(USE_AF_XDP)
+    list(APPEND CORE_SOURCES
+        cpp/net/af_xdp_recv.cpp
+    )
+endif()
+
+# TCP 用户态栈存根根据需要添加（目前仅头文件，若需实现可加入）
+# list(APPEND CORE_SOURCES cpp/net/tcp_userstack.cpp)
 
 # ###############################
 # 构建目标：Python 扩展模块
 # ###############################
-pybind11_add_module(fire_seed_cpp MODULE ${ALL_SOURCES})
+pybind11_add_module(fire_seed_cpp MODULE ${CORE_SOURCES})
 
-# 链接必要的系统库
+# 链接必需的库
 target_link_libraries(fire_seed_cpp PRIVATE
     Threads::Threads
     ${MATH_LIB}
+    ${ONNX_RUNTIME_LIBS}
+    ${XDP_LIBS}
+    ${HUGETLBFS_LIBS}
 )
 
-# 如果使用了 AF_XDP，链接相关库
-if(USE_AF_XDP AND XDP_LIB AND BPF_LIB)
-    target_link_libraries(fire_seed_cpp PRIVATE ${XDP_LIB} ${BPF_LIB})
-endif()
-
-# 如果使用了 ONNX Runtime，链接其库
-if(USE_ONNX_RUNTIME AND onnxruntime_FOUND)
-    target_link_libraries(fire_seed_cpp PRIVATE onnxruntime::onnxruntime)
-endif()
-
-# 为 SIMD 模块添加编译器标志
+# 为 SIMD 模块（包含在 bindings.cpp 中）添加编译器标志
 target_compile_options(fire_seed_cpp PRIVATE -mfma -mavx2)
 
-# 设置 Python 扩展模块后缀（确保可被 Python 导入）
+# 设置 Python 扩展模块后缀
 set_target_properties(fire_seed_cpp PROPERTIES
     SUFFIX ".so"
     POSITION_INDEPENDENT_CODE ON
@@ -173,7 +139,6 @@ set_target_properties(fire_seed_cpp PROPERTIES
 # ###############################
 # 安装规则
 # ###############################
-# 将编译产物安装到 Python 项目根目录（与 main.py 同层）
 install(TARGETS fire_seed_cpp
     LIBRARY DESTINATION ${CMAKE_SOURCE_DIR}
     ARCHIVE DESTINATION ${CMAKE_SOURCE_DIR}
@@ -190,9 +155,3 @@ if(BUILD_TESTS)
 endif()
 
 message(STATUS "FireSeed C++ module configured successfully")
-
-# 针对当前的CPU架构进行指令集优化
-add_compile_options(-O3 -march=native -mtune=native)
-
-# 若确认支持AVX2指令集，可显式启用以获得更高的计算性能
-# add_compile_options(-mavx2 -mfma)
