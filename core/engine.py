@@ -3,19 +3,16 @@
 火种系统 (FireSeed) 核心交易引擎
 ==================================
 主事件循环负责：
-- 行情接收与分发 (多交易所、多周期)
+- 行情接收与多周期分发
 - 感知层调用 (粒子滤波、锁相环、VIB)
-- 策略决策 (多因子评分、仲裁、状态机)
-- 风险校验 (硬实时C++模块 + Python风控)
+- 策略决策 (多因子评分、多周期仲裁、抗辩式议会)
+- 风险管理与硬实时风控协同
 - 订单执行 (网关、TWAP、冰山)
 - 幽灵影子管理
 - 行为日志记录
-- 每日任务调度
-
-运行方式:
-    python engine.py --mode live    # 实盘
-    python engine.py --mode virtual # 虚拟盘
-    python engine.py --mode ghost   # 幽灵回放
+- 每日任务调度与学习守卫
+- OTA 更新与冷数据归档
+- 智能体议会 (12世界观异构智能体 + 对抗式决策)
 """
 
 import asyncio
@@ -25,7 +22,7 @@ import time
 import traceback
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, Optional, Any
+from typing import Any, Dict, Optional
 
 # ---------- 火种核心模块 ----------
 from config.loader import ConfigLoader
@@ -38,34 +35,70 @@ from core.perception import PerceptionFusion
 from core.state_machine import TradingStateMachine
 from core.conditional_weight import ConditionalWeightEngine
 from core.multi_tf_arbiter_v2 import MultiTFArbiter
-from core.context_isolator import ContextFactory
+from core.context_isolator import ContextFactory, Kline
 from core.continuous_position import ContinuousPositionController
 from core.plugin_manager import PluginManager
 from core.self_check import SystemSelfCheck
 from core.daily_tasks import DailyTaskScheduler
 from core.intelligent_learning_guard import LearningGuard
-from core.behavioral_logger import BehavioralLogger, EventType
+from core.behavioral_logger import BehavioralLogger, EventType, EventLevel
 from core.lazy_evaluator import LazyFactorEvaluator
 from core.compute_scheduler import ComputeScheduler
 from core.copy_trading import CopyTradingEngine
-from agents.council import AgentCouncil
+from core.notifier import SystemNotifier
+
+# ---------- 幽灵 & OTA ----------
 from ghost.shadow_manager import ShadowManager
 from ota.updater import OTAUpdater
+from ota.health_check import OTAHealthCheck
 from cold_storage.archiver import ColdArchiver
+
+# ---------- 助手 ----------
 from assistant.llm_gateway import LLMGateway
 from integrations.messenger_hub import MessengerHub
-from core.notifier import SystemNotifier
-from utils.logger import setup_logging
 
-# 尝试加载C++高性能模块
+# ---------- 智能体议会 (深入异构) ----------
+from agents.worldview import WorldView, WorldViewManifesto, WorldViewAgent
+from agents.extreme_rewards import ExtremeRewardFunctions
+from agents.adversarial_council import AdversarialCouncil
+from agents.sentinel import SentinelAgent
+from agents.alchemist import AlchemistAgent
+from agents.guardian import GuardianAgent
+from agents.devils_advocate import DevilsAdvocate
+from agents.godel_watcher import GodelWatcher
+from agents.env_inspector import EnvInspector
+from agents.redundancy_auditor import RedundancyAuditor
+from agents.weight_calibrator import WeightCalibrator
+from agents.narrator import NarratorAgent
+from agents.diversity_enforcer import DiversityEnforcer
+from agents.archive_guardian import ArchiveGuardian
+from agents.copy_trade_coordinator import CopyTradeCoordinator
+
+# ---------- C++ 高性能模块 ----------
 try:
-    from cpp.bindings import RealtimeGuard, JumpDetector, IncrementalCovariance  # type: ignore
+    from cpp.bindings import (
+        RealtimeGuard, JumpDetector, IncrementalCovariance,
+        RingQueue, FlatMsg, AdaptiveTwap, IcebergSlicer,
+        FtrlLearner, VIBInference, EvtRiskEstimator,
+        HardWatcher,
+    )
     CPP_AVAILABLE = True
 except ImportError:
     CPP_AVAILABLE = False
     RealtimeGuard = None
     JumpDetector = None
     IncrementalCovariance = None
+    RingQueue = None
+    FlatMsg = None
+    AdaptiveTwap = None
+    IcebergSlicer = None
+    FtrlLearner = None
+    VIBInference = None
+    EvtRiskEstimator = None
+    HardWatcher = None
+
+# ---------- 日志 ----------
+from utils.logger import setup_logging
 
 
 class FireSeedEngine:
@@ -82,6 +115,13 @@ class FireSeedEngine:
         self.order_mgr = OrderManager(self.config)
         self.execution = ExecutionGateway(self.config, self.order_mgr)
         self.risk_monitor = RiskMonitor(self.config, self.order_mgr)
+
+        # 将行为日志器提前初始化，供后续模块使用
+        self.behavior_log = BehavioralLogger(max_memory=500)
+        # 消息推送与通知
+        self.messenger = MessengerHub(self.config)
+        self.notifier = SystemNotifier(self.messenger, self.behavior_log)
+
         self.scorecard = DynamicScoreCard(self.config)
         self.perception = PerceptionFusion(self.config)
         self.state_machine = TradingStateMachine(self.config)
@@ -91,91 +131,243 @@ class FireSeedEngine:
         self.position_ctrl = ContinuousPositionController(self.config)
         self.plugin_mgr = PluginManager(self.config)
         self.self_check = SystemSelfCheck(self.config)
-        self.daily_tasks = DailyTaskScheduler(self.config)
-        self.learning_guard = LearningGuard(self.config)
-        self.behavior_log = BehavioralLogger()
+        self.daily_tasks = DailyTaskScheduler(self.config, engine=self)
+        self.learning_guard = LearningGuard(self.config, engine=self)
         self.lazy_evaluator = LazyFactorEvaluator(self.config)
         self.compute_scheduler = ComputeScheduler(self.config)
-        self.copy_trading = CopyTradingEngine(self.config)
+        self.copy_trading = CopyTradingEngine(
+            self.config,
+            self.order_mgr,
+            self.execution,
+            self.behavior_log,
+        )
 
-        # 智能体议会
-        self.agent_council = AgentCouncil(self.config)
-        # 幽灵影子
-        self.shadow_mgr = ShadowManager(self.config)
-        # OTA
+        # ------------------------- 幽灵与进化 -------------------------
+        self.shadow_mgr = ShadowManager(
+            self.config,
+            self.order_mgr,
+            self.execution,
+            self.behavior_log,
+            self.data_feed,
+        )
         self.ota_updater = OTAUpdater(self.config)
-        # 冷存储
+        self.ota_health_check = OTAHealthCheck(self.config)
         self.cold_archiver = ColdArchiver(self.config)
-        # LLM网关
-        self.llm_gateway = LLMGateway(self.config)
-        # 消息推送
-        self.messenger = MessengerHub(self.config)
-        self.notifier = SystemNotifier(self.messenger)
+        self.llm_gateway = LLMGateway(self.config, self.behavior_log)
+
+        # ------------------------- 智能体议会(对抗式) -------------------------
+        self.adversarial_council = AdversarialCouncil()
+        self._init_agents()
 
         # ------------------------- C++ 模块 (可选) -------------------------
         self.cpp_guard: Optional[RealtimeGuard] = None
         self.cpp_jump: Optional[JumpDetector] = None
         self.cpp_covar: Optional[IncrementalCovariance] = None
+        self.cpp_hard_watcher: Optional[HardWatcher] = None
         if CPP_AVAILABLE:
-            self.cpp_guard = RealtimeGuard()
-            self.cpp_jump = JumpDetector()
-            self.cpp_covar = IncrementalCovariance(20)
+            if RealtimeGuard:
+                self.cpp_guard = RealtimeGuard()
+            if JumpDetector:
+                self.cpp_jump = JumpDetector()
+            if IncrementalCovariance:
+                self.cpp_covar = IncrementalCovariance(20)
+            if HardWatcher:
+                self.cpp_hard_watcher = HardWatcher()
             self.log.info("C++ 高性能模块加载成功")
 
-        # 运行模式: live / virtual / ghost
+        # ------------------------- 运行模式 -------------------------
         self.mode = self.config.get("system.mode", "virtual")
         # 注册信号处理
         signal.signal(signal.SIGTERM, self._signal_handler)
         signal.signal(signal.SIGINT, self._signal_handler)
 
-    def _signal_handler(self, signum, frame):
-        self.log.warning(f"接收到信号 {signum}，开始优雅退出...")
-        self._running = False
+    # ======================== 智能体注册 ========================
+    def _init_agents(self):
+        """创建12个携带世界观的智能体并注册到对抗议会"""
+        manifestos = {
+            "sentinel": WorldViewManifesto(
+                worldview=WorldView.MECHANICAL_MATERIALISM,
+                core_belief="系统是可分解的钟表",
+                primary_optimization_target="-log(F1_score)",
+                adversary_worldview=WorldView.HOLISM,
+                forbidden_data_source={"KLINE", "ORDERBOOK"},
+                exclusive_data_source={"SYSTEM_METRICS"},
+                time_scale="15s",
+            ),
+            "alchemist": WorldViewManifesto(
+                worldview=WorldView.EVOLUTIONISM,
+                core_belief="策略是适应环境的生命体",
+                primary_optimization_target="sharpe * novelty",
+                adversary_worldview=WorldView.EXISTENTIALISM,
+                forbidden_data_source={"SYSTEM_METRICS", "REAL_TIME_PNL"},
+                exclusive_data_source={"RESEARCH_PAPER", "FORUM_RSS"},
+                time_scale="1d",
+            ),
+            "guardian": WorldViewManifesto(
+                worldview=WorldView.EXISTENTIALISM,
+                core_belief="市场的本质是无常",
+                primary_optimization_target="-max_drawdown",
+                adversary_worldview=WorldView.EVOLUTIONISM,
+                forbidden_data_source={"ORDERBOOK", "SENTIMENT"},
+                exclusive_data_source={"RETURNS_SERIES", "EVT"},
+                time_scale="5m",
+            ),
+            "devils_advocate": WorldViewManifesto(
+                worldview=WorldView.SKEPTICISM,
+                core_belief="任何真理都需不断证伪",
+                primary_optimization_target="F1(correct_veto)",
+                adversary_worldview=WorldView.BAYESIANISM,
+                forbidden_data_source={"LIVE_PRICE"},
+                exclusive_data_source={"FAILURE_CASES", "ADVERSARIAL_SAMPLES"},
+                time_scale="event",
+            ),
+            "godel_watcher": WorldViewManifesto(
+                worldview=WorldView.INCOMPLETENESS,
+                core_belief="系统永远无法完全理解自身",
+                primary_optimization_target="missed_loss_during_sleep",
+                adversary_worldview=WorldView.MECHANICAL_MATERIALISM,
+                forbidden_data_source={"MARKET_DATA", "TRADE_SIGNAL"},
+                exclusive_data_source={"META_META_DATA"},
+                time_scale="1m",
+            ),
+            "env_inspector": WorldViewManifesto(
+                worldview=WorldView.PHYSICALISM,
+                core_belief="一切问题终将表现为物理参数异常",
+                primary_optimization_target="uptime / error_count",
+                adversary_worldview=WorldView.EVOLUTIONISM,
+                forbidden_data_source={"KLINE", "POSITION"},
+                exclusive_data_source={"CPU", "MEM", "DISK", "NETWORK"},
+                time_scale="1m",
+            ),
+            "redundancy_auditor": WorldViewManifesto(
+                worldview=WorldView.OCCAMS_RAZOR,
+                core_belief="简洁是真理的标志",
+                primary_optimization_target="-code_lines",
+                adversary_worldview=WorldView.PLURALISM,
+                forbidden_data_source={"ALL_MARKET_DATA"},
+                exclusive_data_source={"PYTHON_AST"},
+                time_scale="1d",
+            ),
+            "weight_calibrator": WorldViewManifesto(
+                worldview=WorldView.BAYESIANISM,
+                core_belief="概率是信念的量化",
+                primary_optimization_target="OOS_sharpe - IS_sharpe",
+                adversary_worldview=WorldView.SKEPTICISM,
+                forbidden_data_source={"RAW_PRICE"},
+                exclusive_data_source={"FACTOR_IC_SERIES"},
+                time_scale="1d",
+            ),
+            "narrator": WorldViewManifesto(
+                worldview=WorldView.HERMENEUTICS,
+                core_belief="意义存在于叙述之中",
+                primary_optimization_target="human_read_completion_rate",
+                adversary_worldview=WorldView.OCCAMS_RAZOR,
+                forbidden_data_source={"RAW_ORDER_FLOW"},
+                exclusive_data_source={"COUNCIL_LOGS", "STRATEGY_STATS"},
+                time_scale="1d",
+            ),
+            "diversity_enforcer": WorldViewManifesto(
+                worldview=WorldView.PLURALISM,
+                core_belief="正确的决策需要多样化的视角",
+                primary_optimization_target="H(voting_distribution)",
+                adversary_worldview=WorldView.OCCAMS_RAZOR,
+                forbidden_data_source={"TRADE_HISTORY"},
+                exclusive_data_source={"VOTE_CONSISTENCY"},
+                time_scale="5m",
+            ),
+            "archive_guardian": WorldViewManifesto(
+                worldview=WorldView.HISTORICISM,
+                core_belief="一切当前状态都可从历史痕迹中理解",
+                primary_optimization_target="archived_data / total_data",
+                adversary_worldview=WorldView.HOLISM,
+                forbidden_data_source={"REAL_TIME_ANYTHING"},
+                exclusive_data_source={"FILE_SYSTEM", "DB_INTEGRITY"},
+                time_scale="1h",
+            ),
+            "copy_trade_coordinator": WorldViewManifesto(
+                worldview=WorldView.HOLISM,
+                core_belief="部分异常反映整体失调",
+                primary_optimization_target="sync_success_rate",
+                adversary_worldview=WorldView.MECHANICAL_MATERIALISM,
+                forbidden_data_source={"INDIVIDUAL_ACCOUNT_DETAIL"},
+                exclusive_data_source={"SUB_ACCOUNT_API_STATUS"},
+                time_scale="30s",
+            ),
+        }
 
+        # 创建智能体实例
+        agents = {
+            "sentinel": SentinelAgent(self.behavior_log, self.notifier),
+            "alchemist": AlchemistAgent(self.config, self.behavior_log, self.notifier),
+            "guardian": GuardianAgent(self.config, self.risk_monitor, self.behavior_log, self.notifier),
+            "devils_advocate": DevilsAdvocate(self.behavior_log, self.notifier),
+            "godel_watcher": GodelWatcher(behavior_log=self.behavior_log, notifier=self.notifier),
+            "env_inspector": EnvInspector(self.behavior_log, self.notifier),
+            "redundancy_auditor": RedundancyAuditor(root=".", behavior_log=self.behavior_log),
+            "weight_calibrator": WeightCalibrator(behavior_log=self.behavior_log, notifier=self.notifier),
+            "narrator": NarratorAgent(self.behavior_log, self.notifier),
+            "diversity_enforcer": DiversityEnforcer(self.behavior_log, self.notifier),
+            "archive_guardian": ArchiveGuardian(behavior_log=self.behavior_log, notifier=self.notifier),
+            "copy_trade_coordinator": CopyTradeCoordinator(self.behavior_log, self.notifier),
+        }
+
+        # 注入世界观并注册
+        for name, agent in agents.items():
+            manifesto = manifestos[name]
+            # 轻量注入：将世界观直接赋值给智能体实例（各智能体类需预留 manifesto 属性）
+            if hasattr(agent, "manifesto"):
+                agent.manifesto = manifesto
+            # 强制实现 propose / challenge 方法（由各智能体类负责）
+            self.adversarial_council.register_agent(name, agent)
+
+        self.log.info("12世界观异构智能体已注册到对抗式议会")
+
+    # ======================== 主事件循环 ========================
     async def run(self):
-        """主事件循环"""
+        """主引擎循环"""
         self.log.info(f"火种引擎启动于 {self.mode} 模式")
 
         # 启动数据源
         await self.data_feed.start()
-        # 启动C++实时保护线程
+        # 启动计算资源调度
+        self.compute_scheduler.start()
+
+        # 可选 C++ 硬实时保护线程
         if self.cpp_guard:
             self.cpp_guard.start()
+
         # 启动后台任务
         asyncio.create_task(self._background_tasks())
-        # 启动OTA检查
         asyncio.create_task(self._ota_check_loop())
-        # 启动冷归档
         asyncio.create_task(self._cold_archive_loop())
 
-        # 最后记录时间戳
+        # 最新一分钟跟踪
         last_minute = None
 
         while self._running:
             try:
-                # 获取当前Tick
                 tick = await self.data_feed.get_next_tick(timeout=0.5)
                 if tick is None:
                     continue
 
-                now = tick.timestamp
-                current_minute = now.replace(second=0, microsecond=0)
-
-                # 每分钟执行一次 (新K线闭合)
-                if current_minute != last_minute:
-                    last_minute = current_minute
+                now = tick.timestamp.replace(second=0, microsecond=0)
+                # 新一分钟处理
+                if now != last_minute:
+                    last_minute = now
                     await self._on_new_minute(tick)
                 else:
-                    # 同1分钟内，做高频轻量处理 (仅更新部分指标)
                     await self._on_tick(tick)
 
-                # 心跳写入C++监视器
+                # 更新 C++ 监视器心跳
                 if self.cpp_guard:
                     self.cpp_guard.heartbeat()
-
-                # 行为日志推送 (可选，避免每Tick推送)
-                if self.behavior_log.should_flush():
-                    await self.behavior_log.flush_to_frontend()
+                if self.cpp_hard_watcher:
+                    self.cpp_hard_watcher.update_metrics(
+                        rollback_count=self.plugin_mgr.rollback_count(),
+                        strategy_churn=self.plugin_mgr.churn_rate(),
+                        avg_sharpe=self.risk_monitor.avg_sharpe(),
+                        self_doubt_hours=0,
+                    )
 
             except asyncio.CancelledError:
                 break
@@ -185,147 +377,173 @@ class FireSeedEngine:
 
         await self._shutdown()
 
+    # ======================== 新分钟闭合 ========================
     async def _on_new_minute(self, tick):
-        """每分钟K线闭合时执行的主要逻辑"""
         try:
             tf = "1m"
-            ctx = self.ctx_factory.get(tf)
-            ctx.add_kline(tick.ohlc)
+            ctx = self.ctx_factory.get_or_create(tf)
+            kline = Kline(
+                timestamp=tick.timestamp,
+                open=tick.open_price,
+                high=tick.high_price,
+                low=tick.low_price,
+                close=tick.last_price,
+                volume=tick.volume,
+            )
+            ctx.add_kline(kline)
+            ctx.add_orderbook(tick.orderbook)
 
-            # 1. 系统自检
-            health = self.self_check.run()
-            if health.status != "OK":
-                self.behavior_log.log(EventType.SYSTEM, "SelfCheck", f"异常: {health.status}")
-                await self.notifier.alert_health(health)
+            # 学习守卫更新
+            self.learning_guard.update_market_state(
+                volatility=self.scorecard.last_score,  # 简化
+                volume=tick.volume,
+                atr=self.perception._last_pf.atr,
+            )
+            await self.learning_guard.check_and_handle()
 
-            # 2. 跳跃检测 (防止插针干扰)
-            if self.cpp_jump and self.cpp_jump.detect(tick.returns[-10:]):
-                self.behavior_log.log(EventType.RISK, "JumpDetect", "检测到异常跳跃，冻结感知层")
-                self.perception.freeze()
+            # 感知
+            pll_state = self.perception.update_pll(tick.last_price)
+            pf_state = self.perception.update_particle_filter({
+                "close": tick.last_price,
+                "high": tick.high_price,
+                "low": tick.low_price,
+            })
+            vib_state = self.perception.update_vib(self._extract_orderbook_vector(tick.orderbook))
 
-            # 3. 感知层推理
-            pll_state = self.perception.update_pll(ctx)
-            heston_state = self.perception.update_particle_filter(ctx)
-            vib_state = self.perception.update_vib(ctx)
+            # 市场状态
+            regime = self.state_machine.determine_regime(pll_state, pf_state, vib_state, ctx)
 
-            # 4. 市场状态判定
-            regime = self.state_machine.determine_regime(pll_state, heston_state, vib_state, ctx)
-
-            # 5. 震荡过滤器
-            ci = self.state_machine.choppiness_index(ctx)
-            is_oscillation = self.state_machine.is_oscillation(ci, pll_state, hurst_bf=heston_state.hurst_bf)
-
-            # 6. 因子评分 (惰性求值: 仅当可能有信号时才全量计算)
+            # 因子计算 (惰性)
             if self.lazy_evaluator.should_full_evaluate(regime, ctx):
-                factor_scores = self.lazy_evaluator.evaluate_all(ctx, pll_state, heston_state, vib_state)
+                factor_scores = self.lazy_evaluator.evaluate_all(ctx, pll_state, pf_state, vib_state)
                 weights = self.weight_engine.get_weights(regime)
                 score = self.scorecard.compute(factor_scores, weights)
             else:
-                score = self.scorecard.last_score  # 使用上一帧评分
+                score = self.scorecard.last_score
 
-            # 7. 策略决策
-            signal = None
-            if not is_oscillation and score > self.scorecard.threshold_long:
-                signal = {"direction": "LONG", "score": score, "confidence": self._calc_confidence(pll_state)}
-            elif not is_oscillation and score < self.scorecard.threshold_short:
-                signal = {"direction": "SHORT", "score": score, "confidence": self._calc_confidence(pll_state)}
+            # 多周期仲裁 (收集各TF信号)
+            for period in ("1m", "3m", "5m", "15m"):
+                if period in self.ctx_factory._contexts:
+                    ctx_tf = self.ctx_factory.get(period)
+                    if ctx_tf:
+                        pll_tf = self.perception.update_pll(kline.close) if period == "1m" else pll_state
+                        pf_tf = pf_state
+                        vib_tf = vib_state
+                        signal = self._generate_tf_signal(period, ctx_tf, pll_tf, pf_tf, vib_tf, score if period == "1m" else None)
+                        self.arbiter.collect_signal(period, signal)
+            final_arb = self.arbiter.evaluate()
 
-            # 8. 多周期仲裁
-            self.arbiter.collect_signal(tf, signal)
-            final_signal = self.arbiter.evaluate()
+            # 构建议会感知数据包
+            parliament_perception = {
+                "regime": regime,
+                "score": score,
+                "pll_snr": pll_state.snr_db,
+                "jump_detected": self.perception.is_frozen,
+                "position_size": self.order_mgr.get_position_summary().size,
+                "daily_pnl": self.order_mgr.get_daily_trading_stats().get("realized_pnl", 0),
+                "circuit_breaker_level": self.risk_monitor.circuit_breaker.level,
+            }
 
-            # 9. 风险校验
-            if final_signal and not self.risk_monitor.approve(final_signal):
-                self.behavior_log.log(EventType.RISK, "RiskReject", f"评分{final_signal.get('score')}被风控否决")
-                final_signal = None
+            # 对抗式议会审议
+            council_decision = await self.adversarial_council.deliberate(parliament_perception)
 
-            # 10. 执行订单
-            if final_signal:
-                await self._execute_signal(final_signal, tick, ctx)
+            # 决策融合
+            direction = council_decision.get("direction", 0)
+            confidence = council_decision.get("confidence", 0.0)
+            if direction == 0 and final_arb.direction != 0:
+                direction = final_arb.direction
+                confidence = max(confidence, final_arb.confidence * 0.8)
 
-            # 11. 幽灵影子更新
+            # 风控审批
+            if direction != 0 and self.risk_monitor.approve(direction, confidence):
+                await self._execute_signal(direction, confidence, tick, ctx)
+
+            # 影子更新
             await self.shadow_mgr.tick(tick)
 
-            # 12. 智能体议会决策 (每5分钟)
-            if tick.timestamp.minute % 5 == 0:
-                await self.agent_council.deliberate(ctx)
-
-            # 13. 学习时段检查
-            await self.learning_guard.check_and_handle()
-
-            # 14. 行为日志记录
-            self.behavior_log.log(EventType.SIGNAL, "Engine", f"分钟闭合处理完成, 评分={score:.1f}, 信号={'有' if final_signal else '无'}")
+            # 行为日志
+            self.behavior_log.log(
+                EventType.SYSTEM, "Engine",
+                f"新分钟处理完成, 评分={score:.1f}, 议会方向={direction}",
+                snapshot={"regime": regime, "council": council_decision}
+            )
 
         except Exception as e:
-            self.log.error(f"每分钟处理异常: {e}")
+            self.log.error(f"每分钟处理异常: {e}", exc_info=True)
+
+    def _generate_tf_signal(self, tf, ctx, pll, pf, vib, base_score):
+        from core.multi_tf_arbiter_v2 import TFSignal
+        score = self.scorecard.compute(self.lazy_evaluator.last_scores) if base_score is None else base_score
+        direction = 1 if score >= self.scorecard.threshold_long else (-1 if score <= self.scorecard.threshold_short else 0)
+        return TFSignal(
+            timeframe=tf,
+            direction=direction,
+            confidence=0.5 + abs(score - 50) / 100,
+            score=score,
+            timestamp=time.time(),
+        )
 
     async def _on_tick(self, tick):
-        """Tick级别快速处理 (无损实时性)"""
-        # 仅更新C++风控模块、移动止损等
+        # 快速风控与止损检查
         if self.cpp_guard:
             self.cpp_guard.feed_price(tick.last_price, tick.bid, tick.ask)
-        # 更新止损 (若持仓)
         if self.order_mgr.has_position():
             self.risk_monitor.update_trailing_stop(tick.last_price)
 
-    async def _execute_signal(self, signal: dict, tick, ctx):
-        """执行交易指令"""
+    async def _execute_signal(self, direction, confidence, tick, ctx):
         try:
-            size = self.position_ctrl.calc_size(signal, self.order_mgr.get_equity())
-            order = self.execution.create_order(
-                symbol=self.config.get("trading.symbol"),
-                direction=signal["direction"],
-                size=size,
+            size = self.position_ctrl.calc_size(direction, confidence, self.order_mgr.get_equity())
+            order = await self.execution.create_order(
+                symbol=self.config.get("trading.symbol", "BTCUSDT"),
+                side="buy" if direction == 1 else "sell",
+                order_type="LIMIT",
                 price=tick.last_price,
-                order_type="LIMIT" if self.mode == "virtual" else "SMART"
+                quantity=size,
             )
             if order:
-                self.behavior_log.log(EventType.ORDER, "Execution", f"下单: {signal['direction']} {size} @ {tick.last_price}")
-                # 多账户跟单
+                self.behavior_log.log(EventType.ORDER, "Engine", f"下单: {direction} {size}")
                 await self.copy_trading.replicate(order)
         except Exception as e:
-            self.log.error(f"下单执行失败: {e}")
+            self.log.error(f"下单失败: {e}")
 
-    def _calc_confidence(self, pll_state) -> float:
-        """基于锁相环锁相质量计算置信度"""
-        if pll_state.snr_db > 10:
-            return 0.9
-        elif pll_state.snr_db > 6:
-            return 0.7
-        return 0.3
-
+    # ======================== 后台任务 ========================
     async def _background_tasks(self):
-        """后台定时任务"""
         while self._running:
             now = datetime.now()
-            # 每日凌晨3点执行
             if now.hour == 3 and now.minute == 0:
-                self.daily_tasks.run()
+                await self.daily_tasks.run()
                 await asyncio.sleep(60)
             await asyncio.sleep(30)
 
     async def _ota_check_loop(self):
-        """OTA更新检查循环"""
         while self._running:
             await self.ota_updater.check_and_update()
-            await asyncio.sleep(3600)  # 每小时检查一次
+            await asyncio.sleep(3600)
 
     async def _cold_archive_loop(self):
-        """冷数据归档循环"""
         while self._running:
             await self.cold_archiver.archive_expired()
             await asyncio.sleep(3600)
 
+    # ======================== 辅助工具 ========================
+    def _extract_orderbook_vector(self, ob) -> list:
+        if not ob:
+            return [0.0] * 44
+        vec = []
+        for level in (ob.get("bids", []) + ob.get("asks", [])):
+            vec.extend(level)
+        return vec[:44] + [0.0] * max(0, 44 - len(vec))
+
+    def _signal_handler(self, signum, frame):
+        self.log.warning(f"接收到信号 {signum}，开始优雅退出...")
+        self._running = False
+
     async def _shutdown(self):
-        """优雅关闭"""
         self.log.info("正在关闭引擎...")
         self._shutting_down = True
-        # 平掉所有仓位 (如果配置要求)
-        if self.config.get("system.flat_on_exit", True) and self.mode == "live":
-            await self.execution.close_all()
-        # 停止数据源
+        if self.mode == "live" and self.config.get("system.flat_on_exit", True):
+            await self.execution.close_all_positions()
         await self.data_feed.stop()
-        # 保存状态
         self.weight_engine.save()
         self.behavior_log.flush_to_db()
         self.log.info("引擎已安全退出")
@@ -335,8 +553,8 @@ class FireSeedEngine:
 async def main():
     import argparse
     parser = argparse.ArgumentParser(description="火种量化引擎")
-    parser.add_argument("--mode", type=str, default="virtual", choices=["live", "virtual", "ghost"], help="运行模式")
-    parser.add_argument("--config", type=str, default="config/settings.yaml", help="配置文件路径")
+    parser.add_argument("--mode", type=str, default="virtual", choices=["live", "virtual", "ghost"])
+    parser.add_argument("--config", type=str, default="config/settings.yaml")
     args = parser.parse_args()
 
     engine = FireSeedEngine(config_path=args.config)
