@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """
 火种系统 (FireSeed) 对抗式议会 (AdversarialCouncil)
-=========================================================
-模拟英美法系庭审对抗制进行智能体决策：
-- 提议者 (Proposer) 基于自身世界观提出决策建议
-- 挑战者 (Challenger) 从对立世界观出发进行抗辩
-- 若挑战成功，提议者进入冷却期，本轮决策被否决
-- 若挑战未通过，陪审团 (Jury) 投票表决
-- 反共识增强：当存在主义与进化论罕见一致时，可信度加倍
-- 哥德尔监视者的怀疑指数作为全局修正因子
+========================================================
+基于英美法系庭审对抗的超级决策引擎。工作流程：
+1. 随机选择一名不在冷却期的智能体作为「提议者」
+2. 选择一名世界观与提议者对立的智能体作为「挑战者」
+3. 若挑战成功（veto），提议者进入冷却期
+4. 若挑战未通过，由其他智能体组成「陪审团」投票
+5. 检测反共识（守护者 vs 炼金术士）并增强信号
+6. 输出最终方向与置信度
+
+特性：
+- 16 智能体各自携带不可调和的哲学世界观
+- 信息源隔离、时间尺度分裂、奖励函数极端化
+- 持续演化反共识规则
 """
 
 import asyncio
@@ -17,378 +22,392 @@ import random
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Set
 
 import numpy as np
 
-from agents.worldview import WorldView, WorldViewAgent, WorldViewManifesto
-from agents.extreme_rewards import ExtremeRewardFunctions
+from agents.worldview import (
+    WorldView,
+    WorldViewAgent,
+    WorldViewManifesto,
+)
 
 logger = logging.getLogger("fire_seed.adversarial_council")
 
 
 @dataclass
-class ParliamentRecord:
-    """一轮议会审议的完整记录"""
+class CouncilRecord:
+    """单轮审议的完整记录"""
     round_number: int
-    timestamp: datetime = field(default_factory=datetime.now)
-    proposer: str = ""
-    proposer_worldview: str = ""
-    proposal: Dict[str, Any] = field(default_factory=dict)
-    challenger: str = ""
-    challenger_worldview: str = ""
-    challenge_result: Dict[str, Any] = field(default_factory=dict)
-    vetoed: bool = False
-    jury_votes: Dict[str, float] = field(default_factory=dict)
-    verdict_direction: int = 0
-    verdict_confidence: float = 0.0
+    timestamp: datetime
+    proposer: str
+    proposer_worldview: str
+    proposal: Dict[str, Any]
+    challenger: str
+    challenger_worldview: str
+    challenge_result: str          # "vetoed" / "overruled"
+    jury_votes: Dict[str, float]   # 每个陪审员的名字 -> 投票值
+    final_direction: int
+    final_confidence: float
     anti_consensus_triggered: bool = False
-    godel_doubt_applied: float = 0.0
+    notes: str = ""
+
+
+@dataclass
+class AgentRegistryEntry:
+    """智能体注册项"""
+    name: str
+    agent: WorldViewAgent
+    manifesto: WorldViewManifesto
+    cool_down_until: float = 0.0
+    recent_proposals: List[Dict] = field(default_factory=list)
+    challenge_wins: int = 0
+    challenge_losses: int = 0
+    proposal_accepted: int = 0
+    proposal_rejected: int = 0
 
 
 class AdversarialCouncil:
     """
     对抗式议会。
-
-    决策流程：
-    1. 从所有不在冷却期的智能体中随机选择提议者
-    2. 选择世界观对立的智能体作为挑战者
-    3. 挑战者提出抗辩，若抗辩成立（veto=True），提案被否决，提议者进入冷却
-    4. 否则，剩余智能体组成陪审团进行投票
-    5. 若存在主义与进化论罕见一致，触发反共识增强
-    6. 应用哥德尔监视者的怀疑指数修正最终置信度
+    每个智能体带着自己的世界观参与审议，通过抗辩制碰撞出最优决策。
     """
 
-    def __init__(self,
-                 godel_watcher=None,
-                 narrator=None,
-                 behavior_log=None,
-                 config: Optional[Dict[str, Any]] = None):
-        """
-        :param godel_watcher: 哥德尔监视者实例（用于获取怀疑指数）
-        :param narrator:      叙事官实例（用于记录审议过程）
-        :param behavior_log:  行为日志实例
-        :param config:        配置参数
-        """
-        self.agents: Dict[str, WorldViewAgent] = {}
-        self.godel_watcher = godel_watcher
-        self.narrator = narrator
+    def __init__(self, behavior_log=None, config: Dict = None):
         self.behavior_log = behavior_log
+        self.config = config or {}
 
-        # 配置参数
-        cfg = config or {}
-        self.cooling_period_sec = cfg.get("adversarial_council.cooling_period_sec", 1800)  # 30分钟
-        self.min_jury_size = cfg.get("adversarial_council.min_jury_size", 2)
-        self.anti_consensus_multiplier = cfg.get("adversarial_council.anti_consensus_multiplier", 2.0)
-        self.godel_doubt_threshold = cfg.get("adversarial_council.godel_doubt_threshold", 0.7)
+        # 已注册的智能体
+        self.agents: Dict[str, AgentRegistryEntry] = {}
 
         # 审议历史
-        self.records: List[ParliamentRecord] = []
-        self.round_count = 0
+        self.history: List[CouncilRecord] = []
+        self.round_counter = 0
+
+        # 配置参数
+        self.cooling_off_seconds = self.config.get(
+            "adversarial_council.cooling_off_seconds", 1800
+        )  # 默认 30 分钟
+        self.min_jury_participation = self.config.get(
+            "adversarial_council.min_jury_participation", 0.6
+        )
+        self.anti_consensus_multiplier = self.config.get(
+            "adversarial_council.anti_consensus_multiplier", 2.0
+        )
 
         logger.info("对抗式议会初始化完成")
 
-    # ==================== 智能体注册 ====================
+    # ======================== 智能体管理 ========================
     def register_agent(self, name: str, agent: WorldViewAgent) -> None:
         """注册一个携带世界观的智能体"""
-        self.agents[name] = agent
-        logger.info(f"议会注册智能体: {name} ({agent.manifesto.worldview.value})")
+        if name in self.agents:
+            logger.warning(f"智能体 {name} 已注册，将被覆盖")
+
+        manifesto = agent.manifesto if hasattr(agent, 'manifesto') else WorldViewManifesto(
+            worldview=WorldView.MECHANICAL_MATERIALISM,
+            core_belief="默认",
+            primary_optimization_target="未知",
+            adversary_worldview=WorldView.SKEPTICISM,
+        )
+
+        self.agents[name] = AgentRegistryEntry(
+            name=name,
+            agent=agent,
+            manifesto=manifesto,
+        )
+        logger.info(f"智能体已注册: {name} ({manifesto.worldview.value})")
 
     def unregister_agent(self, name: str) -> bool:
-        """移除一个智能体"""
+        """注销智能体"""
         if name in self.agents:
             del self.agents[name]
             return True
         return False
 
-    # ==================== 核心审议 ====================
-    async def deliberate(self, perception: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """
-        执行一轮完整的对抗式审议。
-
-        :param perception: 当前市场感知快照（可由引擎提供）
-        :return: 最终决策字典，包含 direction, confidence, record
-        """
-        self.round_count += 1
-        record = ParliamentRecord(round_number=self.round_count)
-
-        # 1. 收集所有不在冷却期的智能体
+    def get_active_agents(self) -> List[Tuple[str, AgentRegistryEntry]]:
+        """获取所有不在冷却期的智能体"""
         now = time.time()
-        available = [
-            a for a in self.agents.values()
-            if now >= getattr(a, 'cooling_off_until', 0.0)
-        ]
-        if len(available) < 2:
-            logger.debug(f"可用智能体不足 ({len(available)}<2)，返回中性决策")
+        active = []
+        for name, entry in self.agents.items():
+            if now >= entry.cool_down_until:
+                active.append((name, entry))
+        return active
+
+    # ======================== 核心审议流程 ========================
+    async def deliberate(self, context: Dict[str, Any] = None) -> Dict[str, Any]:
+        """
+        一轮完整的对抗式议会审议。
+        返回最终决策：{direction, confidence, record, ...}
+        """
+        self.round_counter += 1
+        context = context or {}
+        record = CouncilRecord(
+            round_number=self.round_counter,
+            timestamp=datetime.now(),
+            proposer="",
+            proposer_worldview="",
+            proposal={},
+            challenger="",
+            challenger_worldview="",
+            challenge_result="pending",
+            jury_votes={},
+            final_direction=0,
+            final_confidence=0.0,
+        )
+
+        # 1. 确定参与者
+        active = self.get_active_agents()
+        if len(active) < 3:
+            logger.warning(f"活跃智能体不足 ({len(active)} < 3)，审议终止")
+            record.notes = "活跃智能体不足"
+            self.history.append(record)
             return {
                 "direction": 0,
                 "confidence": 0.0,
                 "status": "insufficient_agents",
-                "record": record
+                "record": self._record_to_dict(record),
             }
 
-        # 2. 随机选择提议者（排除魔鬼代言人作为提议者，因其天职是挑战）
-        proposer_candidates = [a for a in available
-                               if a.manifesto.worldview != WorldView.SKEPTICISM]
-        if not proposer_candidates:
-            proposer_candidates = available
-        proposer = random.choice(proposer_candidates)
+        # 2. 选择提议者（随机）
+        proposer_name, proposer_entry = random.choice(active)
+        record.proposer = proposer_name
+        record.proposer_worldview = proposer_entry.manifesto.worldview.value
 
-        # 3. 生成提案
-        proposal = proposer.propose(perception)
-        record.proposer = self._agent_name(proposer)
-        record.proposer_worldview = proposer.manifesto.worldview.value
+        # 3. 提议者生成提案
+        try:
+            proposal = proposer_entry.agent.propose(context)
+        except Exception as e:
+            logger.error(f"提议者 {proposer_name} 提案失败: {e}")
+            proposal = {"direction": 0, "confidence": 0.0}
         record.proposal = proposal
 
-        # 4. 选择世界观对立的挑战者
-        remaining = [a for a in available if a != proposer]
-        challenger = self._select_adversary(proposer, remaining)
+        # 4. 选择挑战者（世界观对立的智能体）
+        challenger_name, challenger_entry = self._select_adversary(
+            proposer_name, proposer_entry, active
+        )
+        record.challenger = challenger_name
+        record.challenger_worldview = challenger_entry.manifesto.worldview.value
 
-        # 5. 挑战者提出抗辩
-        challenge = challenger.challenge(proposal, challenger.manifesto.worldview)
-        record.challenger = self._agent_name(challenger)
-        record.challenger_worldview = challenger.manifesto.worldview.value
-        record.challenge_result = challenge
+        # 5. 挑战者发起挑战
+        try:
+            challenge = challenger_entry.agent.challenge(
+                proposal,
+                challenger_entry.manifesto.worldview,
+            )
+        except Exception as e:
+            logger.error(f"挑战者 {challenger_name} 挑战失败: {e}")
+            challenge = {"veto": False, "reason": "挑战过程异常"}
 
-        # 6. 若挑战成功（veto），否决提案
+        # 6. 是否被否决
         if challenge.get("veto", False):
-            record.vetoed = True
-            self._apply_cooling(proposer)
-            logger.info(f"提案被否决: {record.proposer} 被 {record.challenger} 成功挑战")
-            self._log_event("PARLIAMENT_VETO", record)
+            # 否决成功：提议者进入冷却期
+            proposer_entry.cool_down_until = time.time() + self.cooling_off_seconds
+            proposer_entry.challenge_losses += 1
+            proposer_entry.proposal_rejected += 1
+            challenger_entry.challenge_wins += 1
+
+            record.challenge_result = "vetoed"
+            record.notes = f"否决理由: {challenge.get('reason', '未提供')}"
+            self.history.append(record)
+
+            # 记录行为日志
+            if self.behavior_log:
+                self.behavior_log.log(
+                    EventType.AGENT, "AdversarialCouncil",
+                    f"提案被否决: {proposer_name}({record.proposer_worldview}) "
+                    f"by {challenger_name}({record.challenger_worldview})",
+                    snapshot={"reason": challenge.get("reason", "")}
+                )
+
             return {
                 "direction": 0,
                 "confidence": 0.0,
                 "status": "vetoed",
-                "reason": challenge.get("reason", "挑战成功"),
-                "record": record
+                "record": self._record_to_dict(record),
             }
 
-        # 7. 挑战未通过，组成陪审团投票
-        jury = [a for a in available if a not in (proposer, challenger)]
-        if len(jury) < self.min_jury_size:
-            direction = proposal.get("direction", 0)
-            confidence = proposal.get("confidence", 0.3)
-            record.verdict_direction = direction
-            record.verdict_confidence = confidence
+        # 7. 陪审团投票
+        record.challenge_result = "overruled"
+        challenger_entry.challenge_losses += 1
+
+        jury = [
+            (name, entry)
+            for name, entry in active
+            if name not in (proposer_name, challenger_name)
+        ]
+
+        if len(jury) < 2:
+            logger.warning("陪审团人数不足")
+            record.notes = "陪审团不足"
+            self.history.append(record)
             return {
-                "direction": direction,
-                "confidence": confidence,
-                "status": "proposer_fallback",
-                "record": record
+                "direction": proposal.get("direction", 0),
+                "confidence": 0.3,
+                "status": "tiny_jury",
+                "record": self._record_to_dict(record),
             }
 
-        # 8. 陪审团投票
-        votes: Dict[str, float] = {}
-        for agent in jury:
-            vote_conf = self._evaluate_proposal(agent, proposal, challenge, perception)
-            agent_name = self._agent_name(agent)
-            votes[agent_name] = vote_conf
-
-        record.jury_votes = votes
+        # 8. 陪审员评估
+        for juror_name, juror_entry in jury:
+            try:
+                vote = juror_entry.agent.evaluate_proposal(proposal, challenge)
+                record.jury_votes[juror_name] = vote
+            except Exception as e:
+                logger.error(f"陪审员 {juror_name} 评估失败: {e}")
+                record.jury_votes[juror_name] = 0.0
 
         # 9. 反共识增强
-        if self._is_anti_consensus(jury, proposal):
-            record.anti_consensus_triggered = True
-            votes = {k: v * self.anti_consensus_multiplier for k, v in votes.items()}
-            logger.info("反共识增强触发：存在主义与进化论罕见一致")
+        anti_consensus = self._check_anti_consensus(record.jury_votes)
+        record.anti_consensus_triggered = anti_consensus
 
-        # 10. 计算裁决
-        total = sum(votes.values())
-        if abs(total) < 0.01:
-            direction = 0
-            confidence = 0.0
-        else:
-            direction = 1 if total > 0 else -1
-            confidence = min(1.0, abs(total) / (len(votes) * 0.5))
+        if anti_consensus:
+            for name in record.jury_votes:
+                record.jury_votes[name] *= self.anti_consensus_multiplier
 
-        # 11. 应用哥德尔怀疑指数修正
-        godel_doubt = self._get_godel_doubt()
-        if godel_doubt > self.godel_doubt_threshold:
-            confidence *= (1.0 - godel_doubt * 0.5)
-            record.godel_doubt_applied = godel_doubt
-            logger.info(f"哥德尔怀疑指数 {godel_doubt:.3f}，置信度修正为 {confidence:.3f}")
+        # 10. 综合决策
+        total_votes = sum(record.jury_votes.values())
+        confidence = min(1.0, abs(total_votes) / max(len(record.jury_votes), 1))
+        direction = 1 if total_votes > 0 else (-1 if total_votes < 0 else 0)
 
-        record.verdict_direction = direction
-        record.verdict_confidence = confidence
-        self.records.append(record)
+        record.final_direction = direction
+        record.final_confidence = confidence
 
-        self._log_event("PARLIAMENT_VERDICT", record)
+        # 更新提议者统计
+        proposer_entry.proposal_accepted += 1
+
+        self.history.append(record)
+
+        if self.behavior_log:
+            self.behavior_log.log(
+                EventType.AGENT, "AdversarialCouncil",
+                f"审议通过: 方向={'多' if direction==1 else '空' if direction==-1 else '中性'}, "
+                f"置信度={confidence:.2f}, 反共识={anti_consensus}",
+                snapshot={"jury_votes": record.jury_votes, "anti_consensus": anti_consensus}
+            )
+
         return {
             "direction": direction,
             "confidence": confidence,
             "status": "deliberated",
-            "record": record
+            "anti_consensus": anti_consensus,
+            "record": self._record_to_dict(record),
         }
 
-    # ==================== 内部方法 ====================
-    def _select_adversary(self, proposer: WorldViewAgent,
-                          candidates: List[WorldViewAgent]) -> WorldViewAgent:
+    # ======================== 挑战者选择 ========================
+    def _select_adversary(
+        self,
+        proposer_name: str,
+        proposer_entry: AgentRegistryEntry,
+        active: List[Tuple[str, AgentRegistryEntry]],
+    ) -> Tuple[str, AgentRegistryEntry]:
+        """根据世界观对立原则选择挑战者"""
+
+        # 提议者声明的天然对立世界观
+        adversary_worldview = proposer_entry.manifesto.adversary_worldview
+
+        # 第一步：寻找世界观精确匹配的挑战者
+        candidates = [
+            (name, entry)
+            for name, entry in active
+            if name != proposer_name
+            and entry.manifesto.worldview == adversary_worldview
+        ]
+
+        if candidates:
+            return random.choice(candidates)
+
+        # 第二步：若无精确匹配，选择世界观距离最远的
+        remaining = [
+            (name, entry)
+            for name, entry in active
+            if name != proposer_name
+        ]
+
+        if not remaining:
+            # 极端情况：所有活跃智能体只有提议者自己
+            return proposer_name, proposer_entry
+
+        # 计算世界观距离（基于枚举值的哈希差值）
+        proposer_wv = proposer_entry.manifesto.worldview
+        farthest = max(
+            remaining,
+            key=lambda x: abs(
+                hash(x[1].manifesto.worldview) - hash(proposer_wv)
+            ),
+        )
+        return farthest
+
+    # ======================== 反共识检测 ========================
+    def _check_anti_consensus(self, jury_votes: Dict[str, float]) -> bool:
         """
-        选择最对立的挑战者。
-        优先选择 manifesto 中声明的 adversary_worldview。
-        其次选择奖励函数方向相反的智能体。
+        检测守护者（存在主义）与炼金术士（进化论）是否罕见地达成一致。
+        这是一对几乎永远对立的智能体，当它们同时支持同一方向时，
+        往往意味着信号极其可靠（或极其危险）。
         """
-        adv_worldview = proposer.manifesto.adversary_worldview
-        for agent in candidates:
-            if agent.manifesto.worldview == adv_worldview:
-                return agent
+        guardian_found = False
+        alchemist_found = False
 
-        # 备选：选择奖励信号方向最相反者（需各智能体预计算偏好符号）
-        proposer_sign = self._get_preference_sign(proposer)
-        best_agent = None
-        best_opposition = -1.0
-        for agent in candidates:
-            agent_sign = self._get_preference_sign(agent)
-            opposition = -proposer_sign * agent_sign  # 符号越相反，值越负
-            # 我们想要最负的
-            if opposition < best_opposition:
-                best_opposition = opposition
-                best_agent = agent
+        for name, vote in jury_votes.items():
+            entry = self.agents.get(name)
+            if entry is None:
+                continue
+            worldview = entry.manifesto.worldview
+            if worldview == WorldView.EXISTENTIALISM and vote > 0:
+                guardian_found = True
+            if worldview == WorldView.EVOLUTIONISM and vote > 0:
+                alchemist_found = True
 
-        return best_agent if best_agent else random.choice(candidates)
+        return guardian_found and alchemist_found
 
-    def _evaluate_proposal(self, agent: WorldViewAgent,
-                           proposal: Dict[str, Any],
-                           challenge: Dict[str, Any],
-                           perception: Optional[Dict] = None) -> float:
-        """
-        让一个陪审员评估提案。
-        返回 -1.0 到 1.0 的评分，表示反对/支持程度。
-        """
-        # 尝试获取该智能体自身对该情形的判断
-        own_proposal = agent.propose(perception) if hasattr(agent, 'propose') else {}
-        own_dir = own_proposal.get("direction", 0)
-        prop_dir = proposal.get("direction", 0)
-
-        # 基础支持度基于方向一致性
-        if own_dir == prop_dir and own_dir != 0:
-            base = 0.4 + own_proposal.get("confidence", 0.3) * 0.4
-        elif own_dir == 0:
-            base = 0.1  # 中性
-        else:
-            base = -0.3 - own_proposal.get("confidence", 0.3) * 0.3
-
-        # 引入世界观权重扰动（确保多样性）
-        base += random.uniform(-0.05, 0.05)
-
-        # 考虑挑战内容对评估的影响
-        if challenge.get("severity", "low") == "high":
-            base *= 0.8
-
-        return max(-1.0, min(1.0, base))
-
-    def _is_anti_consensus(self, jury: List[WorldViewAgent],
-                           proposal: Dict[str, Any]) -> bool:
-        """
-        检测反共识：存在主义（守护者）与进化论（炼金术士）同时在场，
-        且两者支持的方向相同且非零。
-        """
-        existentialist = None
-        evolutionist = None
-        for agent in jury:
-            wv = agent.manifesto.worldview
-            if wv == WorldView.EXISTENTIALISM:
-                existentialist = agent
-            elif wv == WorldView.EVOLUTIONISM:
-                evolutionist = agent
-
-        if existentialist is None or evolutionist is None:
-            return False
-
-        eval_exist = self._evaluate_proposal(existentialist, proposal, {}, None)
-        eval_evol = self._evaluate_proposal(evolutionist, proposal, {}, None)
-
-        # 两者方向一致且非零，视为罕见共识
-        return (eval_exist * eval_evol > 0 and
-                abs(eval_exist) > 0.2 and abs(eval_evol) > 0.2)
-
-    def _get_preference_sign(self, agent: WorldViewAgent) -> float:
-        """获取智能体的奖励偏好符号（+1 偏好多头，-1 偏好空头，0 中性）"""
-        worldview = agent.manifesto.worldview
-        # 守护者永远悲观 → -1, 炼金术士希望盈利 → +1, 魔鬼代言人→ 0
-        sign_map = {
-            WorldView.EXISTENTIALISM: -1,
-            WorldView.EVOLUTIONISM: 1,
-            WorldView.SKEPTICISM: 0,
-            WorldView.INCOMPLETENESS: -0.5,
-            WorldView.PHYSICALISM: 0,
-            WorldView.OCCAMS_RAZOR: 0,
-            WorldView.BAYESIANISM: 0,
-            WorldView.HERMENEUTICS: 0,
-            WorldView.PLURALISM: 0,
-            WorldView.HISTORICISM: 0,
-            WorldView.HOLISM: 0,
-            WorldView.MECHANICAL_MATERIALISM: 0,
-        }
-        return sign_map.get(worldview, 0.0)
-
-    def _apply_cooling(self, agent: WorldViewAgent) -> None:
-        """对智能体施加冷却期"""
-        setattr(agent, 'cooling_off_until', time.time() + self.cooling_period_sec)
-        logger.info(f"智能体 {self._agent_name(agent)} 进入冷却 {self.cooling_period_sec}秒")
-
-    def _get_godel_doubt(self) -> float:
-        """获取哥德尔监视者的当前怀疑指数"""
-        if self.godel_watcher and hasattr(self.godel_watcher, '_last_doubt'):
-            return float(self.godel_watcher._last_doubt)
-        return 0.0
-
-    def _agent_name(self, agent: WorldViewAgent) -> str:
-        """反向查找智能体的注册名称"""
-        for name, a in self.agents.items():
-            if a is agent:
-                return name
-        return str(id(agent))
-
-    def _log_event(self, event_type: str, record: ParliamentRecord) -> None:
-        """将议会事件写入行为日志"""
-        if self.behavior_log is None:
-            return
-        try:
-            summary = (
-                f"第{record.round_number}轮: {record.proposer}({record.proposer_worldview}) 提案 "
-                f"方向={record.proposal.get('direction')}, "
-                f"挑战者={record.challenger}({record.challenger_worldview}), "
-                f"否决={record.vetoed}, 裁决方向={record.verdict_direction}"
-            )
-            self.behavior_log.info(
-                event_type="Parliament",
-                source="AdversarialCouncil",
-                content=summary,
-                snapshot=record.__dict__
-            )
-        except Exception as e:
-            logger.warning(f"记录议会日志失败: {e}")
-
-    # ==================== 查询接口 ====================
+    # ======================== 状态查询 ========================
     def get_status(self) -> Dict[str, Any]:
         """返回议会当前状态"""
+        active_count = len(self.get_active_agents())
         return {
             "total_agents": len(self.agents),
-            "available_agents": sum(
-                1 for a in self.agents.values()
-                if time.time() >= getattr(a, 'cooling_off_until', 0.0)
-            ),
-            "total_rounds": self.round_count,
-            "recent_records": [
-                {
-                    "round": r.round_number,
-                    "proposer": r.proposer,
-                    "challenger": r.challenger,
-                    "vetoed": r.vetoed,
-                    "verdict": r.verdict_direction,
+            "active_agents": active_count,
+            "cooling_off_agents": len(self.agents) - active_count,
+            "rounds_completed": self.round_counter,
+            "last_verdict": self._record_to_dict(self.history[-1]) if self.history else None,
+            "agent_stats": {
+                name: {
+                    "worldview": entry.manifesto.worldview.value,
+                    "cooling_off": max(0, entry.cool_down_until - time.time()),
+                    "proposals_accepted": entry.proposal_accepted,
+                    "proposals_rejected": entry.proposal_rejected,
+                    "challenge_wins": entry.challenge_wins,
+                    "challenge_losses": entry.challenge_losses,
                 }
-                for r in self.records[-5:]
-            ],
+                for name, entry in self.agents.items()
+            },
         }
 
-    def get_last_verdict(self) -> Optional[ParliamentRecord]:
-        """获取最近一次裁决记录"""
-        return self.records[-1] if self.records else None
+    def get_recent_history(self, limit: int = 20) -> List[Dict]:
+        """获取最近审议记录"""
+        return [self._record_to_dict(r) for r in self.history[-limit:]]
 
-    def clear_cooling(self) -> None:
-        """清除所有智能体的冷却期（用于紧急情况）"""
-        for agent in self.agents.values():
-            setattr(agent, 'cooling_off_until', 0.0)
-        logger.warning("已清除所有智能体的冷却期")
+    @staticmethod
+    def _record_to_dict(record: CouncilRecord) -> Dict[str, Any]:
+        if record is None:
+            return {}
+        return {
+            "round": record.round_number,
+            "timestamp": record.timestamp.isoformat(),
+            "proposer": record.proposer,
+            "proposer_worldview": record.proposer_worldview,
+            "challenger": record.challenger,
+            "challenger_worldview": record.challenger_worldview,
+            "challenge_result": record.challenge_result,
+            "jury_votes": record.jury_votes,
+            "final_direction": record.final_direction,
+            "final_confidence": record.final_confidence,
+            "anti_consensus": record.anti_consensus_triggered,
+            "notes": record.notes,
+        }
+
+    # ======================== 周期运行 ========================
+    async def run_loop(self, interval_sec: int = 300) -> None:
+        """独立运行循环（由引擎驱动）"""
+        while True:
+            await self.deliberate()
+            await asyncio.sleep(interval_sec)
