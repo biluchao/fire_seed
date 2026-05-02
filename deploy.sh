@@ -5,8 +5,8 @@
 # 功能：
 #   1. 环境检测与系统依赖安装
 #   2. Python 虚拟环境创建与 pip 依赖安装
-#   3. C++ 模块编译 (pybind11)
-#   4. 配置文件初始化 (从 .env.example 交互式生成 .env)
+#   3. C++ 高性能模块编译 (pybind11)
+#   4. 配置文件初始化 (含智能体世界观的默认配置)
 #   5. SQLite 数据库初始化
 #   6. 日志轮转配置
 #   7. 系统服务安装 (systemd)
@@ -119,7 +119,7 @@ install_system_deps() {
     systemctl enable --now redis-server || true
 }
 
-# 检查 Python 版本
+# 配置 Python 环境
 setup_python() {
     log_step "配置 Python 环境..."
     if ! command -v python3.12 &> /dev/null; then
@@ -169,6 +169,7 @@ build_cpp() {
 # 初始化配置文件
 init_config() {
     log_step "初始化配置文件..."
+    # .env 文件
     if [[ ! -f "$SCRIPT_DIR/.env" ]]; then
         if [[ -f "$SCRIPT_DIR/.env.example" ]]; then
             cp "$SCRIPT_DIR/.env.example" "$SCRIPT_DIR/.env"
@@ -181,11 +182,189 @@ init_config() {
         log_info ".env 文件已存在，跳过。"
     fi
 
-    # 确保配置文件目录存在
+    # 确保配置目录存在
     mkdir -p "$CONFIG_DIR"
+
+    # settings.yaml (如果不存在则从例子复制)
     if [[ ! -f "$CONFIG_DIR/settings.yaml" ]]; then
-        cp "$CONFIG_DIR/settings.yaml.example" "$CONFIG_DIR/settings.yaml" 2>/dev/null || true
+        if [[ -f "$CONFIG_DIR/settings.yaml.example" ]]; then
+            cp "$CONFIG_DIR/settings.yaml.example" "$CONFIG_DIR/settings.yaml"
+        else
+            # 生成默认 settings.yaml
+            cat > "$CONFIG_DIR/settings.yaml" << 'YAMLEOF'
+# 火种系统默认配置 (自动生成)
+system:
+  mode: virtual
+  strategy_mode: moderate
+  timezone: "Asia/Shanghai"
+  log_level: INFO
+
+learning:
+  enabled: true
+  start_time: "01:30"
+  end_time: "04:30"
+
+adversarial_council:
+  enabled: true
+  cooling_off_minutes: 30
+  anti_consensus_boost: 2.0
+  min_jury_members: 3
+YAMLEOF
+        fi
+        log_info "已生成默认 settings.yaml"
+    else
+        # 检查是否需要补充缺失的配置段
+        if ! grep -q 'adversarial_council' "$CONFIG_DIR/settings.yaml"; then
+            cat >> "$CONFIG_DIR/settings.yaml" << 'YAMLEOF'
+
+# 对抗式议会配置 (自动追加)
+adversarial_council:
+  enabled: true
+  cooling_off_minutes: 30
+  anti_consensus_boost: 2.0
+  min_jury_members: 3
+YAMLEOF
+            log_info "已将对抗式议会配置追加到 settings.yaml"
+        fi
     fi
+
+    # agent_rewards.yaml (默认)
+    if [[ ! -f "$CONFIG_DIR/agent_rewards.yaml" ]]; then
+        cat > "$CONFIG_DIR/agent_rewards.yaml" << 'YAMLEOF'
+# 火种智能体极端化奖励函数 (自动生成)
+global:
+  performance_window_days: 20
+  adaptive_weights: false
+  min_voting_weight: 0.03
+
+agents:
+  sentinel:
+    description: "监察者·机械唯物主义"
+    reward_components:
+      - name: detection_rate
+        weight: 0.5
+        goal: maximize
+      - name: false_alarm_rate
+        weight: -0.5
+        goal: minimize
+
+  alchemist:
+    description: "炼金术士·进化论"
+    reward_components:
+      - name: sharpe_ratio
+        weight: 0.4
+        goal: maximize
+      - name: strategy_novelty
+        weight: 0.2
+        goal: maximize
+
+  guardian:
+    description: "守护者·存在主义"
+    reward_components:
+      - name: max_drawdown
+        weight: -0.6
+        goal: minimize
+      - name: cvar_99
+        weight: -0.4
+        goal: minimize
+
+  devils_advocate:
+    description: "魔鬼代言人·怀疑论"
+    reward_components:
+      - name: adversarial_success
+        weight: 1.0
+        goal: maximize
+
+  godel_watcher:
+    description: "哥德尔监视者·不完备定理"
+    reward_components:
+      - name: doubt_accuracy
+        weight: 0.7
+        goal: maximize
+      - name: opportunity_cost
+        weight: -0.3
+        goal: minimize
+
+  env_inspector:
+    description: "环境检察官·物理主义"
+    reward_components:
+      - name: uptime_pct
+        weight: 0.3
+        goal: maximize
+      - name: avg_latency_ms
+        weight: -0.4
+        goal: minimize
+
+  redundancy_auditor:
+    description: "冗余审计官·奥卡姆剃刀"
+    reward_components:
+      - name: dead_code_ratio
+        weight: -0.5
+        goal: minimize
+      - name: unused_config_keys
+        weight: -0.3
+        goal: minimize
+
+  weight_calibrator:
+    description: "权重校准师·贝叶斯主义"
+    reward_components:
+      - name: out_of_sample_sharpe
+        weight: 0.6
+        goal: maximize
+      - name: in_sample_sharpe_gap
+        weight: -0.4
+        goal: minimize
+
+  narrator:
+    description: "叙事官·诠释学"
+    reward_components:
+      - name: human_feedback_score
+        weight: 0.7
+        goal: maximize
+      - name: report_generation_time
+        weight: -0.3
+        goal: minimize
+
+  diversity_enforcer:
+    description: "多样性强制者·多元主义"
+    reward_components:
+      - name: agent_weight_entropy
+        weight: 0.6
+        goal: maximize
+      - name: prediction_diversity
+        weight: 0.4
+        goal: minimize
+
+  archive_guardian:
+    description: "归档审计官·历史主义"
+    reward_components:
+      - name: archived_ratio
+        weight: 0.8
+        goal: maximize
+      - name: missing_backups
+        weight: -0.2
+        goal: minimize
+
+  copy_trade_coordinator:
+    description: "跟单协调官·整体论"
+    reward_components:
+      - name: sync_success_rate
+        weight: 0.9
+        goal: maximize
+      - name: sync_delay_sec
+        weight: -0.1
+        goal: minimize
+YAMLEOF
+        log_info "已生成默认 agent_rewards.yaml"
+    fi
+
+    # 确保其他配置文件存在（若无则提供默认）
+    for cfg_file in risk_limits.yaml strategy_params.yaml weights.yaml cloud_storage.yaml multi_account.yaml human_constraints.yaml; do
+        if [[ ! -f "$CONFIG_DIR/$cfg_file" ]]; then
+            touch "$CONFIG_DIR/$cfg_file"
+            log_warn "$cfg_file 缺失，已生成空文件，请手动配置。"
+        fi
+    done
 }
 
 # 初始化数据库
@@ -194,27 +373,48 @@ init_database() {
     source "$VENV_DIR/bin/activate"
     python3 -c "
 import sqlite3, os
+os.makedirs('$SCRIPT_DIR/data', exist_ok=True)
 db_path = os.path.join('$SCRIPT_DIR', 'data', 'fire_seed.db')
-os.makedirs(os.path.dirname(db_path), exist_ok=True)
 conn = sqlite3.connect(db_path)
-conn.execute('''
-CREATE TABLE IF NOT EXISTS events (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+conn.execute('''CREATE TABLE IF NOT EXISTS events (
+    id TEXT PRIMARY KEY,
     ts REAL,
-    type TEXT,
+    level TEXT,
+    event_type TEXT,
     module TEXT,
     content TEXT,
-    snapshot TEXT
-)
-''')
-conn.execute('''
-CREATE TABLE IF NOT EXISTS archive_index (
+    snapshot TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+)''')
+conn.execute('''CREATE TABLE IF NOT EXISTS archive_index (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     filename TEXT UNIQUE,
     cloud_key TEXT,
     uploaded_at REAL
-)
-''')
+)''')
+conn.execute('''CREATE TABLE IF NOT EXISTS elo_rankings (
+    strategy_id TEXT PRIMARY KEY,
+    name TEXT DEFAULT '',
+    elo REAL DEFAULT 1500.0,
+    matches INTEGER DEFAULT 0,
+    wins INTEGER DEFAULT 0,
+    draws INTEGER DEFAULT 0,
+    losses INTEGER DEFAULT 0,
+    streak INTEGER DEFAULT 0,
+    best_elo REAL DEFAULT 1500.0,
+    last_updated TEXT DEFAULT (datetime('now')),
+    created_at TEXT DEFAULT (datetime('now'))
+)''')
+conn.execute('''CREATE TABLE IF NOT EXISTS match_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    strategy_a TEXT NOT NULL,
+    strategy_b TEXT NOT NULL,
+    score_a REAL NOT NULL,
+    score_b REAL NOT NULL,
+    elo_change_a REAL NOT NULL,
+    elo_change_b REAL NOT NULL,
+    timestamp TEXT DEFAULT (datetime('now'))
+)''')
 conn.commit()
 conn.close()
 print('数据库初始化完成:', db_path)
@@ -290,9 +490,11 @@ final_check() {
         ((errors++))
     fi
 
-    # 检查 C++ 编译产物
-    if [[ ! -f "$CMAKE_BUILD_DIR/libfire_seed_cpp.so" ]] && [[ ! -f "$CMAKE_BUILD_DIR/fire_seed_cpp.*" ]]; then
-        log_warn "未检测到 C++ 编译产物，请检查编译是否成功。"
+    # 检查 C++ 编译产物（若有 CMakeLists.txt 则检查编译结果）
+    if [[ -f "$SCRIPT_DIR/CMakeLists.txt" ]]; then
+        if [[ ! -f "$CMAKE_BUILD_DIR/fire_seed_cpp.so" ]] && [[ ! -f "$CMAKE_BUILD_DIR/libfire_seed_cpp.so" ]]; then
+            log_warn "未检测到 C++ 编译产物，请检查编译是否成功。"
+        fi
     fi
 
     # 检查 .env 是否已配置
@@ -327,7 +529,7 @@ main() {
     check_hardware
 
     # 询问是否继续
-    read -p "按回车开始部署，或 Ctrl+C 取消..." 
+    read -p "按回车开始部署，或 Ctrl+C 取消..."
 
     install_system_deps
     setup_python
