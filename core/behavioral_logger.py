@@ -4,6 +4,7 @@
 ==================================
 提供统一的事件记录与管理：
 - 事件分级：INFO / WARN / ERROR / CRITICAL
+- 丰富的事件类型（涵盖市场、信号、订单、风控、进化、智能体、议会等）
 - 内存缓存：最近 N 条日志，支持快速查询
 - 持久化：写入 SQLite 数据库，按日期分片
 - 实时推送：通过 WebSocket 广播至前端面板
@@ -40,6 +41,10 @@ class EventType(Enum):
     EVOLUTION = "进化"
     OTA = "OTA更新"
     AUTH = "认证操作"
+    # 议会抗辩相关
+    PARLIAMENT_PROPOSE = "议会提议"
+    PARLIAMENT_CHALLENGE = "议会挑战"
+    PARLIAMENT_VERDICT = "议会裁决"
 
 
 class EventLevel(Enum):
@@ -162,7 +167,7 @@ class BehavioralLogger:
         # 写入内存
         self._memory.append(entry)
 
-        # 异步持久化（简单版本：直接写库，生产环境可改为异步队列）
+        # 持久化
         self._persist(entry)
 
         # 推送到前端
@@ -250,7 +255,6 @@ class BehavioralLogger:
                  event_type: Optional[str] = None,
                  limit: int = 200) -> List[Dict]:
         """从数据库中查询历史日志（支持时间范围和过滤）"""
-        # 需要查询的日期范围
         if start_time is None:
             start_time = datetime.now() - timedelta(days=7)
         if end_time is None:
@@ -264,15 +268,15 @@ class BehavioralLogger:
                 try:
                     with sqlite3.connect(str(db_path)) as conn:
                         sql = "SELECT * FROM events WHERE ts BETWEEN ? AND ?"
-                        params = (start_time.timestamp(), end_time.timestamp())
+                        params: List[Any] = [start_time.timestamp(), end_time.timestamp()]
                         if level:
                             sql += " AND level = ?"
-                            params = (*params, level)
+                            params.append(level)
                         if event_type:
                             sql += " AND event_type = ?"
-                            params = (*params, event_type)
+                            params.append(event_type)
                         sql += " ORDER BY ts DESC LIMIT ?"
-                        params = (*params, limit)
+                        params.append(limit)
                         cursor = conn.execute(sql, params)
                         for row in cursor.fetchall():
                             results.append({
@@ -300,14 +304,13 @@ class BehavioralLogger:
         for db_file in self.db_dir.glob("behavior_*.db"):
             date_str = db_file.stem.replace("behavior_", "")
             if date_str < cutoff_str:
-                # 可选：压缩后上传至冷存储
                 try:
                     import gzip
                     compressed_path = db_file.with_suffix('.db.gz')
                     with open(db_file, 'rb') as f_in:
                         with gzip.open(compressed_path, 'wb') as f_out:
                             f_out.write(f_in.read())
-                    db_file.unlink()  # 删除原始文件
+                    db_file.unlink()
                     logger.info(f"档案已压缩: {compressed_path}")
                 except Exception as e:
                     logger.warning(f"日志归档失败 ({db_file}): {e}")
