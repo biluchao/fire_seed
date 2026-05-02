@@ -2,12 +2,12 @@
 """
 火种系统 (FireSeed) 跟单协调官智能体 (CopyTradeCoordinator)
 ===============================================================
-全天候监控多账户跟单系统的运行状态：
-- 各子账户的 API 连接可用性检测（定期尝试获取账户余额）
-- 跟单订单的延迟统计与成功率监控
-- 异常子账户自动暂停与尝试恢复
-- 跟单偏差告警（子账户与主账户的持仓差异）
-- 定期生成跟单健康报告并推送异常
+世界观：整体论 (Holism)
+核心信仰：系统是各部分的协同体，部分异常反映整体失调
+天然对立：机械唯物主义 (Sentinel)
+专属数据源：子账户 API 响应状态码、延迟
+禁止接触：单个账户的详细持仓
+时间尺度：30 秒
 """
 
 import asyncio
@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from api.server import get_engine
 from core.behavioral_logger import BehavioralLogger, EventType, EventLevel
 from core.notifier import SystemNotifier
+from agents.worldview import WorldViewAgent, WorldViewManifesto, WorldView
 
 logger = logging.getLogger("fire_seed.copy_trade_coordinator")
 
@@ -30,9 +31,9 @@ class SubAccountHealth:
     name: str
     online: bool = False
     last_sync: Optional[datetime] = None
-    sync_delay_sec: float = 0.0           # 当前跟单延迟
-    daily_error_count: int = 0            # 今日错误次数
-    max_position_pct: float = 0.0         # 当前最大仓位占比
+    sync_delay_sec: float = 0.0
+    daily_error_count: int = 0
+    max_position_pct: float = 0.0
     status_summary: str = "unknown"
 
 
@@ -46,40 +47,125 @@ class CopyTradeAlert:
     suggestion: str = ""
 
 
-class CopyTradeCoordinator:
+class CopyTradeCoordinator(WorldViewAgent):
     """
-    跟单协调官智能体。
-
-    监控维度：
-    - 各子账户的 API 连接存活
-    - 跟单订单的延迟（主账户成交时间 vs 子账户成交时间）
-    - 跟单成功率与错误率
-    - 子账户仓位与主账户的偏差
-    - 自动恢复（连续错误后降级，恢复正常后重新上线）
+    跟单协调官智能体（整体论）。
+    监控多账户跟单系统的整体协同状态，当子系统异常时推断系统整体失调。
     """
 
     def __init__(self,
                  behavior_log: Optional[BehavioralLogger] = None,
                  notifier: Optional[SystemNotifier] = None,
                  check_interval_sec: int = 30):
+        # 构建整体论世界观宣言
+        manifesto = WorldViewManifesto(
+            worldview=WorldView.HOLISM,
+            core_belief="系统是各部分的协同体，部分异常反映整体失调",
+            primary_optimization_target="sync_success_rate",
+            adversary_worldview=WorldView.MECHANICAL_MATERIALISM,
+            forbidden_data_source={"INDIVIDUAL_ACCOUNT_DETAIL"},
+            exclusive_data_source={"SUB_ACCOUNT_API_RESPONSE", "SYNC_DELAY"},
+            time_scale="30",
+        )
+        super().__init__(manifesto)
+
         self.behavior_log = behavior_log
         self.notifier = notifier
         self.check_interval = check_interval_sec
 
-        # 各子账户的健康状态历史
         self._health_states: Dict[str, SubAccountHealth] = {}
-        # 告警历史
         self._alerts: List[CopyTradeAlert] = []
-        # 上次检查时间
         self._last_check = 0.0
-        # 连续异常计数器
         self._consecutive_anomalies: Dict[str, int] = {}
-        # 自动恢复尝试次数
         self._recovery_attempts: Dict[str, int] = {}
 
-        logger.info("跟单协调官初始化完成")
+    # ====================== 世界观接口实现 ======================
+    def propose(self, perception: Dict = None) -> Dict:
+        """
+        基于整体论提出交易建议。
+        监控所有子账户状态，若有异常则建议减仓或暂停跟单。
+        """
+        # 从引擎获取跟单状态
+        engine = get_engine()
+        if engine is None or not hasattr(engine, 'copy_trading'):
+            return {
+                "direction": 0,
+                "confidence": 0.0,
+                "description": "跟单引擎未就绪",
+                "worldview": self.manifesto.worldview.value,
+            }
 
-    # ======================== 主入口 ========================
+        trader = engine.copy_trading
+        subs = trader.list_sub_accounts()
+        if not subs:
+            return {
+                "direction": 0,
+                "confidence": 0.0,
+                "description": "无子账户",
+                "worldview": self.manifesto.worldview.value,
+            }
+
+        offline_count = sum(1 for s in subs if s.get('status') != 'online')
+        total_count = len(subs)
+        sync_health = offline_count / total_count if total_count > 0 else 0
+
+        if sync_health > 0.3:
+            # 超过30%子账户离线，整体失调，建议减仓
+            return {
+                "direction": -1,
+                "confidence": min(0.9, sync_health),
+                "description": f"多账户跟单系统整体失调：{offline_count}/{total_count} 离线",
+                "worldview": self.manifesto.worldview.value,
+            }
+        elif sync_health > 0.1:
+            return {
+                "direction": 0,
+                "confidence": 0.5,
+                "description": f"少数子账户异常：{offline_count}/{total_count} 离线，建议暂停加仓",
+                "worldview": self.manifesto.worldview.value,
+            }
+        else:
+            return {
+                "direction": 1,
+                "confidence": 0.6,
+                "description": "多账户跟单系统协同良好",
+                "worldview": self.manifesto.worldview.value,
+            }
+
+    def challenge(self, other_proposal: Dict, my_worldview: WorldView) -> Dict:
+        """
+        从整体论视角挑战其他提案。
+        若提案未考虑多账户跟单的连锁影响，则提出否决。
+        """
+        challenges = []
+
+        # 检查提案是否完全忽略了多账户系统的存在
+        engine = get_engine()
+        if engine and hasattr(engine, 'copy_trading') and engine.copy_trading.enabled:
+            subs = engine.copy_trading.list_sub_accounts()
+            if subs:
+                offline = [s for s in subs if s.get('status') != 'online']
+                if offline:
+                    challenges.append(
+                        f"当前有 {len(offline)} 个子账户离线，提案未考虑整体协同风险"
+                    )
+
+                # 检查是否有子账户处于高延迟状态
+                for name, health in self._health_states.items():
+                    if health.sync_delay_sec > 120:
+                        challenges.append(
+                            f"子账户 {name} 延迟 {health.sync_delay_sec:.0f}s，提案风险被低估"
+                        )
+
+        veto = len(challenges) >= 2
+        return {
+            "veto": veto,
+            "challenges": challenges,
+            "suggestion": "建议在解决跟单系统异常后再执行此提案",
+            "worldview": my_worldview.value,
+        }
+
+    # ====================== 主监控入口 ======================
     async def evaluate(self) -> Dict[str, Any]:
         """执行一次完整的跟单健康检查"""
         now = time.time()
@@ -88,42 +174,28 @@ class CopyTradeCoordinator:
         self._last_check = now
 
         alerts: List[CopyTradeAlert] = []
-
-        # 获取跟单引擎
         engine = get_engine()
         if engine is None or not hasattr(engine, 'copy_trading'):
             if self.behavior_log:
-                self.behavior_log.log(EventType.AGENT, "CopyTradeCoordinator",
-                                      "跟单引擎未就绪")
+                self.behavior_log.log(EventType.AGENT, "CopyTradeCoordinator", "跟单引擎未就绪")
             return {"status": "engine_not_available"}
 
         trader = engine.copy_trading
         if not trader.enabled:
             return {"status": "disabled"}
 
-        # 1. 检查各子账户连接状态
         await self._check_sub_account_connectivity(trader, alerts)
-
-        # 2. 检查跟单延迟
         await self._check_sync_delay(trader, alerts)
-
-        # 3. 检查跟单成功率
         await self._check_success_rate(trader, alerts)
-
-        # 4. 检查仓位偏差
         await self._check_position_deviation(trader, alerts)
-
-        # 5. 自动恢复尝试
         await self._attempt_recovery(trader, alerts)
 
-        # 推送告警
         for alert in alerts:
             self._emit_alert(alert)
 
-        # 记录行为日志
+        online_count = sum(1 for h in self._health_states.values() if h.online)
+        total_count = len(self._health_states)
         if self.behavior_log:
-            online_count = sum(1 for h in self._health_states.values() if h.online)
-            total_count = len(self._health_states)
             self.behavior_log.log(
                 EventType.AGENT, "CopyTradeCoordinator",
                 f"跟单检查完成: {online_count}/{total_count} 在线, 告警 {len(alerts)}",
@@ -131,26 +203,20 @@ class CopyTradeCoordinator:
             )
 
         return {
-            "online_count": sum(1 for h in self._health_states.values() if h.online),
-            "total_accounts": len(self._health_states),
+            "online_count": online_count,
+            "total_accounts": total_count,
             "alert_count": len(alerts),
             "health_states": {k: v.status_summary for k, v in self._health_states.items()},
-            "timestamp": datetime.now().isoformat()
+            "timestamp": datetime.now().isoformat(),
         }
 
-    # ======================== 连接检查 ========================
-    async def _check_sub_account_connectivity(self, trader, alerts: List[CopyTradeAlert]) -> None:
-        """
-        通过检查子账户的 last_sync 时间戳判断连接是否存活。
-        若超过5分钟未同步，尝试检测连接状态。
-        """
+    async def _check_sub_account_connectivity(self, trader, alerts):
         subs = trader.list_sub_accounts()
         for sub in subs:
             name = sub.get("name", "unknown")
             status = sub.get("status", "offline")
             last_sync = sub.get("last_sync")
 
-            # 初始化健康状态
             if name not in self._health_states:
                 self._health_states[name] = SubAccountHealth(name=name)
 
@@ -168,7 +234,6 @@ class CopyTradeCoordinator:
                 self._consecutive_anomalies[name] = self._consecutive_anomalies.get(name, 0) + 1
             elif status == "disabled":
                 health.online = False
-                # 被主动禁用，不告警
             else:
                 health.online = True
                 if last_sync:
@@ -176,7 +241,7 @@ class CopyTradeCoordinator:
                     delay = (datetime.now() - sync_time).total_seconds()
                     health.last_sync = sync_time
                     health.sync_delay_sec = delay
-                    if delay > 300:  # 超过5分钟
+                    if delay > 300:
                         alerts.append(CopyTradeAlert(
                             level=EventLevel.WARN,
                             account=name,
@@ -185,9 +250,8 @@ class CopyTradeCoordinator:
                         ))
                         self._consecutive_anomalies[name] = self._consecutive_anomalies.get(name, 0) + 1
                     else:
-                        self._consecutive_anomalies[name] = 0  # 恢复正常
+                        self._consecutive_anomalies[name] = 0
 
-                # 更新错误计数
                 error_count = sub.get("error_count", 0)
                 health.daily_error_count = error_count
                 if error_count > 10:
@@ -198,9 +262,7 @@ class CopyTradeCoordinator:
                         suggestion="检查日志定位错误原因"
                     ))
 
-    # ======================== 跟单延迟检查 ========================
-    async def _check_sync_delay(self, trader, alerts: List[CopyTradeAlert]) -> None:
-        """检查主账户与子账户的成交时间差"""
+    async def _check_sync_delay(self, trader, alerts):
         for name, health in self._health_states.items():
             if health.online and health.sync_delay_sec > 120:
                 alerts.append(CopyTradeAlert(
@@ -210,12 +272,9 @@ class CopyTradeCoordinator:
                     suggestion="网络延迟过高，考虑检查子账户交易所的物理区域"
                 ))
 
-    # ======================== 成功率检查 ========================
-    async def _check_success_rate(self, trader, alerts: List[CopyTradeAlert]) -> None:
-        """检查跟单成功率（从行为日志中统计）"""
+    async def _check_success_rate(self, trader, alerts):
         if not self.behavior_log:
             return
-        # 查询最近1小时内跟单失败事件
         recent = self.behavior_log.query_db(
             start_time=datetime.now() - timedelta(hours=1),
             module="CopyTrading",
@@ -223,7 +282,6 @@ class CopyTradeCoordinator:
         )
         failures = [e for e in recent if "失败" in e.get("content", "")]
         if len(failures) > 5:
-            # 统计每个子账户的失败次数
             fail_per_account = {}
             for f in failures:
                 for name in self._health_states:
@@ -238,36 +296,18 @@ class CopyTradeCoordinator:
                         suggestion="考虑暂停该账户跟单并人工排查"
                     ))
 
-    # ======================== 仓位偏差检查 ========================
-    async def _check_position_deviation(self, trader, alerts: List[CopyTradeAlert]) -> None:
-        """
-        检查子账户持仓与主账户的偏差。
-        需从引擎获取主账户持仓，并与子账户对比。
-        """
+    async def _check_position_deviation(self, trader, alerts):
         try:
             engine = get_engine()
             if engine is None:
                 return
             master_pos = engine.order_mgr.get_position_summary()
             master_size = master_pos.size if hasattr(master_pos, 'size') else 0.0
-
-            for name, health in self._health_states.items():
-                if not health.online:
-                    continue
-                # 从子账户获取持仓（实际上需要通过子账户的 order_mgr）
-                # 简化：通过跟单引擎的接口
-                # 若无法获取，跳过
-                pass
+            # 实际偏差检查需对比每个子账户的持仓，此处占位
         except Exception as e:
             logger.warning(f"仓位偏差检查失败: {e}")
 
-    # ======================== 自动恢复 ========================
-    async def _attempt_recovery(self, trader, alerts: List[CopyTradeAlert]) -> None:
-        """
-        尝试自动恢复连续异常的子账户。
-        - 连续3次检查离线 → 尝试重新启用
-        - 连续10次异常 → 发送关键告警，不再自动恢复
-        """
+    async def _attempt_recovery(self, trader, alerts):
         for name, count in self._consecutive_anomalies.items():
             if count >= 10:
                 alerts.append(CopyTradeAlert(
@@ -277,7 +317,6 @@ class CopyTradeCoordinator:
                     suggestion="需要人工介入排查"
                 ))
             elif count >= 3:
-                # 尝试自动恢复
                 attempts = self._recovery_attempts.get(name, 0)
                 if attempts < 3:
                     success = trader.enable_account(name)
@@ -294,12 +333,10 @@ class CopyTradeCoordinator:
                     else:
                         logger.warning(f"子账户 {name} 自动恢复失败 ({attempts+1}/3)")
 
-    # ======================== 告警处理 ========================
-    def _emit_alert(self, alert: CopyTradeAlert) -> None:
+    def _emit_alert(self, alert: CopyTradeAlert):
         self._alerts.append(alert)
         if len(self._alerts) > 200:
             self._alerts = self._alerts[-200:]
-
         if self.notifier:
             asyncio.ensure_future(
                 self.notifier.send_alert(
