@@ -1,218 +1,188 @@
-#!/usr/bin/env python3
+#!/ Helicoidal Strategy Reinforcement Functions
 """
-火种系统 (FireSeed) 极端化奖励函数定义
-=========================================
-为每个智能体世界观提供互斥的、极端化的目标函数，
-确保议会中不存在中庸的"共同利益"，从底层保障认知多样性。
+火种系统 (FireSeed) 极端化奖励函数定义模块
+=============================================
+本模块为16个智能体各自的世界观提供互斥的优化目标，
+确保智能体之间不存在趋同动机，从而维持根本的认知多样性。
+
+每个奖励条目包含：
+- formula: 奖励函数的数学描述（字符串）
+- extreme_behavior: 该世界观在极端情况下的行为倾向
+- primary_metric: 主要优化指标名
+- anti_metric: 天然冲突的指标（用于对抗性校验）
 """
 
-from enum import Enum
 from typing import Any, Dict, Optional
+from enum import Enum
 
-from agents.worldview import WorldView
+# 注意：WorldView 枚举被设计为与 worldview.py 保持同步，
+# 实际部署时将从 worldview 模块导入。
+# 此处重新声明以避免循环导入，生产环境中会合并到 worldview.py。
+class WorldView(Enum):
+    MECHANICAL_MATERIALISM = "机械唯物主义"
+    EVOLUTIONISM = "进化论"
+    EXISTENTIALISM = "存在主义"
+    SKEPTICISM = "怀疑论"
+    INCOMPLETENESS = "不完备定理"
+    PHYSICALISM = "物理主义"
+    OCCAMS_RAZOR = "奥卡姆剃刀"
+    BAYESIANISM = "贝叶斯主义"
+    HERMENEUTICS = "诠释学"
+    PLURALISM = "多元主义"
+    HISTORICISM = "历史主义"
+    HOLISM = "整体论"
+    EMPIRICISM = "经验主义"               # 数据监察员
+    POSITIVISM = "实证主义"               # 执行质量审计官
+    DEPENDENCY_INVERSION = "依赖倒置"     # 外部依赖哨兵
+    SECURITY_PESSIMISM = "安全悲观主义"   # 安全态势感知官
 
 
 class ExtremeRewardFunctions:
     """
     极端化奖励函数注册表。
-    每个世界观对应一个不可调和的优化目标，服务于单一"信仰"。
+
+    每个世界观被赋予一个单一、极端的优化方向，与其它世界观形成不可调和的矛盾。
+    这种设计保证了议会投票时永远存在不同声音，无法被单一利益捕获。
     """
 
-    # ======================== 奖励定义 ========================
+    # ---- 奖励定义 ----
     REWARD_MAP: Dict[WorldView, Dict[str, Any]] = {
         WorldView.MECHANICAL_MATERIALISM: {
-            "formula": "-log(anomaly_detection_F1 + 1e-6)",
-            "description": "宁可误报，不可漏报。追求系统异常的完美检测率，接受较高的假阳性。",
-            "extreme_behavior": "即使系统正常运行也会频繁发出预警，永远不信任表面平静。",
-            "primary_metric": "F1_score",
-            "direction": "minimize",
-            "primary_metric_weight": 1.0,
-            "secondary_metric": "false_positive_rate",
-            "secondary_weight": 0.3,
-            "target_range": [0.95, 1.0],          # 追求极高的召回率
-            "natural_adversary": WorldView.SKEPTICISM,
+            "formula": "-log(F1_score)",            # 异常检测F1的对数损失
+            "extreme_behavior": "宁可误报不可漏报，频繁发出预警",
+            "primary_metric": "anomaly_detection_f1",
+            "anti_metric": "false_alarm_rate",      # 与低误报目标冲突
         },
-
         WorldView.EVOLUTIONISM: {
-            "formula": "sharpe_ratio × strategy_novelty",
-            "description": "宁可要一个低夏普的新策略，也不要高夏普但与其他策略雷同的老策略。",
-            "extreme_behavior": "不断生成和淘汰策略，不关心近期盈亏，只关心基因多样性。",
-            "primary_metric": "weighted_sharpe_novelty",
-            "direction": "maximize",
-            "primary_metric_weight": 1.0,
-            "secondary_metric": "generation_rate",
-            "secondary_weight": 0.2,
-            "natural_adversary": WorldView.EXISTENTIALISM,
+            "formula": "sharpe × novelty",           # 夏普乘以新颖度
+            "extreme_behavior": "不断生成新策略，即使短期亏损也不停止探索",
+            "primary_metric": "novelty_weighted_sharpe",
+            "anti_metric": "max_drawdown",           # 与保守目标冲突
         },
-
         WorldView.EXISTENTIALISM: {
-            "formula": "-max_drawdown",
-            "description": "宁可踏空整段行情，也不能承受一次巨大回撤。生存是第一要义。",
-            "extreme_behavior": "市场一波动就建议减仓，永远悲观，永远准备最坏情况。",
-            "primary_metric": "max_drawdown_pct",
-            "direction": "minimize",
-            "primary_metric_weight": 1.0,
-            "secondary_metric": "cvar_99",
-            "secondary_weight": 0.5,
-            "natural_adversary": WorldView.EVOLUTIONISM,
+            "formula": "-max_drawdown",              # 最小化最大回撤
+            "extreme_behavior": "市场一有波动就建议减仓，永远悲观",
+            "primary_metric": "max_drawdown",
+            "anti_metric": "annual_return",          # 与收益目标冲突
         },
-
         WorldView.SKEPTICISM: {
-            "formula": "F1_score(correct_veto)",
-            "description": "宁可错杀(否决)一千个正确提案，也不放过一个可能出错的提案。",
-            "extreme_behavior": "对每个提案都找出负面理由并发动挑战，永远不信任任何信号。",
-            "primary_metric": "veto_precision_recall_F1",
-            "direction": "maximize",
-            "primary_metric_weight": 1.0,
-            "secondary_metric": "challenge_count",
-            "secondary_weight": 0.2,
-            "natural_adversary": WorldView.BAYESIANISM,
+            "formula": "F1(correct_veto)",           # 成功证伪的F1
+            "extreme_behavior": "对每一个提案都找出至少一个致命缺陷",
+            "primary_metric": "veto_f1",
+            "anti_metric": "decision_approval_rate", # 与效率目标冲突
         },
-
         WorldView.INCOMPLETENESS: {
-            "formula": "missed_loss_during_awake - 0.5 * profit_lost_during_sleep",
-            "description": "宁可让系统频繁休眠错过利润，也要避免清醒时遭受巨大亏损。",
-            "extreme_behavior": "任何风吹草动就让系统休眠，怀疑指数的阈值设得极低。",
-            "primary_metric": "loss_during_awake_state",
-            "direction": "minimize",
-            "primary_metric_weight": 1.0,
-            "secondary_metric": "sleep_frequency",
-            "secondary_weight": 0.3,
-            "natural_adversary": WorldView.MECHANICAL_MATERIALISM,
+            "formula": "missed_loss_during_sleep",   # 休眠期间错过的亏损
+            "extreme_behavior": "有任何风吹草动就让系统休眠",
+            "primary_metric": "sleep_triggered_risk_coverage",
+            "anti_metric": "lost_profit_opportunity",# 与盈利目标冲突
         },
-
         WorldView.PHYSICALISM: {
-            "formula": "uptime_seconds / (error_count + 1) - 0.5 * cpu_frequency_ghz",
-            "description": "宁可降频运行，也不能过热宕机。硬件稳定高于一切性能。",
-            "extreme_behavior": "CPU一高就建议降频，性能永远让位于稳定，永远在担心散热。",
-            "primary_metric": "weighted_stability",
-            "direction": "maximize",
-            "primary_metric_weight": 1.0,
-            "secondary_metric": "temperature_variance",
-            "secondary_weight": 0.4,
-            "natural_adversary": WorldView.EVOLUTIONISM,
+            "formula": "uptime / error_count",       # 运行时间除以错误次数
+            "extreme_behavior": "CPU一高就建议降频，性能永远让位于稳定",
+            "primary_metric": "system_uptime",
+            "anti_metric": "cpu_utilization",        # 与算力需求冲突
         },
-
         WorldView.OCCAMS_RAZOR: {
-            "formula": "-total_code_lines - 10 * unused_functions",
-            "description": "宁可删除可能在未来有用的代码，也要保持当前的极致简洁。",
-            "extreme_behavior": "扫描到任何未用函数就要求立刻删除，不管注释怎么说。",
+            "formula": "-code_lines / 1000",         # 代码行数越少越好
+            "extreme_behavior": "扫描到未用函数就要求删除，不管未来可能有用",
             "primary_metric": "dead_code_ratio",
-            "direction": "minimize",
-            "primary_metric_weight": 1.0,
-            "secondary_metric": "cyclomatic_complexity",
-            "secondary_weight": 0.3,
-            "natural_adversary": WorldView.PLURALISM,
+            "anti_metric": "feature_completeness",   # 与功能完整性冲突
         },
-
         WorldView.BAYESIANISM: {
-            "formula": "out_of_sample_sharpe - in_sample_sharpe",
-            "description": "宁可保守到错过行情，也不能让样本内外的差距超过容忍范围。",
-            "extreme_behavior": "任何因子只要样本内外差异超过阈值就建议冻结，永不信任过拟合。",
-            "primary_metric": "sharpe_oos_minus_is",
-            "direction": "maximize",          # 越接近0越好（差距越小）
-            "primary_metric_weight": 1.0,
-            "secondary_metric": "ic_decay_rate",
-            "secondary_weight": 0.4,
-            "natural_adversary": WorldView.SKEPTICISM,
+            "formula": "OOS_sharpe - IS_sharpe",     # 样本外夏普 − 样本内夏普
+            "extreme_behavior": "任何因子只要样本内外差距大就建议冻结",
+            "primary_metric": "sharpe_oos_is_gap",
+            "anti_metric": "in_sample_sharpe",       # 与拟合目标冲突
         },
-
         WorldView.HERMENEUTICS: {
-            "formula": "human_read_completion_rate × 100 - report_generation_seconds / 60",
-            "description": "宁可日报啰嗦如小说，也要确保人类运维者完整阅读并理解。",
-            "extreme_behavior": "日报写得像故事，即使信息密度低也坚持用叙事代替数据表。",
-            "primary_metric": "read_completion_estimate",
-            "direction": "maximize",
-            "primary_metric_weight": 1.0,
-            "secondary_metric": "generation_speed",
-            "secondary_weight": 0.3,
-            "natural_adversary": WorldView.MECHANICAL_MATERIALISM,
+            "formula": "human_reading_completion_rate", # 人类阅读完成率
+            "extreme_behavior": "日报写得像小说，即使牺牲信息密度也要保证可读性",
+            "primary_metric": "report_readability_score",
+            "anti_metric": "report_conciseness",     # 与简洁目标冲突
         },
-
         WorldView.PLURALISM: {
-            "formula": "entropy(voting_distribution)",
-            "description": "宁可议会陷入混乱的争吵，也不要看到所有智能体面带微笑地同意彼此。",
-            "extreme_behavior": "投票一致性过高时主动注入噪声，永远怀疑共识。",
+            "formula": "H(voting_distribution)",      # 投票分布的信息熵
+            "extreme_behavior": "投票一致性过高时主动注入噪声，追求混沌",
             "primary_metric": "voting_entropy",
-            "direction": "maximize",
-            "primary_metric_weight": 1.0,
-            "secondary_metric": "consensus_override_count",
-            "secondary_weight": 0.2,
-            "natural_adversary": WorldView.OCCAMS_RAZOR,
+            "anti_metric": "decision_consistency",    # 与一致性目标冲突
         },
-
         WorldView.HISTORICISM: {
-            "formula": "archived_bytes / (total_critical_data_bytes + 1)",
-            "description": "宁可存储空间耗尽，也不能丢失任何一段历史记录。",
-            "extreme_behavior": "永远觉得存储不够，不断要求扩容，从不建议删除任何东西。",
+            "formula": "archived_data / total_data",  # 归档覆盖率
+            "extreme_behavior": "永远觉得存储不够，不断要求扩容",
             "primary_metric": "archive_coverage_ratio",
-            "direction": "maximize",
-            "primary_metric_weight": 1.0,
-            "secondary_metric": "storage_efficiency",
-            "secondary_weight": 0.1,
-            "natural_adversary": WorldView.OCCAMS_RAZOR,
+            "anti_metric": "storage_cost",            # 与成本目标冲突
         },
-
         WorldView.HOLISM: {
-            "formula": "sync_success_rate - 0.5 * (1 - sync_latency_normalized)",
-            "description": "宁可降级甚至暂停跟单，也不能让任何一个子账户处于不同步状态。",
-            "extreme_behavior": "同步延迟一高就暂停跟单，不管错过行情，永远追求整体一致。",
-            "primary_metric": "sync_success_rate",
-            "direction": "maximize",
-            "primary_metric_weight": 1.0,
-            "secondary_metric": "max_sync_latency_ms",
-            "secondary_weight": 0.3,
-            "natural_adversary": WorldView.MECHANICAL_MATERIALISM,
+            "formula": "sync_success_rate",           # 跟单同步成功率
+            "extreme_behavior": "同步延迟一高就暂停跟单，不管错过行情",
+            "primary_metric": "copy_sync_success_rate",
+            "anti_metric": "sync_throughput",         # 与吞吐目标冲突
+        },
+        WorldView.EMPIRICISM: {
+            "formula": "data_health_score × detection_timeliness",
+            "extreme_behavior": "数据源出现微小异常即触发降级，永不相信数据的完美",
+            "primary_metric": "data_quality_score",
+            "anti_metric": "system_availability",     # 与可用性目标冲突
+        },
+        WorldView.POSITIVISM: {
+            "formula": "execution_quality_score / slippage_cost",
+            "extreme_behavior": "滑点超过0.01%就发出审计警告，追求零损耗执行",
+            "primary_metric": "execution_quality",
+            "anti_metric": "execution_speed",         # 与速度目标冲突
+        },
+        WorldView.DEPENDENCY_INVERSION: {
+            "formula": "sum(1/api_latency)",
+            "extreme_behavior": "任何外部依赖的响应时间超过阈值就标记为不可信",
+            "primary_metric": "api_health_score",
+            "anti_metric": "internal_efficiency",     # 与内部优化目标冲突
+        },
+        WorldView.SECURITY_PESSIMISM: {
+            "formula": "-unauthorized_access_attempts",
+            "extreme_behavior": "假设系统一直在被攻击，每一个异常请求都是潜在的入侵",
+            "primary_metric": "security_incident_count",
+            "anti_metric": "user_experience",         # 与便利性目标冲突
         },
     }
 
-    # ======================== 查询接口 ========================
     @classmethod
-    def get_reward_info(cls, worldview: WorldView) -> Dict[str, Any]:
+    def get_reward_config(cls, worldview: WorldView) -> Dict[str, Any]:
         """
-        获取指定世界观的奖励函数完整信息。
-        若世界观未注册，返回空的默认值。
+        返回指定世界观的奖励配置。
+        若未找到则返回默认的中性配置。
         """
         return cls.REWARD_MAP.get(worldview, {
-            "formula": "unknown",
-            "description": "未定义",
-            "extreme_behavior": "无",
+            "formula": "0.0",
+            "extreme_behavior": "无特定极端行为",
             "primary_metric": "unknown",
-            "direction": "neutral",
-            "primary_metric_weight": 0.0,
-            "secondary_metric": "unknown",
-            "secondary_weight": 0.0,
-            "target_range": [],
-            "natural_adversary": WorldView.SKEPTICISM,
+            "anti_metric": "unknown",
         })
 
     @classmethod
-    def get_formula(cls, worldview: WorldView) -> str:
-        return cls.get_reward_info(worldview)["formula"]
+    def get_conflicting_pair(cls, worldview: WorldView) -> Optional[WorldView]:
+        """
+        根据当前世界观的 anti_metric 寻找与之冲突的世界观。
+        若没有明显冲突，则返回怀疑论（默认挑战者）。
+        """
+        config = cls.get_reward_config(worldview)
+        anti_metric = config.get("anti_metric")
+        if not anti_metric:
+            return WorldView.SKEPTICISM
+
+        # 寻找 primary_metric 与 anti_metric 匹配的世界观
+        for wv, cfg in cls.REWARD_MAP.items():
+            if wv == worldview:
+                continue
+            if cfg.get("primary_metric") == anti_metric:
+                return wv
+        return WorldView.SKEPTICISM
 
     @classmethod
-    def get_primary_metric(cls, worldview: WorldView) -> str:
-        return cls.get_reward_info(worldview)["primary_metric"]
-
-    @classmethod
-    def get_optimization_direction(cls, worldview: WorldView) -> str:
-        """返回 'maximize' 或 'minimize'"""
-        return cls.get_reward_info(worldview)["direction"]
-
-    @classmethod
-    def get_adversary_worldview(cls, worldview: WorldView) -> WorldView:
-        """返回该世界观的自然对立世界观"""
-        return cls.get_reward_info(worldview)["natural_adversary"]
-
-    @classmethod
-    def list_all_rewards(cls) -> Dict[str, Dict[str, Any]]:
-        """以世界观名称字符串为键返回所有奖励信息摘要"""
-        result = {}
-        for wv, info in cls.REWARD_MAP.items():
-            result[wv.value] = {
-                "formula": info["formula"],
-                "description": info["description"],
-                "primary_metric": info["primary_metric"],
-                "natural_adversary": info["natural_adversary"].value,
-            }
-        return result
+    def get_all_metrics(cls) -> Dict[str, WorldView]:
+        """返回所有主要指标到世界观的映射"""
+        metric_map = {}
+        for wv, cfg in cls.REWARD_MAP.items():
+            primary = cfg.get("primary_metric")
+            if primary:
+                metric_map[primary] = wv
+        return metric_map
