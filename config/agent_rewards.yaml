@@ -1,131 +1,82 @@
 # =============================================================================
-# 火种系统 (FireSeed) 智能体极端化奖励与世界观配置
+# 火种系统 (FireSeed) 智能体异质奖励函数配置 (v3.0 — 16智能体世界观版本)
 # =============================================================================
-# 每个智能体均携带不可调和的世界观，追求互斥的极端目标。
-# 本文件由 adversarial_council.py 和 worldview.py 解析，
-# 任何手工修改将在议会下一轮审议时自动热重载。
+# 每一位智能体均分配独立且不可调和的目标函数组合。
+# 这是火种议会防止认知趋同与群体极化的数学根基。
 # =============================================================================
 
-# 对抗式议会全局配置
-council:
-  # 提案被成功挑战后，提议者进入冷却的时长（秒）
-  proposer_cooldown_sec: 1800
-  # 反共识增强倍率（当守护者与炼金术士罕见一致时，置信度乘以此值）
-  anti_consensus_boost: 2.0
-  # 陪审团最低人数（不足则降级为简单多数）
-  min_jury_size: 2
-  # 每轮审议最大时长（秒）
-  deliberation_timeout_sec: 10
-  # 挑战成功率阈值（超过此比例则触发智能体权重衰减）
-  challenge_success_threshold: 0.6
+global:
+  performance_window_days: 20
+  adaptive_weights: false
+  min_voting_weight: 0.01
 
-# ---------------------------------------------------------------------------
-# 12 智能体奖励定义
-# ---------------------------------------------------------------------------
 agents:
-  # =========================================================================
-  # 监察者 - 机械唯物主义
-  # =========================================================================
+  # -----------------------------------------------------------------------
+  # 1. 监察者 (Sentinel) — 机械唯物主义
+  # -----------------------------------------------------------------------
   sentinel:
-    worldview: mechanical_materialism
-    core_belief: "系统是可分解为独立组件的钟表，任何故障均可被定位与修复"
-    primary_optimization_target: "minimize -log(F1_score)"
-    adversary_worldview: holism
-    forbidden_data_sources: ["KLINE", "ORDERBOOK", "MARKET_MICROSTRUCTURE"]
-    exclusive_data_sources: ["SYSTEM_METRICS", "PROCESS_STAT", "NETWORK_IO", "API_RATE_LIMIT"]
-    time_scale: "15s"
+    description: "监控系统健康状态，追求异常检测覆盖率最大化"
     reward_components:
-      - name: detection_f1
-        weight: 1.0
+      - name: detection_rate
+        weight: 0.5
         goal: maximize
-        # 对数惩罚：漏报的代价远高于误报
-        penalty_type: logarithmic
-        penalty_base: 10
+        target_range: [0.90, 1.0]
       - name: false_alarm_rate
-        weight: 0.0        # 显式置零——宁可误报
-        goal: ignore
-    extreme_behavior: "即使系统一切正常也会频繁发出预警，坚信任何平静都可能是暴风雨的前兆"
-    voting_weight: 0.08
-
-  # =========================================================================
-  # 炼金术士 - 进化论
-  # =========================================================================
-  alchemist:
-    worldview: evolutionism
-    core_belief: "策略是不断适应市场环境的生命体，适者生存，探索优于利用"
-    primary_optimization_target: "maximize (sharpe × novelty)"
-    adversary_worldview: existentialism
-    forbidden_data_sources: ["SYSTEM_METRICS", "REAL_TIME_PNL", "RISK_EXPOSURE"]
-    exclusive_data_sources: ["HISTORICAL_OHLCV", "ORDERBOOK_SNAPSHOT", "ACADEMIC_PAPER", "QUANT_FORUM"]
-    time_scale: "24h"
-    reward_components:
-      - name: sharpe_ratio
-        weight: 0.4
-        goal: maximize
-      - name: strategy_novelty
-        weight: 0.6
-        goal: maximize
-        # 新颖度 = 与现有策略库的余弦距离
-        metric: cosine_distance_to_existing
-    extreme_behavior: "不断生成和淘汰策略，对近期盈亏漠不关心；宁可拥抱一个夏普1.0的全新策略，也不容忍夏普3.0的过时策略"
-    voting_weight: 0.08
-
-  # =========================================================================
-  # 守护者 - 存在主义
-  # =========================================================================
-  guardian:
-    worldview: existentialism
-    core_belief: "市场的本质是无常与荒诞，唯一能确定的是风险，生存是最高道德"
-    primary_optimization_target: "minimize max_drawdown"
-    adversary_worldview: evolutionism
-    forbidden_data_sources: ["ORDERBOOK", "SENTIMENT", "SOCIAL_MEDIA"]
-    exclusive_data_sources: ["FULL_RETURN_HISTORY", "TAIL_DISTRIBUTION", "CORRELATION_MATRIX"]
-    time_scale: "5m"
-    reward_components:
-      - name: max_drawdown
-        weight: -1.0
-        goal: minimize
-      - name: cvar_99
         weight: -0.5
         goal: minimize
-      - name: profit
-        weight: 0.0        # 显式置零——不关心盈利
-        goal: ignore
-    extreme_behavior: "市场一有风吹草动就建议减仓至零，永远在等待下一场崩盘；盈利时依然悲观，认为这只是灾难前的回光返照"
-    voting_weight: 0.10
+        target_range: [0.0, 0.05]
+    internal_loss: binary_crossentropy
 
-  # =========================================================================
-  # 魔鬼代言人 - 怀疑论
-  # =========================================================================
-  devils_advocate:
-    worldview: skepticism
-    core_belief: "任何真理都可能是临时的，唯一确定的是不确定；证伪是知识增长的唯一途径"
-    primary_optimization_target: "maximize F1(correct_veto)"
-    adversary_worldview: bayesianism
-    forbidden_data_sources: ["LIVE_PRICE", "REAL_TIME_ORDER_FLOW"]
-    exclusive_data_sources: ["ADVERSARIAL_SAMPLE_DB", "FAILURE_GENE_BANK", "HISTORICAL_VETO_LOG"]
-    time_scale: "event_driven"
+  # -----------------------------------------------------------------------
+  # 2. 炼金术士 (Alchemist) — 进化论
+  # -----------------------------------------------------------------------
+  alchemist:
+    description: "创造高收益、低相关、具有新颖性的交易策略"
     reward_components:
-      - name: veto_precision
-        weight: 0.5
+      - name: sharpe_ratio
+        weight: 0.3
         goal: maximize
-      - name: veto_recall
-        weight: 0.5
+      - name: max_drawdown
+        weight: -0.2
+        goal: minimize
+      - name: strategy_novelty
+        weight: 0.3
         goal: maximize
-    extreme_behavior: "对每一个议会提案都竭尽全力寻找负面证据并发出挑战，宁可错杀一百不可放过一个"
-    voting_weight: 0.10
+      - name: win_rate
+        weight: 0.2
+        goal: maximize
+    elimination_penalty: -1.0
 
-  # =========================================================================
-  # 哥德尔监视者 - 不完备定理
-  # =========================================================================
+  # -----------------------------------------------------------------------
+  # 3. 守护者 (Guardian) — 存在主义
+  # -----------------------------------------------------------------------
+  guardian:
+    description: "仅最小化最大回撤与尾部风险"
+    reward_components:
+      - name: max_drawdown
+        weight: -0.6
+        goal: minimize
+      - name: cvar_99
+        weight: -0.4
+        goal: minimize
+    ignore_profit: true
+
+  # -----------------------------------------------------------------------
+  # 4. 魔鬼代言人 (Devil's Advocate) — 怀疑论
+  # -----------------------------------------------------------------------
+  devils_advocate:
+    description: "以找出当前策略的潜在致命缺陷为唯一目标"
+    reward_components:
+      - name: adversarial_success
+        weight: 1.0
+        goal: maximize
+    scenario_count: 5
+
+  # -----------------------------------------------------------------------
+  # 5. 哥德尔监视者 (Gödel Watcher) — 不完备定理
+  # -----------------------------------------------------------------------
   godel_watcher:
-    worldview: incompleteness
-    core_belief: "任何足够复杂的系统都无法完全理解自身；真正的智慧在于知道何时停止思考"
-    primary_optimization_target: "minimize missed_loss_during_sleep"
-    adversary_worldview: mechanical_materialism
-    forbidden_data_sources: ["MARKET_DATA", "TRADE_SIGNAL", "ORDER_BOOK"]
-    exclusive_data_sources: ["SYSTEM_META_METRICS", "LOG_LENGTH", "PROCESS_AGE", "ROLLBACK_COUNT"]
-    time_scale: "1m"
+    description: "维护自我怀疑水平，触发必要的系统休眠"
     reward_components:
       - name: doubt_accuracy
         weight: 0.7
@@ -133,152 +84,181 @@ agents:
       - name: opportunity_cost
         weight: -0.3
         goal: minimize
-    extreme_behavior: "发现任何无法解释的异常就立即让系统休眠，坚决执行'不决策就是最好的决策'"
-    voting_weight: 0.05
 
-  # =========================================================================
-  # 环境检察官 - 物理主义
-  # =========================================================================
-  env_inspector:
-    worldview: physicalism
-    core_belief: "一切问题最终都会表现为物理参数的异常；软件的错误只是硬件故障的投影"
-    primary_optimization_target: "maximize uptime / error_count"
-    adversary_worldview: pluralism
-    forbidden_data_sources: ["KLINE", "POSITION", "PNL"]
-    exclusive_data_sources: ["CPU_FREQ", "TEMP_SENSOR", "S_M_A_R_T", "NET_STAT", "NTP_STATUS"]
-    time_scale: "1m"
+  # -----------------------------------------------------------------------
+  # 6. 议会协调者 (Council) — 多数共识 (仅用于记录)
+  # -----------------------------------------------------------------------
+  council:
+    description: "最大化议会投票后的整体夏普比率"
     reward_components:
-      - name: uptime_hours
-        weight: 0.6
-        goal: maximize
-      - name: error_count
-        weight: -0.4
-        goal: minimize
-    extreme_behavior: "CPU使用率一过50%就建议降频，磁盘温度一高就要求停机；性能永远让位于物理稳定"
-    voting_weight: 0.05
-
-  # =========================================================================
-  # 冗余审计官 - 奥卡姆剃刀
-  # =========================================================================
-  redundancy_auditor:
-    worldview: occams_razor
-    core_belief: "简洁是真理的标志，冗余是熵的征兆；未被使用的代码是系统的毒瘤"
-    primary_optimization_target: "minimize code_lines"
-    adversary_worldview: pluralism
-    forbidden_data_sources: ["ALL_MARKET_DATA", "TRADE_SIGNAL", "REAL_TIME_ANYTHING"]
-    exclusive_data_sources: ["PYTHON_AST", "IMPORT_GRAPH", "CONFIG_YAML_FILES"]
-    time_scale: "24h"
-    reward_components:
-      - name: dead_code_ratio
-        weight: -0.6
-        goal: minimize
-      - name: unused_config_keys
-        weight: -0.4
-        goal: minimize
-    extreme_behavior: "扫描到任何一个未被调用的函数就要求立即删除，绝不考虑'未来可能有用'"
-    voting_weight: 0.04
-
-  # =========================================================================
-  # 权重校准师 - 贝叶斯主义
-  # =========================================================================
-  weight_calibrator:
-    worldview: bayesianism
-    core_belief: "概率是信念的量化，所有信念都必须用证据持续更新；过拟合是对数据的亵渎"
-    primary_optimization_target: "maximize (OOS_sharpe - IS_sharpe)"
-    adversary_worldview: skepticism
-    forbidden_data_sources: ["RAW_PRICE", "ORDER_FLOW"]
-    exclusive_data_sources: ["FACTOR_IC_SERIES", "WEIGHT_HISTORY", "CROSS_VALIDATION_FOLD"]
-    time_scale: "24h"
-    reward_components:
-      - name: out_of_sample_sharpe
-        weight: 0.7
-        goal: maximize
-      - name: in_sample_sharpe_gap
-        weight: -0.3
-        goal: minimize
-    extreme_behavior: "只要因子样本内外夏普差距超过0.1就建议冻结，宁可砍掉有效因子也不容忍过拟合嫌疑"
-    voting_weight: 0.08
-
-  # =========================================================================
-  # 叙事官 - 诠释学
-  # =========================================================================
-  narrator:
-    worldview: hermeneutics
-    core_belief: "意义存在于叙述之中，真相是故事的函数；不可读的数据等于不存在"
-    primary_optimization_target: "maximize human_read_completion_rate"
-    adversary_worldview: bayesianism
-    forbidden_data_sources: ["RAW_ORDER_FLOW", "TICK_DATA"]
-    exclusive_data_sources: ["COUNCIL_VOTE_RECORD", "BEHAVIOR_LOG_SUMMARY", "STRATEGY_PERFORMANCE"]
-    time_scale: "24h"
-    reward_components:
-      - name: human_feedback_score
-        weight: 0.8
-        goal: maximize
-      - name: report_generation_time_sec
-        weight: -0.2
-        goal: minimize
-    extreme_behavior: "日报写得像章回小说，即使信息密度低也坚决保留叙事完整性，绝不牺牲可读性换取数据精度"
-    voting_weight: 0.02
-
-  # =========================================================================
-  # 多样性强制者 - 多元主义
-  # =========================================================================
-  diversity_enforcer:
-    worldview: pluralism
-    core_belief: "正确的决策需要多样化且相互矛盾的视角；趋同是系统认知死亡的开始"
-    primary_optimization_target: "maximize H(voting_distribution)"
-    adversary_worldview: occams_razor
-    forbidden_data_sources: ["TRADE_HISTORY", "PNL_RECORD"]
-    exclusive_data_sources: ["VOTING_DIRECTION_STREAM", "AGENT_WEIGHT_HISTORY", "CONSENSUS_METRIC"]
-    time_scale: "5m"
-    reward_components:
-      - name: voting_entropy
+      - name: portfolio_sharpe
         weight: 1.0
         goal: maximize
-      - name: consensus_rate
+    combine_signals: weighted_majority
+
+  # -----------------------------------------------------------------------
+  # 7. 环境检察官 (EnvInspector) — 物理主义
+  # -----------------------------------------------------------------------
+  env_inspector:
+    description: "确保硬件资源充足，网络低延迟"
+    reward_components:
+      - name: uptime_pct
+        weight: 0.3
+        goal: maximize
+      - name: avg_latency_ms
+        weight: -0.4
+        goal: minimize
+      - name: resource_headroom
+        weight: 0.3
+        goal: maximize
+
+  # -----------------------------------------------------------------------
+  # 8. 冗余审计官 (RedundancyAuditor) — 奥卡姆剃刀
+  # -----------------------------------------------------------------------
+  redundancy_auditor:
+    description: "扫描死代码与未使用配置，维持系统熵值最低"
+    reward_components:
+      - name: dead_code_ratio
         weight: -0.5
         goal: minimize
-    extreme_behavior: "投票一致性一超过85%就强制注入噪声或重置智能体参数，宁可制造混乱也不容忍群体思维"
-    voting_weight: 0.06
-
-  # =========================================================================
-  # 归档审计官 - 历史主义
-  # =========================================================================
-  archive_guardian:
-    worldview: historicism
-    core_belief: "一切当前状态都可以从历史痕迹中理解；遗忘是系统的终极敌人"
-    primary_optimization_target: "maximize archived_data / total_data"
-    adversary_worldview: physicalism
-    forbidden_data_sources: ["REAL_TIME_ANYTHING", "LIVE_MARKET_DATA"]
-    exclusive_data_sources: ["DISK_INODE", "FILE_TIMESTAMP", "COLD_STORAGE_BILL", "DB_INTEGRITY_CHECK"]
-    time_scale: "1h"
-    reward_components:
-      - name: archive_coverage_ratio
-        weight: 0.7
-        goal: maximize
-      - name: data_loss_events
+      - name: unused_config_keys
         weight: -0.3
         goal: minimize
-    extreme_behavior: "永远觉得存储空间不足，不断要求扩容和归档；即使磁盘尚有50%空闲也持续发出预警"
-    voting_weight: 0.04
-
-  # =========================================================================
-  # 跟单协调官 - 整体论
-  # =========================================================================
-  copy_trade_coordinator:
-    worldview: holism
-    core_belief: "系统是各部分的有机协同体，任何一个子账户的异常都反映整体的失调"
-    primary_optimization_target: "maximize sync_success_rate"
-    adversary_worldview: mechanical_materialism
-    forbidden_data_sources: ["INDIVIDUAL_ACCOUNT_DETAIL", "MASTER_POSITION_SIZE"]
-    exclusive_data_sources: ["SUB_ACCOUNT_API_STATUS", "SYNC_DELAY_MS", "ORDER_REPLICATION_LOG"]
-    time_scale: "30s"
-    reward_components:
-      - name: sync_success_rate
-        weight: 0.8
-        goal: maximize
-      - name: sync_delay_ms
+      - name: entropy_index
         weight: -0.2
         goal: minimize
-    extreme_behavior: "只要任何一个子账户出现同步延迟就立即暂停全部跟单，坚决执行'宁可集体停摆，不可个别出错'"
-    voting_weight: 0.04
+
+  # -----------------------------------------------------------------------
+  # 9. 权重校准师 (WeightCalibrator) — 贝叶斯主义
+  # -----------------------------------------------------------------------
+  weight_calibrator:
+    description: "确保因子权重自洽，避免过拟合"
+    reward_components:
+      - name: out_of_sample_sharpe
+        weight: 0.6
+        goal: maximize
+      - name: in_sample_sharpe_gap
+        weight: -0.4
+        goal: minimize
+
+  # -----------------------------------------------------------------------
+  # 10. 叙事官 (Narrator) — 诠释学
+  # -----------------------------------------------------------------------
+  narrator:
+    description: "生成人类可读的决策回溯，提高运维理解度"
+    reward_components:
+      - name: human_feedback_score
+        weight: 0.7
+        goal: maximize
+      - name: report_generation_time
+        weight: -0.3
+        goal: minimize
+
+  # -----------------------------------------------------------------------
+  # 11. 多样性强制者 (DiversityEnforcer) — 多元主义
+  # -----------------------------------------------------------------------
+  diversity_enforcer:
+    description: "强制注入随机扰动，保持智能体群体方差"
+    reward_components:
+      - name: agent_weight_entropy
+        weight: 0.6
+        goal: maximize
+      - name: prediction_diversity
+        weight: 0.4
+        goal: maximize
+
+  # -----------------------------------------------------------------------
+  # 12. 归档审计官 (ArchiveGuardian) — 历史主义
+  # -----------------------------------------------------------------------
+  archive_guardian:
+    description: "确保所有数据按时归档、可回溯、可恢复"
+    reward_components:
+      - name: archive_completeness_pct
+        weight: 0.5
+        goal: maximize
+      - name: data_restore_success_rate
+        weight: 0.3
+        goal: maximize
+      - name: storage_cost_efficiency
+        weight: -0.2
+        goal: minimize
+
+  # -----------------------------------------------------------------------
+  # 13. 跟单协调官 (CopyTradeCoordinator) — 整体论
+  # -----------------------------------------------------------------------
+  copy_trade_coordinator:
+    description: "确保多账户同步的整体一致性"
+    reward_components:
+      - name: sync_success_rate
+        weight: 0.6
+        goal: maximize
+      - name: avg_sync_delay_ms
+        weight: -0.4
+        goal: minimize
+
+  # -----------------------------------------------------------------------
+  # 14. 执行质量审计官 (ExecutionAuditor) — 实证主义
+  # -----------------------------------------------------------------------
+  execution_auditor:
+    description: "订单执行质量只能用统计数据证明，不接受理论最优"
+    reward_components:
+      - name: twap_completion_rate
+        weight: 0.3
+        goal: maximize
+      - name: avg_slippage_bps
+        weight: -0.3
+        goal: minimize
+      - name: cancel_retry_rate
+        weight: -0.2
+        goal: minimize
+      - name: multi_exchange_routing_score
+        weight: 0.2
+        goal: maximize
+
+  # -----------------------------------------------------------------------
+  # 15. 外部依赖哨兵 (DependencySentinel) — 依赖倒置
+  # -----------------------------------------------------------------------
+  dependency_sentinel:
+    description: "任何外部依赖都是潜在的断裂点"
+    reward_components:
+      - name: external_api_availability
+        weight: 0.4
+        goal: maximize
+      - name: external_api_latency_ms
+        weight: -0.3
+        goal: minimize
+      - name: message_push_success_rate
+        weight: 0.3
+        goal: maximize
+
+  # -----------------------------------------------------------------------
+  # 16. 安全态势感知官 (SecurityAwareness) — 安全悲观主义
+  # -----------------------------------------------------------------------
+  security_awareness:
+    description: "假设系统一直在被攻击，只是尚未发现"
+    reward_components:
+      - name: intrusion_attempt_detection
+        weight: 0.5
+        goal: maximize
+      - name: config_tampering_alerts
+        weight: 0.3
+        goal: maximize
+      - name: threshold_key_availability
+        weight: 0.2
+        goal: maximize
+
+  # -----------------------------------------------------------------------
+  # 17. 数据监察员 (DataOmbudsman) — 经验主义
+  # -----------------------------------------------------------------------
+  data_ombudsman:
+    description: "无数据，不决策；脏数据，必误判"
+    reward_components:
+      - name: data_anomaly_detection_coverage
+        weight: 0.4
+        goal: maximize
+      - name: report_timeliness_sec
+        weight: -0.3
+        goal: minimize
+      - name: data_health_score
+        weight: 0.3
+        goal: maximize
