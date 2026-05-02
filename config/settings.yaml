@@ -1,34 +1,21 @@
 # =============================================================================
 # 火种系统 (FireSeed) 全局配置文件
 # =============================================================================
-# 修改此文件后，系统将在下一个K线闭合或通过SIGHUP信号实时重载。
-# 敏感信息（API密钥、密码等）通过环境变量注入，禁止硬编码。
+# 所有标记为 ${ENV_VAR} 的敏感值必须通过环境变量注入，严禁硬编码。
+# 修改后通过 SIGHUP 信号或在下一分钟 K 线闭合时自动热重载。
+# 时区：Asia/Shanghai (UTC+8)
 # =============================================================================
 
 # ---------------------------------------------------------------------------
 # 系统基础设置
 # ---------------------------------------------------------------------------
 system:
-  # 运行模式: virtual / live / ghost
-  mode: virtual
-
-  # 策略激进程度: aggressive / moderate
-  strategy_mode: moderate
-
-  # 系统时区 (用于日志、学习时段判断)
+  mode: virtual                      # virtual / live
+  strategy_mode: moderate            # aggressive / moderate
   timezone: "Asia/Shanghai"
-
-  # 日志级别: DEBUG / INFO / WARN / ERROR / CRITICAL
-  log_level: INFO
-
-  # 欢迎登录动画 (前端专用)
+  log_level: INFO                    # DEBUG / INFO / WARN / ERROR / CRITICAL
   welcome_animation: true
-
-  # 行为日志实时推送 (WebSocket)
   behavior_log_push: true
-
-  # 当前OTA版本
-  version: "3.0.0-spartan"
 
 # ---------------------------------------------------------------------------
 # 学习与进化时段
@@ -38,15 +25,11 @@ learning:
   start_time: "01:30"
   end_time: "04:30"
   learning_mode: moderate
-
+  elastic: true                      # 弹性低活跃判定
   nightmare:
-    # 波动率倍数：当前波动率超过过去24小时均值的倍数
     volatility_multiplier: 2.0
-    # 成交量萎缩阈值：当前1分钟成交量低于过去24小时均值的比率
     volume_shrink_ratio: 0.3
-    # 确认时长(秒)：异常需持续多久才触发唤醒
-    confirm_duration: 300
-    # 跳空幅度阈值（ATR倍数）
+    confirm_duration: 300            # 异常需持续5分钟才唤醒
     gap_atr_mult: 3.0
 
 # ---------------------------------------------------------------------------
@@ -79,16 +62,16 @@ hardware:
   cpu_cores: 4
   total_memory_gb: 8
   disk_usage_max_pct: 85
-  rt_guard_heartbeat_ms: 500
+  rt_guard_heartbeat_ms: 500         # C++ 硬实时风控心跳超时
   main_loop_max_lag_sec: 0.05
 
 # ---------------------------------------------------------------------------
 # 网络与低延迟优化
 # ---------------------------------------------------------------------------
 network:
-  user_space_net: false          # AF_XDP 需内核 >= 5.4
+  user_space_net: false              # 是否启用 AF_XDP
   ws_buffer_size: 65536
-  shm_queue_size: 1048576       # 1MB共享内存队列
+  shm_queue_size: 1048576
   max_latency_ms: 60
   packet_loss_alert_pct: 1.0
 
@@ -96,7 +79,7 @@ network:
 # 模型推理与 ONNX Runtime
 # ---------------------------------------------------------------------------
 inference:
-  engine: onnxruntime
+  engine: onnxruntime                # pytorch / onnxruntime
   onnx:
     intra_op_threads: 4
     inter_op_threads: 1
@@ -115,7 +98,7 @@ database:
   log_memory_size: 500
 
 # ---------------------------------------------------------------------------
-# 冷数据归档
+# 冷数据归档 (云存储)
 # ---------------------------------------------------------------------------
 cold_storage:
   provider: aliyun_oss
@@ -137,14 +120,23 @@ messaging:
     telegram:
       enabled: true
       bot_token: ${TELEGRAM_BOT_TOKEN}
-      chat_ids: [123456789]
+      chat_ids:
+        - 123456789
       allow_commands: true
     dingtalk:
       enabled: false
+      webhook_url: ${DINGTALK_WEBHOOK_URL}
+      secret: ${DINGTALK_SECRET}
     wecom:
       enabled: false
+      corp_id: ${WECOM_CORP_ID}
+      agent_id: ${WECOM_AGENT_ID}
+      secret: ${WECOM_SECRET}
     wechat:
       enabled: false
+      app_id: ${WECHAT_APP_ID}
+      app_secret: ${WECHAT_APP_SECRET}
+      template_id: ${WECHAT_TEMPLATE_ID}
 
 # ---------------------------------------------------------------------------
 # 多账户跟单系统
@@ -152,13 +144,20 @@ messaging:
 copy_trading:
   enabled: false
   master_account: "main"
-  accounts: []            # 通过 multi_account.yaml 单独配置
-  global_risk:
-    max_daily_loss_pct: 3.0
-    max_total_leverage: 5.0
-    force_close_on_master_flat: true
-    max_connection_retries: 3
-    retry_delay_sec: 5
+  accounts:
+    - name: "sub1"
+      api_key: ${SUB1_API_KEY}
+      api_secret: ${SUB1_API_SECRET}
+      follow_ratio: 1.0
+      max_single_position_pct: 50
+      allow_add_position: true
+      allow_manual_close: false
+    - name: "sub2"
+      api_key: ${SUB2_API_KEY}
+      api_secret: ${SUB2_API_SECRET}
+      follow_ratio: 0.5
+      max_single_position_pct: 40
+    # sub3 ~ sub6 按需增配
 
 # ---------------------------------------------------------------------------
 # 前端与安全
@@ -166,6 +165,8 @@ copy_trading:
 frontend:
   port: 8000
   https: false
+  ssl_cert: "/etc/letsencrypt/live/example.com/fullchain.pem"
+  ssl_key: "/etc/letsencrypt/live/example.com/privkey.pem"
 
 auth:
   password_algo: bcrypt
@@ -181,9 +182,15 @@ evolution:
   max_rollbacks_per_day: 3
   min_shadow_hours: 24
   canary_stages:
-    - { ratio: 0.01, min_hours: 6,  max_dd: 0.02 }
-    - { ratio: 0.10, min_hours: 12, max_dd: 0.05 }
-    - { ratio: 1.00, min_hours: 24, max_dd: 0.10 }
+    - ratio: 0.01
+      min_hours: 6
+      max_dd: 0.02
+    - ratio: 0.10
+      min_hours: 12
+      max_dd: 0.05
+    - ratio: 1.00
+      min_hours: 24
+      max_dd: 0.10
   divergence_threshold: 0.4
   sandbox:
     forbidden_imports: ["os", "subprocess", "socket", "requests"]
@@ -191,141 +198,68 @@ evolution:
     max_execution_sec: 30
 
 # ---------------------------------------------------------------------------
-# 智能体议会 (16位)
+# 智能体议会
 # ---------------------------------------------------------------------------
 agents:
-  # 通用议会参数
+  adversarial_council:
+    enabled: true
+    proposer_cooldown_sec: 1800     # 被挑战成功后冷却30分钟
+    anti_consensus_mult: 2.0        # 存在主义与进化论一致时可信度倍率
+    jury_min_size: 2
   max_single_weight: 0.35
   min_participation_rate: 0.6
   consensus_overload_threshold: 0.85
 
-  # 对抗式议会配置
-  adversarial_council:
+  # 各智能体独立配置
+  execution_auditor:
     enabled: true
-    cooldown_seconds: 1800          # 挑战失败后提议者冷却时间（30分钟）
-    anti_consensus_boost: 2.0       # 守护者与炼金术士罕见一致时的信度乘数
-    jury_min_members: 2             # 最少陪审员人数
-
-  # 各智能体专属配置
-  instances:
-    sentinel:
-      enabled: true
-      worldview: "机械唯物主义"
-      check_interval_sec: 15
-    alchemist:
-      enabled: true
-      worldview: "进化论"
-      explore_interval_hours: 12
-      max_daily_proposals: 10
-    guardian:
-      enabled: true
-      worldview: "存在主义"
-      check_interval_sec: 30
-      var_warn_mult: 30
-      max_drawdown_action: 15
-      liquidity_shrink_critical: 0.6
-    devils_advocate:
-      enabled: true
-      worldview: "怀疑论"
-      min_challenges_per_round: 1
-    godel_watcher:
-      enabled: true
-      worldview: "不完备定理"
-      doubt_threshold: 0.8
-      sleep_hours: 24
-      min_awake_hours: 6
-    env_inspector:
-      enabled: true
-      worldview: "物理主义"
-      check_interval_sec: 60
-    redundancy_auditor:
-      enabled: true
-      worldview: "奥卡姆剃刀"
-      scan_interval_hours: 24
-    weight_calibrator:
-      enabled: true
-      worldview: "贝叶斯主义"
-      audit_interval_hours: 24
-      fdr_q: 0.1
-    narrator:
-      enabled: true
-      worldview: "诠释学"
-      report_time: "03:00"
-    diversity_enforcer:
-      enabled: true
-      worldview: "多元主义"
-      check_interval_sec: 300
-      noise_injection_prob: 0.1
-    archive_guardian:
-      enabled: true
-      worldview: "历史主义"
-      check_interval_sec: 3600
-    copy_trade_coordinator:
-      enabled: false                 # 跟单启用后自动开启
-      worldview: "整体论"
-      check_interval_sec: 30
-
-    # 新增三位智能体
-    execution_auditor:
-      enabled: true
-      worldview: "实证主义"
-      check_interval_sec: 60
-      slippage_warn_bps: 2.0        # 滑点告警阈值（基点）
-      twap_completion_min: 0.95     # TWAP最低完成率
-    dependency_sentinel:
-      enabled: true
-      worldview: "依赖倒置"
-      check_interval_sec: 120
-      external_services:
-        - name: "deepseek_api"
-          max_latency_ms: 2000
-        - name: "aliyun_oss"
-          max_latency_ms: 1000
-        - name: "redis"
-          max_latency_ms: 100
-    security_awareness:
-      enabled: true
-      worldview: "安全悲观主义"
-      check_interval_sec: 60
-      max_failed_logins_per_hour: 10
-      jwt_refresh_anomaly_threshold: 5
-    data_ombudsman:
-      enabled: true
-      worldview: "经验主义"
-      check_interval_sec: 10
-      max_ws_latency_ms: 200
-      max_packet_loss_pct: 1.0
-      ntp_offset_max_ms: 100
+    twap_completion_threshold: 0.95
+    max_slippage_trend_bps: 2.0     # 滑点趋势恶化阈值 (bps/周)
+  dependency_sentinel:
+    enabled: true
+    external_apis:
+      - name: "binance_rest"
+        endpoint: "https://api.binance.com/api/v3/ping"
+        timeout_sec: 5
+      - name: "deepseek_api"
+        endpoint: "https://api.deepseek.com/v1/chat/completions"
+        timeout_sec: 15
+      - name: "oss_api"
+        endpoint: "https://oss-cn-hangzhou.aliyuncs.com"
+        timeout_sec: 10
+  security_awareness:
+    enabled: true
+    max_login_fails_per_hour: 10
+    abnormal_api_call_hour_range: [0, 5]
+  data_ombudsman:
+    enabled: true
+    check_interval_sec: 10
+    latency_warn_ms: 200
+    latency_critical_ms: 500
+    packet_loss_warn_pct: 1.0
+    wasserstein_warn_threshold: 50.0
+    price_gap_sigma: 5.0
 
 # ---------------------------------------------------------------------------
 # 风险与熔断
 # ---------------------------------------------------------------------------
 risk:
   circuit_breakers:
-    level_1: { trigger: 0.03, action: "no_new_entry", stop_tighten: 0.8 }
-    level_2: { trigger: 0.05, action: "liquidate_non_arb", cooldown_minutes: 10 }
-    level_3: { trigger: 0.08, action: "halt_until_midnight" }
-  margin:
-    min_maintenance_rate: 150
-    liquidation_warning_rate: 180
-    stress_test:
-      adverse_move_pct: 2.0
-      min_pass_rate: 150
-  liquidity:
-    depth_shrink_warning: 0.4
-    depth_shrink_halt: 0.6
-    spread_max_pct: 0.5
-  position:
-    max_single_symbol_pct: 50
-    max_net_exposure_pct: 200
-  execution:
-    max_slippage_pct: 0.15
-    consecutive_bad_slippage: 3
-    pending_order_timeout_sec: 10
-  system:
-    max_trades_per_day: 500
-    api_rate_per_minute: 960
-    max_order_error_rate: 0.02
+    level_1:
+      trigger: 0.03
+      action: "no_new_entry"
+      stop_tighten: 0.8
+    level_2:
+      trigger: 0.05
+      action: "liquidate_non_arb"
+      cooldown_minutes: 10
+    level_3:
+      trigger: 0.08
+      action: "halt_until_midnight"
+  liquidity_spread_max: 0.005
+  min_margin_rate: 150
+  max_single_position_pct: 50
+  max_risk_per_trade_pct: 2.0
 
 # ---------------------------------------------------------------------------
 # 性能调优
@@ -338,6 +272,7 @@ performance:
     monitoring: 10
     assistant: 10
   factor_thread_pool: 3
+  max_eval_interval: 30              # 惰性求值最大静默间隔（秒）
 
 # ---------------------------------------------------------------------------
 # 第三方 API (LLM 与助手)
@@ -354,10 +289,3 @@ llm:
       enabled: false
       api_key: ${OPENAI_API_KEY}
       model: "gpt-4o"
-
-# ---------------------------------------------------------------------------
-# 数据监察员·对抗性校验
-# ---------------------------------------------------------------------------
-data_quality:
-  adversarial_audit: true             # 与监察者进行结论交叉比对
-  global_health_degraded_threshold: 80
