@@ -1,13 +1,9 @@
 #!/usr/bin/env python3
 """
-火种系统 (FireSeed) 归档审计官智能体 (ArchiveGuardian)
-===========================================================
-全天候监控冷存储与数据完整性，确保关键数据安全：
-- 本地数据库文件完整性校验（SQLite 连接测试、页数统计）
-- 冷存储上传成功率与时效性检查
-- 日志文件轮转状态与磁盘占用监控
-- 失败基因库、帕累托前沿等关键知识库的备份验证
-- 定期生成归档健康报告并推送异常告警
+火种系统 (FireSeed) 归档审计官智能体 (ArchiveGuardian) — 历史主义
+=====================================================================
+全天候监控冷存储与数据完整性，确保关键数据安全。
+世界观：历史主义 — 一切当前状态都可以从历史痕迹中理解，遗忘是系统最大的敌人。
 """
 
 import asyncio
@@ -16,7 +12,7 @@ import logging
 import os
 import sqlite3
 import time
-from collections import deque
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -27,8 +23,23 @@ import yaml
 from api.server import get_engine
 from core.behavioral_logger import BehavioralLogger, EventType, EventLevel
 from core.notifier import SystemNotifier
+from agents.worldview import WorldView, WorldViewAgent, WorldViewManifesto
 
 logger = logging.getLogger("fire_seed.archive_guardian")
+
+
+# ------------------------------------------------------------
+# 历史主义世界观宣言
+# ------------------------------------------------------------
+ARCHIVE_GUARDIAN_MANIFESTO = WorldViewManifesto(
+    worldview=WorldView.HISTORICISM,
+    core_belief="一切当前状态都可以从历史痕迹中理解，遗忘是系统最大的敌人",
+    primary_optimization_target="archived_data / total_data",
+    adversary_worldview=WorldView.MECHANICAL_MATERIALISM,
+    forbidden_data_source={"REAL_TIME_ANYTHING"},
+    exclusive_data_source={"FILE_SYSTEM", "DATABASE_METADATA", "COLD_STORAGE_LOGS"},
+    time_scale="1h",
+)
 
 
 @dataclass
@@ -41,9 +52,9 @@ class ArchiveAlert:
     suggestion: str = ""
 
 
-class ArchiveGuardian:
+class ArchiveGuardian(WorldViewAgent):
     """
-    归档审计官智能体。
+    归档审计官智能体 — 历史主义。
 
     监控维度：
     - 数据库完整性（行为日志、ELO排名、订单记录）
@@ -58,6 +69,7 @@ class ArchiveGuardian:
                  behavior_log: Optional[BehavioralLogger] = None,
                  notifier: Optional[SystemNotifier] = None,
                  check_interval_sec: int = 3600):  # 每小时检查一次
+        super().__init__(ARCHIVE_GUARDIAN_MANIFESTO)
         self.root = Path(root_dir)
         self.behavior_log = behavior_log
         self.notifier = notifier
@@ -90,6 +102,44 @@ class ArchiveGuardian:
         self._last_check = 0.0
         # 连续异常计数器
         self._consecutive_issues: Dict[str, int] = {}
+
+    # ======================== 世界观接口实现 ========================
+    def propose(self, perception: Dict) -> Dict:
+        """基于历史主义视角提出建议：检查哪些数据有被遗忘的风险"""
+        # 探测最近未更新的文件
+        stale_files = self._detect_stale_files()
+        lost_data_risk = 1.0 if stale_files else 0.0
+
+        return {
+            "direction": -1 if lost_data_risk > 0.3 else 0,
+            "confidence": min(1.0, lost_data_risk),
+            "reason": f"发现 {len(stale_files)} 个可能被遗忘的数据文件" if stale_files else "数据记忆完好",
+            "stale_files": stale_files,
+        }
+
+    def challenge(self, other_proposal: Dict, my_worldview: WorldView) -> Dict:
+        """从历史主义角度挑战其他提案：该决策是否忽略了历史教训？"""
+        # 以最近归档失败为例，指出任何忽略持久化的行为
+        recent_failures = [a for a in self._alerts if a.level == EventLevel.CRITICAL]
+        veto = len(recent_failures) > 0 and other_proposal.get("direction", 0) != 0
+
+        return {
+            "veto": veto,
+            "reason": "历史数据显示关键数据丢失风险，不宜执行新操作" if veto else "历史记录正常，不反对",
+            "confidence": len(recent_failures) / 10.0,
+        }
+
+    def _detect_stale_files(self) -> List[str]:
+        """检测长时间未修改的关键文件"""
+        stale = []
+        threshold = datetime.now() - timedelta(days=7)
+        for pattern in self.critical_databases:
+            for db_file in self.root.glob(pattern):
+                if db_file.exists():
+                    mtime = datetime.fromtimestamp(db_file.stat().st_mtime)
+                    if mtime < threshold:
+                        stale.append(str(db_file.relative_to(self.root)))
+        return stale
 
     # ======================== 主入口 ========================
     async def evaluate(self) -> Dict[str, Any]:
