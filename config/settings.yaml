@@ -1,10 +1,10 @@
 # =============================================================================
 # 火种系统 (FireSeed) 全局配置文件
 # =============================================================================
-# 注意：
-#   1. 修改此文件后，系统将在下一个 K 线闭合或通过 SIGHUP 信号实时重载。
-#   2. 敏感信息（API 密钥、密码等）应通过环境变量注入，不要硬编码在此处。
-#   3. 所有时间均以 24 小时制 UTC+8 时区表示。
+# 说明：
+#   1. 修改此文件后，系统将自动热重载（部分参数需要重启）。
+#   2. 所有敏感信息（API密钥、密码等）通过环境变量注入，不得硬编码于此。
+#   3. 时间均以 24 小时制 UTC+8 时区表示。
 # =============================================================================
 
 # ---------------------------------------------------------------------------
@@ -23,10 +23,10 @@ system:
   # 日志级别: DEBUG / INFO / WARN / ERROR / CRITICAL
   log_level: INFO
 
-  # 是否启用欢迎登录动画 (前端专用)
+  # 是否启用前端欢迎登录动画
   welcome_animation: true
 
-  # 是否启用行为日志推送 (WebSocket)
+  # 是否启用行为日志 WebSocket 推送
   behavior_log_push: true
 
 # ---------------------------------------------------------------------------
@@ -36,37 +36,30 @@ learning:
   # 是否启用每日自动学习
   enabled: true
 
-  # 学习时段 (24小时制)
+  # 学习时段 (24小时制，弹性学习在此基础上进一步判断)
   start_time: "01:30"
   end_time: "04:30"
 
-  # 学习期间自动切换到的策略模式 (通常为 moderate)
+  # 学习期间自动切换到的策略模式
   learning_mode: moderate
 
   # 惊梦唤醒阈值
   nightmare:
-    # 波动率倍数：当前波动率超过过去24小时均值的倍数
-    volatility_multiplier: 2.0
-    # 成交量萎缩阈值：当前1分钟成交量低于过去24小时均值的比率
-    volume_shrink_ratio: 0.3
-    # 确认时长(秒)：异常需持续多久才触发唤醒
-    confirm_duration: 300
-    # 跳空幅度阈值（ATR 倍数）
-    gap_atr_mult: 3.0
+    volatility_multiplier: 2.0          # 波动率超24h均值倍数
+    volume_shrink_ratio: 0.3            # 成交量萎缩比率
+    confirm_duration: 300               # 持续秒数
+    gap_atr_mult: 3.0                   # 跳空ATR倍数
 
 # ---------------------------------------------------------------------------
 # 多周期配置
 # ---------------------------------------------------------------------------
 timeframes:
-  # 全局周期开关列表
   active: ["1m", "3m", "5m", "15m"]
-
-  # 各周期独立开关及参数
   periods:
     "1m":
-      engine: true         # 是否启用策略引擎
-      arbitrate: true      # 是否参与多周期仲裁
-      execute: true        # 是否允许实盘下单
+      engine: true
+      arbitrate: true
+      execute: true
     "3m":
       engine: true
       arbitrate: true
@@ -84,131 +77,68 @@ timeframes:
 # 硬件资源限制
 # ---------------------------------------------------------------------------
 hardware:
-  # 总逻辑 CPU 核心数 (用于线程池和并行度设置)
   cpu_cores: 4
-
-  # 总物理内存 (GB)，用于风控中的内存使用率告警
   total_memory_gb: 8
-
-  # 最大可用磁盘空间百分比 (当磁盘使用率超过此值时告警)
   disk_usage_max_pct: 85
-
-  # C++ 硬实时风控子核心跳超时 (毫秒)，超过后将自动切换备份路径
   rt_guard_heartbeat_ms: 500
-
-  # Python 主循环最大允许的雷达间隔 (秒)
   main_loop_max_lag_sec: 0.05
 
 # ---------------------------------------------------------------------------
 # 网络与低延迟优化
 # ---------------------------------------------------------------------------
 network:
-  # 是否启用用户态网络栈 (AF_XDP) - 需要内核 >= 5.4
-  user_space_net: false
-
-  # WebSocket 接收缓冲区大小 (字节)
+  user_space_net: false                 # AF_XDP 用户态网络开关
   ws_buffer_size: 65536
-
-  # 共享内存环形队列大小 (字节)
   shm_queue_size: 1048576
-
-  # 最大容忍延迟 (毫秒)，超过时触发网络告警
   max_latency_ms: 60
-
-  # 丢包率告警阈值 (百分比)
   packet_loss_alert_pct: 1.0
 
 # ---------------------------------------------------------------------------
 # 模型推理与 ONNX Runtime
 # ---------------------------------------------------------------------------
 inference:
-  # 推理引擎: pytorch / onnxruntime
   engine: onnxruntime
-
-  # ONNX Runtime 优化选项
   onnx:
-    # 推理线程数 (建议设为总核心数)
     intra_op_threads: 4
-    # 线程间并行数
     inter_op_threads: 1
-    # 图优化级别: DISABLE_ALL / EXTENDED / ENABLE_ALL
     graph_optimization_level: ENABLE_ALL
-    # 是否使用内存复用
     enable_mem_pattern: true
-    # 模型文件路径 (相对于项目根目录)
     model_path: "models/vib_int8.onnx"
-
-  # VIB 推理频率 (秒)，非交易路径可适度降低
   vib_inference_interval_sec: 10
 
 # ---------------------------------------------------------------------------
 # 数据库与存储
 # ---------------------------------------------------------------------------
 database:
-  # SQLite 数据库文件路径
   path: "data/fire_seed.db"
-
-  # 是否启用 WAL 模式
   wal_mode: true
-
-  # 同步级别: NORMAL / FULL / OFF
   synchronous: NORMAL
-
-  # 行为日志内存缓存条数
   log_memory_size: 500
 
 # ---------------------------------------------------------------------------
 # 冷数据归档 (云存储)
 # ---------------------------------------------------------------------------
 cold_storage:
-  # 当前使用的云平台: aliyun_oss / tencent_cos / aws_s3 / minio
   provider: aliyun_oss
-
-  # 阿里云 OSS 配置 (通过环境变量注入)
   aliyun_oss:
     endpoint: "oss-cn-hangzhou.aliyuncs.com"
     bucket: "fire-seed-logs"
-    # access_key_id 和 access_key_secret 从环境变量 OSS_ACCESS_KEY / OSS_SECRET_KEY 读取
-
-  # 腾讯云 COS 配置
-  tencent_cos:
-    region: "ap-guangzhou"
-    bucket: "fire-seed-logs"
-
-  # AWS S3 配置
-  aws_s3:
-    region: "us-east-1"
-    bucket: "fire-seed-logs"
-
-  # MinIO (私有部署) 配置
-  minio:
-    endpoint: "localhost:9000"
-    bucket: "fire-seed-logs"
-
-  # 生命周期策略
   lifecycle:
-    # 本地保留天数 (热数据)
     hot_days: 7
-    # 归档前压缩级别 (0-9)
     compression_level: 6
-    # 冷数据加密是否启用
     encryption: true
-    # 上传间隔 (秒)
     upload_interval_sec: 3600
 
 # ---------------------------------------------------------------------------
 # 消息推送渠道
 # ---------------------------------------------------------------------------
 messaging:
-  # 默认告警通道
   default_channel: telegram
-
   channels:
     telegram:
       enabled: true
       bot_token: ${TELEGRAM_BOT_TOKEN}
-      chat_ids:
-        - 123456789
+      chat_ids: [123456789]
       allow_commands: true
     dingtalk:
       enabled: false
@@ -229,154 +159,95 @@ messaging:
 # 多账户跟单系统
 # ---------------------------------------------------------------------------
 copy_trading:
-  # 是否启用多账户跟单
   enabled: false
-
-  # 主账户标识
   master_account: "main"
-
-  # 子账户列表 (最多6个)
   accounts:
     - name: "sub1"
       api_key: ${SUB1_API_KEY}
       api_secret: ${SUB1_API_SECRET}
-      follow_ratio: 1.0       # 跟单比例
-      max_pos_pct: 50         # 单个品种最大仓位占比
+      follow_ratio: 1.0
+      max_pos_pct: 50
     - name: "sub2"
       api_key: ${SUB2_API_KEY}
       api_secret: ${SUB2_API_SECRET}
       follow_ratio: 0.5
       max_pos_pct: 40
-    - name: "sub3"
-      api_key: ${SUB3_API_KEY}
-      api_secret: ${SUB3_API_SECRET}
-      follow_ratio: 0.8
-      max_pos_pct: 30
-    # 可继续添加 sub4 ~ sub6
 
 # ---------------------------------------------------------------------------
 # 前端与安全
 # ---------------------------------------------------------------------------
 frontend:
-  # 面板访问端口
   port: 8000
-
-  # 是否强制 HTTPS
   https: false
 
-  # HTTPS 证书路径 (如果 https 为 true)
-  ssl_cert: "/etc/letsencrypt/live/example.com/fullchain.pem"
-  ssl_key: "/etc/letsencrypt/live/example.com/privkey.pem"
-
 auth:
-  # 密码哈希算法: bcrypt
   password_algo: bcrypt
-
-  # TOTP 是否启用
   totp_enabled: true
-
-  # JWT 令牌过期时间 (分钟)
   jwt_expiry_minutes: 30
-
-  # 登录失败延迟递增 (毫秒)
   login_fail_delay: 2000
-
-  # IP 临时封锁阈值 (多少次失败后封锁)
   ip_ban_threshold: 5
 
 # ---------------------------------------------------------------------------
 # 进化与自学习安全协议
 # ---------------------------------------------------------------------------
 evolution:
-  # 每日最大允许回滚次数，超限冻结进化
   max_rollbacks_per_day: 3
-
-  # 幽灵影子最短验证时间 (小时)
   min_shadow_hours: 24
-
-  # 金丝雀发布阶段
   canary_stages:
-    - ratio: 0.01
-      min_hours: 6
-      max_dd: 0.02
-    - ratio: 0.10
-      min_hours: 12
-      max_dd: 0.05
-    - ratio: 1.00
-      min_hours: 24
-      max_dd: 0.10
-
-  # 信号分歧阈值 (新旧策略信号分歧超此值则回滚)
+    - { ratio: 0.01, min_hours: 6, max_dd: 0.02 }
+    - { ratio: 0.10, min_hours: 12, max_dd: 0.05 }
+    - { ratio: 1.00, min_hours: 24, max_dd: 0.10 }
   divergence_threshold: 0.4
-
-  # 沙箱安全限制
   sandbox:
-    # 禁止的 Python 导入
     forbidden_imports: ["os", "subprocess", "socket", "requests"]
-    # 最大代码长度 (字符)
     max_code_length: 5000
-    # 最大执行时间 (秒)
     max_execution_sec: 30
 
 # ---------------------------------------------------------------------------
-# 智能体议会
+# 智能体议会 (对抗式)
 # ---------------------------------------------------------------------------
 agents:
-  # 单智能体最大投票权重，超过将强制稀释
+  adversarial_council:
+    enabled: true
+    cooling_off_sec: 1800               # 挑战成功后的冷却时间 (秒)
+    anti_consensus_multiplier: 2.0      # 反共识增强倍率
+    min_jury_size: 2                    # 最少陪审员数量
   max_single_weight: 0.35
-
-  # 议会投票生效的最低参与率
   min_participation_rate: 0.6
-
-  # 共识过载阈值 (一致率超此值触发多样性预警)
   consensus_overload_threshold: 0.85
 
 # ---------------------------------------------------------------------------
 # 风险与熔断
 # ---------------------------------------------------------------------------
 risk:
-  # 单日最大亏损 (权益百分比)，三级熔断
   circuit_breakers:
-    level_1: 0.03   # 禁止开仓，收紧止损
-    level_2: 0.05   # 平掉所有非套利仓位，暂停 10 分钟
-    level_3: 0.08   # 全平，停止交易至次日
+    level_1: { trigger: 0.03, action: "no_new_entry", stop_tighten: 0.8 }
+    level_2: { trigger: 0.05, action: "liquidate_non_arb", cooldown_minutes: 10 }
+    level_3: { trigger: 0.08, action: "halt_until_midnight" }
 
-  # 流动性熔断 (价差百分比)
   liquidity_spread_max: 0.005
-
-  # 保证金率最低要求 (百分比)
   min_margin_rate: 150
-
-  # 单品种最大仓位 (保证金占比)
   max_single_position_pct: 50
-
-  # 总权益风险预算上限 (用于趋势压榨者)
   max_risk_per_trade_pct: 2.0
 
 # ---------------------------------------------------------------------------
 # 性能调优
 # ---------------------------------------------------------------------------
 performance:
-  # 惰性求值：仅在信号检测时计算全部因子，否则仅维护基础状态
   lazy_evaluation: true
-
-  # 算力调度权重
   cpu_quota:
-    trading: 60          # 交易核心占用百分比
-    evolution: 20        # 进化工厂占用百分比
-    monitoring: 10       # 监控与日志占用百分比
-    assistant: 10        # 火种助手占用百分比
-
-  # 因子计算线程池大小
+    trading: 60
+    evolution: 20
+    monitoring: 10
+    assistant: 10
   factor_thread_pool: 3
+  max_eval_interval: 30
 
 # ---------------------------------------------------------------------------
 # 第三方 API (LLM 与助手)
 # ---------------------------------------------------------------------------
 llm:
-  # 是否启用本地模式 (不调用外部 API)
   local_mode_fallback: true
-
   providers:
     deepseek:
       enabled: false
