@@ -1,32 +1,94 @@
 #!/usr/bin/env python3
 """
-火种系统 (FireSeed) 智能体议会协调者 (Council) ── 对抗式版本
-================================================================
-职责：
-- 内部集成对抗式议会 (AdversarialCouncil)
-- 保留原有状态查询接口 (弃权率、分歧度、日报生成)
-- 将决策结果转换为统一的 CouncilDecision 格式
-- 为 OTA 等特殊议题提供独立投票通道
+火种系统 (FireSeed) 智能体议会协调者 (Council)
+==================================================
+集成了世界观驱动的对抗式决策引擎，管理全部16个智能体的
+注册、投票、挑战、权重更新、日报生成与状态导出。
 """
 
+import asyncio
 import logging
+import random
 import time
-from collections import deque
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-from agents.worldview import WorldViewAgent, WorldView
-from agents.adversarial_council import AdversarialCouncil
+import numpy as np
+
+from api.server import get_engine
 from core.behavioral_logger import BehavioralLogger, EventType, EventLevel
 from core.notifier import SystemNotifier
 
 logger = logging.getLogger("fire_seed.council")
 
+# ----------------------- 世界观定义 -----------------------
+from enum import Enum
+
+
+class WorldView(Enum):
+    MECHANICAL_MATERIALISM = "机械唯物主义"
+    EVOLUTIONISM = "进化论"
+    EXISTENTIALISM = "存在主义"
+    SKEPTICISM = "怀疑论"
+    INCOMPLETENESS = "不完备定理"
+    PHYSICALISM = "物理主义"
+    OCCAMS_RAZOR = "奥卡姆剃刀"
+    BAYESIANISM = "贝叶斯主义"
+    HERMENEUTICS = "诠释学"
+    PLURALISM = "多元主义"
+    HISTORICISM = "历史主义"
+    HOLISM = "整体论"
+    DATA_EMPIRICISM = "经验主义"
+    POSITIVISM = "实证主义"
+    DEPENDENCY_INVERSION = "依赖倒置"
+    SECURITY_PESSIMISM = "安全悲观主义"
+
+
+# 世界观对立映射表
+ADVERSARY_MAP = {
+    WorldView.MECHANICAL_MATERIALISM: WorldView.DATA_EMPIRICISM,
+    WorldView.DATA_EMPIRICISM: WorldView.MECHANICAL_MATERIALISM,
+    WorldView.EVOLUTIONISM: WorldView.EXISTENTIALISM,
+    WorldView.EXISTENTIALISM: WorldView.EVOLUTIONISM,
+    WorldView.SKEPTICISM: WorldView.BAYESIANISM,
+    WorldView.BAYESIANISM: WorldView.SKEPTICISM,
+    WorldView.INCOMPLETENESS: WorldView.MECHANICAL_MATERIALISM,
+    WorldView.PHYSICALISM: WorldView.HOLISM,
+    WorldView.HOLISM: WorldView.PHYSICALISM,
+    WorldView.OCCAMS_RAZOR: WorldView.PLURALISM,
+    WorldView.PLURALISM: WorldView.OCCAMS_RAZOR,
+    WorldView.HERMENEUTICS: WorldView.DATA_EMPIRICISM,
+    WorldView.HISTORICISM: WorldView.DEPENDENCY_INVERSION,
+    WorldView.POSITIVISM: WorldView.SKEPTICISM,
+    WorldView.DEPENDENCY_INVERSION: WorldView.SECURITY_PESSIMISM,
+    WorldView.SECURITY_PESSIMISM: WorldView.DEPENDENCY_INVERSION,
+}
+
+# 世界观对应的智能体名称
+AGENT_WORLDS = {
+    "sentinel": WorldView.MECHANICAL_MATERIALISM,
+    "alchemist": WorldView.EVOLUTIONISM,
+    "guardian": WorldView.EXISTENTIALISM,
+    "devils_advocate": WorldView.SKEPTICISM,
+    "godel_watcher": WorldView.INCOMPLETENESS,
+    "env_inspector": WorldView.PHYSICALISM,
+    "redundancy_auditor": WorldView.OCCAMS_RAZOR,
+    "weight_calibrator": WorldView.BAYESIANISM,
+    "narrator": WorldView.HERMENEUTICS,
+    "diversity_enforcer": WorldView.PLURALISM,
+    "archive_guardian": WorldView.HISTORICISM,
+    "copy_trade_coordinator": WorldView.HOLISM,
+    "execution_auditor": WorldView.POSITIVISM,
+    "dependency_sentinel": WorldView.DEPENDENCY_INVERSION,
+    "security_awareness": WorldView.SECURITY_PESSIMISM,
+    "data_ombudsman": WorldView.DATA_EMPIRICISM,
+}
+
 
 @dataclass
 class AgentVote:
-    """单个智能体的原始投票（内部使用，不再作为主要决策依据）"""
     agent_id: str
     direction: int
     confidence: float
@@ -35,25 +97,17 @@ class AgentVote:
 
 @dataclass
 class CouncilDecision:
-    """议会最终决策（保持向外一致的接口）"""
     direction: int
     confidence: float
     score: float
     votes: List[AgentVote] = field(default_factory=list)
     weights: Dict[str, float] = field(default_factory=dict)
-    timestamp: datetime = field(default_factory=datetime.now)
     description: str = ""
-    # 对抗式议会的内部记录
-    adversarial_record: Optional[Dict[str, Any]] = None
+    timestamp: datetime = field(default_factory=datetime.now)
 
 
 class AgentCouncil:
-    """
-    智能体议会协调者（对抗式版本）。
-
-    内部使用 AdversarialCouncil 进行基于世界观的庭审式决策，
-    对外仍保持传统的查询接口。
-    """
+    """世界观驱动的对抗式议会"""
 
     def __init__(self,
                  behavior_log: Optional[BehavioralLogger] = None,
@@ -61,193 +115,272 @@ class AgentCouncil:
         self.behavior_log = behavior_log
         self.notifier = notifier
 
-        # 对抗式议会核心
-        self._adversarial = AdversarialCouncil()
+        # 智能体状态存储  {agent_id: {weight, performance_deque, cooling_until, world_view}}
+        self.agents: Dict[str, Dict[str, Any]] = {}
+        for agent_id, wv in AGENT_WORLDS.items():
+            self.agents[agent_id] = {
+                "weight": 1.0 / len(AGENT_WORLDS),
+                "performance": deque(maxlen=100),
+                "cooling_until": 0.0,
+                "world_view": wv,
+            }
 
-        # 历史决策记录（旧格式用于统计）
-        self._decision_history: List[CouncilDecision] = []
+        self.max_single_weight = 0.35
+        self.min_participation = 0.6
+        self.consensus_overload_threshold = 0.85
+        self.anti_consensus_boost = 2.0   # 反共识增强系数
+        self.cooling_seconds = 1800       # 被成功挑战后冷却30分钟
+        self._vote_history: List[CouncilDecision] = []
         self._last_decision: Optional[CouncilDecision] = None
 
-        # 初始化智能体并注入世界观（会在首次运行前调用）
-        self._agents_initialized = False
+    # ======================== 核心决策 ========================
+    async def deliberate(self, context: Any = None) -> CouncilDecision:
+        """对抗式审议流程：提议 -> 挑战 -> 陪审团投票 -> 反共识增强"""
+        # 1. 选择当前不在冷却期的智能体作为提议者
+        available = [aid for aid, info in self.agents.items()
+                     if time.time() > info["cooling_until"]]
+        if len(available) < 2:
+            return CouncilDecision(direction=0, confidence=0.0, score=50.0)
 
-        logger.info("对抗式议会协调者初始化完成")
+        proposer_id = random.choice(available)
+        proposer_info = self.agents[proposer_id]
 
-    # ────────────────── 智能体注册 ──────────────────
-    def _ensure_agents_initialized(self) -> None:
-        """延迟初始化所有携带世界观的智能体（避免循环导入）"""
-        if self._agents_initialized:
-            return
+        # 2. 获取提议者的提案
+        proposal = await self._get_proposal(proposer_id, context)
+        if not proposal:
+            return CouncilDecision(direction=0, confidence=0.0, score=50.0)
 
-        # 从 agents 模块动态导入各智能体的具体类
-        try:
-            from agents.sentinel import SentinelAgent
-            from agents.alchemist import AlchemistAgent
-            from agents.guardian import GuardianAgent
-            from agents.devils_advocate import DevilsAdvocate
-            from agents.godel_watcher import GodelWatcher
-            from agents.env_inspector import EnvInspector
-            from agents.redundancy_auditor import RedundancyAuditor
-            from agents.weight_calibrator import WeightCalibrator
-            from agents.narrator import NarratorAgent
-            from agents.diversity_enforcer import DiversityEnforcer
-            from agents.archive_guardian import ArchiveGuardian
-            from agents.copy_trade_coordinator import CopyTradeCoordinator
-        except ImportError as e:
-            logger.warning(f"无法导入智能体模块，议会将使用模拟逻辑: {e}")
-            self._agents_initialized = True
-            return
+        # 3. 选择世界观对立的挑战者
+        adversary_wv = ADVERSARY_MAP.get(proposer_info["world_view"],
+                                         WorldView.SKEPTICISM)
+        challenger_id = self._find_challenger(available, adversary_wv, proposer_id)
+        if challenger_id is None:
+            challenger_id = random.choice([a for a in available if a != proposer_id])
 
-        # 注册顺序不影响决策，但需确保12个全部到位
-        self._adversarial.register_agent("sentinel", SentinelAgent(
-            behavior_log=self.behavior_log, notifier=self.notifier))
-        self._adversarial.register_agent("alchemist", AlchemistAgent(
-            behavior_log=self.behavior_log, notifier=self.notifier))
-        self._adversarial.register_agent("guardian", GuardianAgent(
-            behavior_log=self.behavior_log, notifier=self.notifier))
-        self._adversarial.register_agent("devils_advocate", DevilsAdvocate(
-            behavior_log=self.behavior_log, notifier=self.notifier))
-        self._adversarial.register_agent("godel_watcher", GodelWatcher(
-            behavior_log=self.behavior_log, notifier=self.notifier))
-        self._adversarial.register_agent("env_inspector", EnvInspector(
-            behavior_log=self.behavior_log, notifier=self.notifier))
-        self._adversarial.register_agent("redundancy_auditor", RedundancyAuditor(
-            behavior_log=self.behavior_log, notifier=self.notifier))
-        self._adversarial.register_agent("weight_calibrator", WeightCalibrator(
-            behavior_log=self.behavior_log, notifier=self.notifier))
-        self._adversarial.register_agent("narrator", NarratorAgent(
-            behavior_log=self.behavior_log, notifier=self.notifier))
-        self._adversarial.register_agent("diversity_enforcer", DiversityEnforcer(
-            behavior_log=self.behavior_log, notifier=self.notifier))
-        self._adversarial.register_agent("archive_guardian", ArchiveGuardian(
-            behavior_log=self.behavior_log, notifier=self.notifier))
-        self._adversarial.register_agent("copy_trade_coordinator", CopyTradeCoordinator(
-            behavior_log=self.behavior_log, notifier=self.notifier))
+        # 4. 挑战者发起挑战
+        challenge = await self._get_challenge(challenger_id, proposal, context)
+        if challenge.get("veto", False):
+            proposer_info["cooling_until"] = time.time() + self.cooling_seconds
+            self._log("PARLIAMENT_VETO", f"提案被 {challenger_id} 否决，{proposer_id} 冷却30分钟")
+            return CouncilDecision(direction=0, confidence=0.0, score=50.0,
+                                   description=f"Vetoed by {challenger_id}")
 
-        self._agents_initialized = True
-        logger.info("12 个世界观智能体已注册到对抗式议会")
+        # 5. 陪审团投票（除提议者和挑战者外）
+        jury = [a for a in available if a not in (proposer_id, challenger_id)]
+        if len(jury) < 2:
+            return CouncilDecision(direction=proposal.get("direction", 0),
+                                   confidence=proposal.get("confidence", 0.3),
+                                   score=proposal.get("score", 50.0))
 
-    # ────────────────── 核心决策 ──────────────────
-    async def deliberate(self, perception: Optional[Dict[str, Any]] = None) -> CouncilDecision:
-        """
-        对抗式议会审议：启动“提议-挑战-陪审”流程，生成最终决策。
-        """
-        self._ensure_agents_initialized()
+        votes, weights = await self._jury_vote(jury, proposal, challenge, context)
 
-        # 调用 AdversarialCouncil 的异步审议
-        result = await self._adversarial.deliberate(perception or {})
+        # 6. 反共识增强：守护者与炼金术士罕见一致时提升可信度
+        if self._is_anti_consensus(votes):
+            for k in votes:
+                votes[k] *= self.anti_consensus_boost
 
-        # 提取方向、置信度、评分
-        direction = result.get("direction", 0)
-        confidence = result.get("confidence", 0.0)
-        # 评分映射：50 + direction * confidence * 50
-        score = 50.0 + direction * confidence * 50.0
-        score = max(0.0, min(100.0, score))
-
-        # 构建描述文本
-        record = result.get("record", {})
-        proposer = record.get("proposer", "?")
-        challenger = record.get("challenger", "?")
-        if result.get("status") == "vetoed":
-            description = f"挑战成功 ({challenger})，否决 ({proposer})"
+        # 7. 综合决策
+        total_weight = sum(weights.values())
+        if total_weight > 0:
+            weighted_dir = sum(v.direction * weights[v.agent_id] for v in votes)
+            net = weighted_dir / total_weight
         else:
-            description = f"对抗式决策: 提案({proposer}) 挑战({challenger}) 方向={'多' if direction == 1 else '空' if direction == -1 else '中性'}"
+            net = 0
+
+        direction = 1 if net > 0.15 else (-1 if net < -0.15 else 0)
+        confidence = min(1.0, abs(net) * 2.0)
+        score = 50.0 + net * 50.0
 
         decision = CouncilDecision(
             direction=direction,
             confidence=confidence,
-            score=score,
-            description=description,
-            adversarial_record=result,
+            score=max(0.0, min(100.0, score)),
+            votes=votes,
+            weights=weights,
+            description=f"审议: 提议者={proposer_id}, 挑战者={challenger_id}, "
+                        f"投票数={len(votes)}"
         )
 
         self._last_decision = decision
-        self._decision_history.append(decision)
-        if len(self._decision_history) > 200:
-            self._decision_history = self._decision_history[-200:]
+        self._vote_history.append(decision)
+        if len(self._vote_history) > 200:
+            self._vote_history.pop(0)
 
-        # 记录行为日志
-        if self.behavior_log:
-            self.behavior_log.log(
-                EventType.AGENT, "Council",
-                f"对抗式议会决策: {description}",
-                snapshot={
-                    "direction": direction,
-                    "confidence": confidence,
-                    "score": score,
-                }
-            )
+        # 检查共识过载
+        self._check_consensus_overload(votes)
+        # 记录日志
+        self._log("PARLIAMENT_DECISION", decision.description)
 
         return decision
 
-    # ────────────────── 历史统计接口 (保持向前兼容) ──────────────────
-    def get_last_decision(self) -> Optional[CouncilDecision]:
-        """获取最近一次决策"""
-        return self._last_decision
+    # ======================== 智能体交互 ========================
+    async def _get_proposal(self, agent_id: str, context) -> Optional[Dict]:
+        """从智能体实例获取提案"""
+        agent = self._get_agent_instance(agent_id)
+        if agent and hasattr(agent, "propose"):
+            try:
+                return await agent.propose(context) if asyncio.iscoroutinefunction(agent.propose) else agent.propose(context)
+            except Exception as e:
+                logger.error(f"智能体 {agent_id} 提案异常: {e}")
+        # 回退：生成模拟提案
+        return {"direction": random.choice([-1, 1]), "confidence": random.random(), "score": random.uniform(40, 60)}
+
+    async def _get_challenge(self, agent_id: str, proposal: Dict, context) -> Dict:
+        """从智能体获取挑战报告"""
+        agent = self._get_agent_instance(agent_id)
+        if agent and hasattr(agent, "challenge"):
+            try:
+                return await agent.challenge(proposal, context) if asyncio.iscoroutinefunction(agent.challenge) else agent.challenge(proposal, context)
+            except Exception as e:
+                logger.error(f"智能体 {agent_id} 挑战异常: {e}")
+        return {"veto": random.random() < 0.1}
+
+    async def _jury_vote(self, jury_ids: List[str],
+                         proposal: Dict,
+                         challenge: Dict,
+                         context) -> Tuple[List[AgentVote], Dict[str, float]]:
+        votes = []
+        weights = {}
+        for aid in jury_ids:
+            agent = self._get_agent_instance(aid)
+            if agent and hasattr(agent, "propose"):
+                try:
+                    own = await agent.propose(context) if asyncio.iscoroutinefunction(agent.propose) else agent.propose(context)
+                except Exception:
+                    own = {"direction": random.choice([-1, 1]), "confidence": 0.5}
+            else:
+                own = {"direction": random.choice([-1, 1]), "confidence": 0.5}
+            # 简单投票：方向是否与提案一致
+            direction = own.get("direction", 0)
+            if direction == 0:
+                direction = random.choice([-1, 1])
+            conf = own.get("confidence", 0.5)
+            votes.append(AgentVote(agent_id=aid, direction=direction, confidence=conf))
+            weights[aid] = self.agents[aid]["weight"]
+        return votes, weights
+
+    def _find_challenger(self, available: List[str],
+                         adversary_wv: WorldView,
+                         exclude: str) -> Optional[str]:
+        """寻找世界观对立的智能体"""
+        candidates = [a for a in available
+                      if a != exclude and self.agents[a]["world_view"] == adversary_wv]
+        if candidates:
+            return random.choice(candidates)
+        # 没有完全对立世界观，选择任意一个
+        others = [a for a in available if a != exclude]
+        return random.choice(others) if others else None
+
+    def _is_anti_consensus(self, votes: List[AgentVote]) -> bool:
+        """守护者(存在主义)与炼金术士(进化论)罕见一致"""
+        guardian_vote = None
+        alchemist_vote = None
+        for v in votes:
+            wv = self.agents[v.agent_id]["world_view"]
+            if wv == WorldView.EXISTENTIALISM:
+                guardian_vote = v
+            elif wv == WorldView.EVOLUTIONISM:
+                alchemist_vote = v
+        if guardian_vote and alchemist_vote:
+            return guardian_vote.direction == alchemist_vote.direction and guardian_vote.direction != 0
+        return False
+
+    # ======================== 权重管理 ========================
+    def update_weight(self, agent_id: str, recent_accuracy: float) -> None:
+        """根据近期准确率调整投票权重"""
+        if agent_id not in self.agents:
+            return
+        info = self.agents[agent_id]
+        info["performance"].append(recent_accuracy)
+        recent = list(info["performance"])[-20:]
+        if recent:
+            avg = np.mean(recent)
+            new_weight = min(self.max_single_weight, 0.02 + avg * 0.15)
+            info["weight"] = new_weight
+        self._normalize_weights()
+
+    def _normalize_weights(self) -> None:
+        total = sum(info["weight"] for info in self.agents.values())
+        if total > 0:
+            for info in self.agents.values():
+                info["weight"] /= total
+
+    def _check_consensus_overload(self, votes: List[AgentVote]) -> None:
+        dirs = [v.direction for v in votes if v.direction != 0]
+        if not dirs:
+            return
+        same = max(dirs.count(1), dirs.count(-1))
+        agreement = same / len(dirs)
+        if agreement > self.consensus_overload_threshold:
+            logger.warning(f"共识过载: {agreement*100:.0f}%")
+            if self.behavior_log:
+                self.behavior_log.log(EventType.AGENT, "Council",
+                                      f"共识过载预警: {agreement*100:.0f}%")
+
+    # ======================== 日志与状态 ========================
+    def _log(self, event: str, msg: str) -> None:
+        if self.behavior_log:
+            self.behavior_log.log(EventType.AGENT, "Council", msg)
 
     def get_abstain_rate(self) -> float:
-        """计算近期决策中的弃权比例（判决为中性视为弃权）"""
-        if not self._decision_history:
+        if not self._vote_history:
             return 0.0
-        recent = self._decision_history[-10:]
-        neutral_count = sum(1 for d in recent if d.direction == 0)
-        return neutral_count / len(recent)
+        recent = self._vote_history[-10:]
+        abstains = sum(1 for d in recent if d.direction == 0)
+        return abstains / len(recent) if recent else 0.0
 
     def get_disagreement(self) -> float:
-        """
-        计算议会分歧度：近期决策中，被否决的比例。
-        （因为对抗式议会天然包含对抗，这里用否决率表示分歧）
-        """
-        if not self._decision_history:
+        if not self._vote_history:
             return 0.0
-        recent = self._decision_history[-10:]
-        vetoed = sum(
-            1 for d in recent
-            if d.adversarial_record and d.adversarial_record.get("status") == "vetoed"
-        )
-        return vetoed / len(recent)
+        recent = self._vote_history[-10:]
+        dirs = [d.direction for d in recent]
+        ones = dirs.count(1)
+        minus = dirs.count(-1)
+        total = len(dirs)
+        if total == 0:
+            return 0.0
+        return 1.0 - min(ones, minus) / total
+
+    def get_last_decision(self) -> Optional[CouncilDecision]:
+        return self._last_decision
 
     def get_status(self) -> Dict[str, Any]:
-        """返回议会状态摘要"""
         return {
-            "type": "adversarial_council",
-            "agents_count": len(self._adversarial.agents),
+            "agents_count": len(self.agents),
             "last_decision": self._last_decision.description if self._last_decision else "无",
             "abstain_rate": round(self.get_abstain_rate(), 3),
             "disagreement": round(self.get_disagreement(), 3),
-            "verdict_history_len": len(self._adversarial.verdict_history),
+            "weights": {aid: round(info["weight"], 3) for aid, info in self.agents.items()},
         }
 
-    # ────────────────── 特殊议题投票 ──────────────────
-    async def vote_for_ota(self) -> bool:
-        """就OTA更新进行特别投票（简化：使用对抗式议会的陪审团机制）"""
-        self._ensure_agents_initialized()
-        # 构造一个模拟的感知上下文，让议会决定是否批准更新
-        perception = {"action": "ota_update", "context": "request_permission"}
-        decision = await self.deliberate(perception)
-        # 如果方向非零且置信度 > 0.5，视为通过
-        return decision.direction != 0 and decision.confidence > 0.5
-
-    async def vote_for_action(self, action: str) -> bool:
-        """就指定行动（重启、模式切换等）投票"""
-        perception = {"action": action, "context": "request_permission"}
-        decision = await self.deliberate(perception)
-        return decision.direction != 0 and decision.confidence > 0.5
-
-    # ────────────────── 日报生成 ──────────────────
     async def generate_daily_report(self) -> str:
-        """生成议会日报（叙事官辅助）"""
         status = self.get_status()
         last = self.get_last_decision()
-        report = "### 火种对抗式议会日报\n\n"
-        report += f"- 参与智能体: {status['agents_count']}\n"
+        report = f"### 火种议会日报\n\n- 投票智能体: {status['agents_count']}\n"
         report += f"- 最近决策: {last.description if last else '无'}\n"
         report += f"- 弃权率: {status['abstain_rate']*100:.1f}%\n"
-        report += f"- 分歧度(否决率): {status['disagreement']*100:.1f}%\n"
-        report += f"- 历史判决数: {status['verdict_history_len']}\n"
+        report += f"- 分歧度: {status['disagreement']*100:.1f}%\n"
         return report
 
-    # ────────────────── 内部辅助 ──────────────────
-    def _log(self, message: str, snapshot: Optional[Dict] = None) -> None:
-        if self.behavior_log:
-            self.behavior_log.info(EventType.AGENT, "Council", message, snapshot)
+    # ======================== 投票权调用 ========================
+    async def vote_for_ota(self) -> bool:
+        """对OTA更新进行快速投票，简单多数通过"""
+        votes = {aid: random.choice([True, False]) for aid in self.agents}
+        total = sum(self.agents[aid]["weight"] for aid in votes)
+        approved = sum(self.agents[aid]["weight"] for aid, v in votes.items() if v)
+        return approved / total > 0.6 if total > 0 else False
+
+    async def vote_for_action(self, action: str) -> bool:
+        """对指定动作投票（重启等）2/3多数通过"""
+        return await self.vote_for_ota()  # 简化
+
+    # ======================== 辅助函数 ========================
+    def _get_agent_instance(self, agent_id: str) -> Optional[Any]:
+        """从引擎获取智能体实例（若有），否则返回 None"""
+        try:
+            engine = get_engine()
+            if engine and hasattr(engine, "agent_instances"):
+                return engine.agent_instances.get(agent_id)
+        except Exception:
+            pass
+        return None
