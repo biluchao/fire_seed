@@ -2,21 +2,21 @@
 火种系统 · 利润再投资与弹药库 (ProfitReinvestment)
 
 核心职责：
-1. 管理部分止盈或全平后释放的保证金，按优先级（同策略加仓 -> 跨策略分配 -> 弹药库储备）自动分配
+1. 管理部分止盈或全平后释放的保证金，按优先级（借贷归还 -> 同策略加仓 -> 跨策略分配 -> 弹药库储备）自动分配
 2. 维护弹药库资金池，支持高质量信号触发时的智能释放、策略亏损时的反向解锁，以及利润锁定比例的动态调整
 
 外部依赖（真实模块接口）：
 - core.position_sizer.PositionSizer : 获取当前策略的资金需求与仓位上限，以及近期绩效数据
 - core.risk_monitor.circuit_breaker.CircuitBreaker : 查询是否处于熔断冷却期，熔断期间禁止再投资
 - core.ecological_niche.capital_allocator.CapitalAllocator : 跨策略资金调拨接口
-- core.account_ledger.AccountLedger : 获取账户总权益、可用保证金等财务数据
+- core.account_ledger.AccountLedger : 获取账户总权益、可用保证金等财务数据，以及资金回流接口
 - core.negotiation_bus.NegotiationBus : 发布弹药库释放/锁定事件，供其他模块订阅
 - core.perception.tactile_cortex.TactileCortex : 获取当前市场流动性评级，用于弹药库释放决策
-- core.performance_tracker.PerformanceTracker : 获取策略近期胜率、滚动夏普等绩效数据（可选，未注入则跳过门禁）
+- core.performance_tracker.PerformanceTracker : 获取策略近期胜率、滚动夏普等绩效数据（不可用时拒绝同策略加仓）
 
 接口契约：
 - allocate_released_capital(amount: float, source_strategy: str, current_signal_score: float) -> Dict[str, Any]
-- request_ammo_release(signal_score: float, required_amount: float) -> Dict[str, Any]
+- request_ammo_release(signal_score: float, required_amount: float, strategy_name: str) -> Dict[str, Any]
 - get_ammo_status() -> Dict[str, Any]
 - health_check() -> Dict[str, Any]
 - 所有公共方法输出字典固定包含 "status" (str), "reason" (str), "data" (Dict), "warnings" (List[str])
@@ -24,14 +24,14 @@
 异常与降级：
 - 当 PositionSizer 不可用时，跳过同策略加仓，直接将资金转入弹药库
 - 当 CapitalAllocator 不可用时，跨策略分配降级为弹药库储备
-- 当 AccountLedger 不可用时，使用上一次缓存的总权益计算分配比例，或使用弹药库余额反推最低保留
-- 当 PerformanceTracker 不可用时，跳过策略近期绩效门禁（保守策略：禁止同策略加仓，或降级？这里选择降级为弹药库储备）
+- 当 AccountLedger 不可用时，使用上一次缓存的总权益计算分配比例；溢出资金无法回流时仅记录关键告警
+- 当 PerformanceTracker 不可用时，同策略加仓降级为拒绝（资金转入弹药库），保守保护
 - 当 TactileCortex 不可用时，忽略流动性门禁
 - 当数据库不可用时，弹药库余额仅保存在内存中，重启丢失，critical 日志告警
 - 所有降级值在类常量区明确声明
 
 资源管理：
-- 弹药库余额持久化至本地 SQLite 数据库，通过线程锁保证并发写入安全
+- 弹药库余额与借贷记录持久化至本地 SQLite 数据库，通过事务（IMMEDIATE）保证写入原子性与并发安全
 - 数据库连接在模块初始化时创建，在系统退出时通过 atexit 回调关闭
 - 不持有其他外部资源句柄
 """
@@ -72,9 +72,10 @@ class ProfitReinvestment:
     DEFAULT_LOW_LIQUIDITY_RELEASE_MULT = 0.30  # 低流动性时弹药库释放比例乘数
     DEFAULT_DB_PATH = "data/ammo_reserve.db"   # 弹药库持久化数据库路径
     MIN_RESERVE_AMMO_FALLBACK_RATIO = 0.10 # AccountLedger 不可用时，最低保留占当前弹药库余额比例
+    MAX_OUTSTANDING_LOAN_BALANCE_RATIO = 1.5  # 未还借贷总额超过弹药库余额的倍数告警阈值
 
-    # 再投资优先级
-    REINVEST_PRIORITY = ["same_strategy", "cross_strategy", "ammo_reserve"]
+    # 再投资优先级（借贷归还优先于一切）
+    REINVEST_PRIORITY = ["loan_repayment", "same_strategy", "cross_strategy", "ammo_reserve"]
 
     def __init__(self):
         # 弹药库余额（内存缓存）
@@ -142,7 +143,7 @@ class ProfitReinvestment:
             self._account_ledger = account_ledger
             logger.info("AccountLedger 注入成功")
         else:
-            logger.warning("AccountLedger 未注入，将使用弹药库余额反推最低保留")
+            logger.warning("AccountLedger 未注入，溢出资金无法自动回流主资金池")
 
         if negotiation_bus is not None:
             self._negotiation_bus = negotiation_bus
@@ -160,14 +161,14 @@ class ProfitReinvestment:
             self._performance_tracker = performance_tracker
             logger.info("PerformanceTracker 注入成功")
         else:
-            logger.warning("PerformanceTracker 未注入，绩效门禁不可用，同策略加仓降级为弹药库储备")
+            logger.warning("PerformanceTracker 未注入，绩效门禁不可用，同策略加仓降级为拒绝")
 
     # ========== 公共接口 ==========
     def allocate_released_capital(
         self, amount: float, source_strategy: str, current_signal_score: float
     ) -> Dict[str, Any]:
         """
-        将部分止盈或全平释放的保证金按优先级分配
+        将部分止盈或全平释放的保证金按优先级分配（借贷归还优先）
         """
         if amount <= 0:
             logger.warning(f"无效释放金额: {amount}，跳过分配")
@@ -200,19 +201,18 @@ class ProfitReinvestment:
             if remaining <= 0:
                 break
             allocated = self._execute_allocation(priority, remaining, source_strategy, current_signal_score)
-            allocated = min(allocated, remaining)  # 防止浮点精度导致超扣
-            if allocated > 1e-10:  # 过滤极小的浮点噪声
+            allocated = min(allocated, remaining)
+            if allocated > 1e-10:
                 reason = self._get_allocation_reason(priority, source_strategy, current_signal_score)
                 allocations.append({"target": priority, "amount": round(allocated, 8), "reason": reason})
                 remaining -= allocated
-                remaining = max(0.0, remaining)  # 确保非负
+                remaining = max(0.0, remaining)
 
-        # 若还有剩余，直接存入弹药库（跳过上限检查，因为是从利润释放的）
+        # 最终剩余通过 _add_to_ammo 统一处理（遵守容量上限）
         if remaining > 1e-10:
-            self._ammo_balance += remaining
-            self._persist_balance()
+            self._add_to_ammo(remaining)
             allocations.append({"target": "ammo_reserve", "amount": round(remaining, 8), "reason": "最终剩余转入弹药库"})
-            logger.debug("最终剩余 %.4f 直接转入弹药库", remaining)
+            logger.debug("最终剩余 %.4f 通过标准通道转入弹药库", remaining)
 
         return {
             "status": "ok",
@@ -225,9 +225,11 @@ class ProfitReinvestment:
             "warnings": [],
         }
 
-    def request_ammo_release(self, signal_score: float, required_amount: float) -> Dict[str, Any]:
+    def request_ammo_release(
+        self, signal_score: float, required_amount: float, strategy_name: str = "unknown"
+    ) -> Dict[str, Any]:
         """
-        根据信号强度请求从弹药库释放资金
+        根据信号强度请求从弹药库释放资金（含借贷上限与流动性门禁）
         """
         if required_amount <= 0:
             return {
@@ -282,17 +284,18 @@ class ProfitReinvestment:
                 actual_release = max(0.0, self._ammo_balance - min_reserve)
 
             # 检查单个策略的未还借贷上限
-            outstanding = sum(loan["amount"] for loans in self._loans.get("unknown", []) if not loan["repaid"])
+            outstanding = sum(
+                loan["amount"] for loans in self._loans.get(strategy_name, []) if not loan["repaid"]
+            )
             max_strategy_borrow = self._ammo_balance * self.DEFAULT_SINGLE_STRATEGY_BORROW_PCT
             if outstanding + actual_release > max_strategy_borrow:
                 actual_release = max(0.0, max_strategy_borrow - outstanding)
-                logger.warning("策略借贷已达上限，实际释放 %.4f", actual_release)
+                logger.warning("策略 %s 借贷已达上限，实际释放 %.4f", strategy_name, actual_release)
 
             self._ammo_balance -= actual_release
             self._persist_balance()
 
-            logger.info("弹药库释放: %.4f (信号评分 %d, 释放比例 %.0f%%)",
-                        actual_release, int(signal_score), release_ratio * 100)
+            logger.info("弹药库释放: %.4f (信号评分 %d, 策略 %s)", actual_release, int(signal_score), strategy_name)
             self._notify_ammo_event("release", actual_release, signal_score)
 
             return {
@@ -341,19 +344,35 @@ class ProfitReinvestment:
                         db_ok = False
                         logger.error("弹药库数据库连接异常 #RECOVERY: 检查 SQLite 文件和磁盘状态")
 
-                warnings = [] if db_ok else ["database_disconnected"]
+                warnings_list = [] if db_ok else ["database_disconnected"]
                 if not db_ok:
                     logger.critical("弹药库持久化不可用，重启将丢失余额")
 
                 overdue = self._check_overdue_loans()
                 if overdue:
-                    warnings.append(f"存在 {len(overdue)} 笔逾期贷款")
+                    warnings_list.append(f"存在 {len(overdue)} 笔逾期贷款")
                     for item in overdue:
                         logger.warning("逾期贷款: %s, 金额 %.4f, 天数 %d",
                                        item["strategy"], item["amount"], item["days_overdue"])
 
+                # 一致性校验：未还借贷不应远超弹药库余额
+                outstanding_total = sum(
+                    loan["amount"] for loans in self._loans.values()
+                    for loan in loans if not loan["repaid"]
+                )
+                if outstanding_total > self._ammo_balance * self.MAX_OUTSTANDING_LOAN_BALANCE_RATIO:
+                    logger.critical("未还借贷总额 %.4f 超过弹药库余额 %.4f 的 %.1f 倍，数据可能异常",
+                                    outstanding_total, self._ammo_balance,
+                                    self.MAX_OUTSTANDING_LOAN_BALANCE_RATIO)
+                    warnings_list.append("loan_balance_anomaly")
+
+                # 增加独立告警：未还借贷超过弹药库余额本身
+                if outstanding_total > self._ammo_balance and self._ammo_balance > 0:
+                    logger.warning("未还借贷总额 %.4f 已超过弹药库余额 %.4f", outstanding_total, self._ammo_balance)
+                    warnings_list.append("outstanding_exceeds_balance")
+
                 return {
-                    "status": "ok" if db_ok and not overdue else "degraded",
+                    "status": "ok" if db_ok and not overdue and "loan_balance_anomaly" not in warnings_list else "degraded",
                     "reason": "弹药库模块正常" if (db_ok and not overdue) else "存在异常",
                     "data": {
                         "ammo_balance": self._ammo_balance,
@@ -370,7 +389,7 @@ class ProfitReinvestment:
                             "performance_tracker": self._performance_tracker is not None,
                         },
                     },
-                    "warnings": warnings,
+                    "warnings": warnings_list,
                 }
         except Exception as e:
             logger.error(f"健康检查失败: {e} #RECOVERY: 检查数据库文件权限和磁盘空间")
@@ -386,7 +405,9 @@ class ProfitReinvestment:
         self, target: str, amount: float, strategy: str, signal_score: float
     ) -> float:
         """执行单个优先级的分配，返回实际分配金额"""
-        if target == "same_strategy":
+        if target == "loan_repayment":
+            return self._allocate_loan_repayment(amount, strategy)
+        elif target == "same_strategy":
             return self._allocate_same_strategy(amount, strategy, signal_score)
         elif target == "cross_strategy":
             return self._allocate_cross_strategy(amount)
@@ -394,8 +415,36 @@ class ProfitReinvestment:
             return self._allocate_to_ammo(amount)
         return 0.0
 
+    def _allocate_loan_repayment(self, amount: float, strategy: str) -> float:
+        """优先归还该策略的未还借贷（修正资金黑洞）"""
+        if strategy not in self._loans:
+            return 0.0
+        total_owed = sum(loan["amount"] for loan in self._loans[strategy] if not loan["repaid"])
+        if total_owed <= 0:
+            return 0.0
+
+        remaining_to_repay = min(amount, total_owed)
+        actual_repaid = remaining_to_repay  # 保存原始归还额
+
+        # 逐笔标记归还
+        for loan in self._loans[strategy]:
+            if not loan["repaid"] and remaining_to_repay > 0:
+                if remaining_to_repay >= loan["amount"]:
+                    remaining_to_repay -= loan["amount"]
+                    loan["repaid"] = True
+                else:
+                    loan["amount"] -= remaining_to_repay
+                    remaining_to_repay = 0.0
+                    break
+
+        # 归还弹药库（使用实际归还总额）
+        self._ammo_balance += actual_repaid
+        self._persist_balance()
+        logger.info("策略 %s 归还借贷: %.4f (原本欠款 %.4f)", strategy, actual_repaid, total_owed)
+        return actual_repaid
+
     def _allocate_same_strategy(self, amount: float, strategy: str, signal_score: float) -> float:
-        """同策略加仓（含绩效门禁）"""
+        """同策略加仓（含绩效门禁，PerformanceTracker 不可用时拒绝加仓）"""
         if self._position_sizer is None:
             logger.debug("PositionSizer 不可用，跳过同策略加仓")
             return 0.0
@@ -420,7 +469,12 @@ class ProfitReinvestment:
                         logger.warning("策略 %s 滚动夏普为负 (%.2f)，拒绝同策略加仓", strategy, sharpe)
                         return 0.0
             except Exception as e:
-                logger.warning(f"获取策略绩效异常: {e}，跳过绩效门禁")
+                logger.warning(f"获取策略绩效异常: {e}，拒绝同策略加仓")
+                return 0.0
+        else:
+            # PerformanceTracker 不可用时，拒绝同策略加仓
+            logger.warning("PerformanceTracker 未注入，拒绝同策略加仓，资金降级为弹药库储备")
+            return 0.0
 
         try:
             available = self._position_sizer.get_available_capacity(strategy)
@@ -451,7 +505,7 @@ class ProfitReinvestment:
         return amount
 
     def _add_to_ammo(self, amount: float) -> None:
-        """增加弹药库余额（线程安全，含峰值权益保护）"""
+        """增加弹药库余额（线程安全，含峰值权益保护与绝对金额上限）"""
         with self._lock:
             total_equity = self._get_total_equity()
             if total_equity > self._peak_equity:
@@ -460,21 +514,45 @@ class ProfitReinvestment:
             cap_by_current = total_equity * self.DEFAULT_AMMO_MAX_PCT if total_equity > 0 else 0
             cap_by_peak = self._peak_equity * self.DEFAULT_AMMO_PEAK_EQUITY_PCT if self._peak_equity > 0 else 0
             max_ammo = max(cap_by_current, cap_by_peak)
-            # 绝对金额上限
             if self.DEFAULT_AMMO_ABSOLUTE_CAP > 0:
                 max_ammo = min(max_ammo, self.DEFAULT_AMMO_ABSOLUTE_CAP)
 
             effective = min(amount, max_ammo - self._ammo_balance)
             if effective <= 0:
                 overflow = amount
-                logger.info("弹药库已达上限 (%.4f/%.4f)，溢出 %.4f 将退回主资金池",
-                            self._ammo_balance, max_ammo, overflow)
+                logger.info("弹药库已达上限 (%.4f/%.4f)，溢出 %.4f", self._ammo_balance, max_ammo, overflow)
+                # 尝试回流主资金池
+                self._return_overflow_to_pool(overflow)
                 self._notify_ammo_event("ammo_overflow", overflow)
                 return
+
+            old_balance = self._ammo_balance
             self._ammo_balance += effective
             self._persist_balance()
-            logger.debug("弹药库增加: %.4f (当前: %.4f)", effective, self._ammo_balance)
+            logger.info("弹药库增加: %.4f (%.4f -> %.4f)", effective, old_balance, self._ammo_balance)
             self._notify_ammo_event("ammo_deposit", effective)
+
+    def _return_overflow_to_pool(self, amount: float) -> None:
+        """将溢出资金返还主资金池，并确认回流成功"""
+        if self._account_ledger is not None:
+            try:
+                # 回流前记录主资金池余额
+                before_balance = self._account_ledger.get_total_equity()
+                self._account_ledger.deposit(amount, source="ammo_overflow")
+                # 回流后确认余额增加
+                after_balance = self._account_ledger.get_total_equity()
+                expected = before_balance + amount
+                if abs(after_balance - expected) > 1e-6:
+                    logger.critical(
+                        f"溢出资金回流确认失败: 预期 %.4f, 实际 %.4f, 差额 %.4f #RECOVERY: 手动对账",
+                        expected, after_balance, expected - after_balance
+                    )
+                else:
+                    logger.info("溢出资金 %.4f 已退回主资金池并确认成功", amount)
+            except Exception as e:
+                logger.critical(f"溢出资金 %.4f 回流失败: {e} #RECOVERY: 检查 AccountLedger 状态，手动对账", amount)
+        else:
+            logger.critical("AccountLedger 不可用，溢出资金 %.4f 无法回流，需人工处理", amount)
 
     def _get_total_equity(self) -> float:
         """获取账户总权益（带降级）"""
@@ -487,7 +565,9 @@ class ProfitReinvestment:
 
     def _get_allocation_reason(self, target: str, strategy: str, signal_score: float) -> str:
         """生成分配原因说明"""
-        if target == "same_strategy":
+        if target == "loan_repayment":
+            return f"策略 {strategy} 优先归还弹药库借贷"
+        elif target == "same_strategy":
             return f"信号评分{signal_score:.0f}>={self.DEFAULT_REINVEST_SIGNAL_THRESHOLD}，同策略{strategy}加仓"
         elif target == "cross_strategy":
             return "跨策略分配"
@@ -521,7 +601,8 @@ class ProfitReinvestment:
                 "CREATE TABLE IF NOT EXISTS ammo_state (key TEXT PRIMARY KEY, value TEXT)"
             )
             self._db_conn.execute(
-                "CREATE TABLE IF NOT EXISTS loan_records (strategy TEXT, amount REAL, timestamp REAL, repaid INTEGER)"
+                "CREATE TABLE IF NOT EXISTS loan_records "
+                "(strategy TEXT, amount REAL, timestamp REAL, repaid INTEGER)"
             )
             self._db_conn.commit()
         except Exception as e:
@@ -533,7 +614,7 @@ class ProfitReinvestment:
             self._db_conn = None
 
     def _load_state(self) -> None:
-        """从数据库加载状态（含损坏数据保护）"""
+        """从数据库加载状态（含损坏数据保护与一致性校验）"""
         if self._db_conn is None:
             return
         try:
@@ -543,7 +624,8 @@ class ProfitReinvestment:
                 try:
                     self._ammo_balance = float(row[0])
                 except (ValueError, TypeError):
-                    logger.error(f"弹药库余额数据损坏: {row[0]} #RECOVERY: 检查数据库文件完整性，手动修正或删除重建")
+                    logger.error(f"弹药库余额数据损坏: {row[0]} "
+                                 "#RECOVERY: 检查数据库文件完整性，手动修正或删除重建")
                     self._ammo_balance = 0.0
             cursor = self._db_conn.execute("SELECT value FROM ammo_state WHERE key='peak_equity'")
             row = cursor.fetchone()
@@ -552,20 +634,36 @@ class ProfitReinvestment:
                     self._peak_equity = float(row[0])
                 except (ValueError, TypeError):
                     self._peak_equity = 0.0
-            cursor = self._db_conn.execute("SELECT strategy, amount, timestamp, repaid FROM loan_records")
+            cursor = self._db_conn.execute(
+                "SELECT strategy, amount, timestamp, repaid FROM loan_records"
+            )
             for strategy, amount, ts, repaid in cursor.fetchall():
                 if strategy not in self._loans:
                     self._loans[strategy] = []
-                self._loans[strategy].append({"amount": amount, "timestamp": ts, "repaid": bool(repaid)})
+                self._loans[strategy].append({
+                    "amount": amount, "timestamp": ts, "repaid": bool(repaid)
+                })
+            # 一致性校验：未还借贷不应远超弹药库余额
+            outstanding = sum(
+                loan["amount"] for loans in self._loans.values()
+                for loan in loans if not loan["repaid"]
+            )
+            if outstanding > self._ammo_balance * self.MAX_OUTSTANDING_LOAN_BALANCE_RATIO:
+                logger.critical("加载数据异常：未还借贷总额 %.4f 超过弹药库余额 %.4f 的 %.1f 倍",
+                                outstanding, self._ammo_balance, self.MAX_OUTSTANDING_LOAN_BALANCE_RATIO)
+            if outstanding > self._ammo_balance and self._ammo_balance > 0:
+                logger.warning("加载数据：未还借贷总额 %.4f 已超过弹药库余额 %.4f", outstanding, self._ammo_balance)
         except Exception as e:
             logger.error(f"加载状态失败: {e}")
 
     def _persist_balance(self) -> None:
-        """持久化余额与峰值权益（需在锁内调用）"""
+        """持久化余额、峰值权益与借贷记录（IMMEDIATE 事务保护，需在锁内调用）"""
         if self._db_conn is None:
-            logger.warning("数据库不可用，弹药库余额未持久化，重启后可能丢失")
+            logger.warning("数据库不可用，弹药库状态未持久化，重启后可能丢失")
             return
         try:
+            # 使用 BEGIN IMMEDIATE 获取写锁，防止并发写入冲突
+            self._db_conn.execute("BEGIN IMMEDIATE")
             self._db_conn.execute(
                 "INSERT OR REPLACE INTO ammo_state (key, value) VALUES ('balance', ?)",
                 (str(self._ammo_balance),)
@@ -574,9 +672,22 @@ class ProfitReinvestment:
                 "INSERT OR REPLACE INTO ammo_state (key, value) VALUES ('peak_equity', ?)",
                 (str(self._peak_equity),)
             )
+            # 持久化借贷记录：先清空再重新写入（事务内）
+            self._db_conn.execute("DELETE FROM loan_records")
+            for strategy, loans in self._loans.items():
+                for loan in loans:
+                    self._db_conn.execute(
+                        "INSERT INTO loan_records (strategy, amount, timestamp, repaid) "
+                        "VALUES (?, ?, ?, ?)",
+                        (strategy, loan["amount"], loan["timestamp"], int(loan["repaid"]))
+                    )
             self._db_conn.commit()
         except Exception as e:
-            logger.error(f"持久化余额失败: {e}")
+            logger.error(f"持久化状态失败: {e} #RECOVERY: 检查数据库文件完整性")
+            try:
+                self._db_conn.rollback()
+            except Exception:
+                pass
 
     def _notify_ammo_event(self, event_type: str, amount: float, signal_score: float = 0.0) -> None:
         """发布弹药库事件"""
@@ -599,4 +710,4 @@ class ProfitReinvestment:
                 self._db_conn.close()
                 logger.debug("数据库连接已关闭")
             except Exception as e:
-                logger.warning(f"关闭数据库连接异常: {e}")
+                logger.warning(f"关闭数据库连接
