@@ -10,13 +10,16 @@
 - core.perception.visual_cortex.VisualCortex : 获取当前 M12 方向、距离分区与质量评分
 - core.risk_monitor.circuit_breaker.CircuitBreaker : 检查是否处于熔断冷却期
 - core.risk_monitor.fragility_index_calculator.FragilityIndexCalculator : 获取当前脆弱性指数与波动率分位
-- core.account_ledger.AccountLedger : 查询账户保证金率、可用保证金与强平价格
+- core.account_ledger.AccountLedger : 查询账户保证金率、可用保证金、强平价格、风险预算与权益
+- core.position_snapshot.PositionSnapshot : 系统重启时恢复冷却记录与 K 线序号
+- core.symbol_mapper.SymbolMapper : 获取交易对合约规格（最小变动单位、最大杠杆倍数）
 - core.negotiation_bus.NegotiationBus : 发出加仓协商请求，获取风控与执行模块的约束反馈
 - core.behavioral_logger.BehavioralLogger : 记录加仓决策与异常事件
 
 接口契约：
 - evaluate_add_position(symbol: str, direction: int, current_position: float, avg_entry: float,
-    current_price: float, current_atr: float, timestamp: float, bar_duration_seconds: int = 60) -> Dict[str, Any]
+    current_price: float, current_atr: float, timestamp: float, current_bar_index: int,
+    bar_duration_seconds: int = 60) -> Dict[str, Any]
   主入口：执行完整加仓评估流程，返回是否可加仓、仓位倍数与决策依据
 - evaluate_post_add_behavior(...) -> Dict[str, Any]：加仓后行为评估（反向速裁 + 僵持防护）
 - health_check() -> Dict[str, Any] : 模块自检
@@ -24,20 +27,23 @@
 
 异常与降级：
 - 当 ProfitCompression 不可用时，跳过紧缩利润校验，并标记 "degraded" 状态
-- 当 AccountLedger 不可用时，使用类常量 DEFAULT_MARGIN_SAFETY_FACTOR 进行保守估算
+- 当 AccountLedger 不可用时，使用缓存权益 × 1% 作为保守风险预算，缓存超过 1 小时则使用硬底线
 - 当 VisualCortex 不可用时，使用保守趋势评分 DEFAULT_CONSERVATIVE_TREND_SCORE
+- 当 SymbolMapper 不可用时，使用默认杠杆 5 倍与默认最小变动单位 0.0
+- 系统重启时从 PositionSnapshot 恢复冷却记录与 K 线序号
 - 所有降级值在类常量区明确声明
 
 资源管理：
 - 本模块不持有任何需要手动释放的资源
 - 依赖的外部模块由调用方管理生命周期
-- 冷却时间戳字典定期清理过期记录，防止内存泄漏
+- 冷却记录字典定期清理超过 24 小时未更新的记录，防止内存泄漏
+- 权益缓存附带时间戳，超时自动失效
 """
 
 import time
 import logging
 import threading
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -63,13 +69,16 @@ class AddPositionManager:
     DEFAULT_MAX_ADD_MULT = 1.5             # 最大加仓倍数，无量纲，[1.2, 2.0]
     DEFAULT_MIN_ADD_MULT = 0.3             # 最小加仓倍数，无量纲，[0.1, 0.5]
 
-    # 反向速裁参数
+    # 反向速裁参数（非对称阈值）
     DEFAULT_REVERSAL_MICRO_SEC = 3         # 微反向判定时间窗口，秒，[1, 5]
     DEFAULT_REVERSAL_MEDIUM_SEC = 10       # 中反向判定时间窗口，秒，[5, 15]
     DEFAULT_REVERSAL_STRONG_SEC = 20       # 强反向判定时间窗口，秒，[15, 30]
-    DEFAULT_MICRO_PRICE_PCT = 0.0015       # 微反向价格阈值（%），无量纲，[0.001, 0.003]
-    DEFAULT_MEDIUM_PRICE_PCT = 0.003       # 中反向价格阈值（%），无量纲，[0.002, 0.005]
-    DEFAULT_STRONG_PRICE_PCT = 0.005       # 强反向价格阈值（%），无量纲，[0.004, 0.008]
+    # 多头持仓对下跌更敏感（恐慌性抛售），空头持仓对上涨更敏感
+    LONG_MICRO_PRICE_PCT = 0.0010          # 多头微反向阈值，无量纲，[0.0005, 0.002]
+    LONG_MEDIUM_PRICE_PCT = 0.0020         # 多头中反向阈值，无量纲，[0.001, 0.004]
+    SHORT_MICRO_PRICE_PCT = 0.0015         # 空头微反向阈值，无量纲，[0.0008, 0.003]
+    SHORT_MEDIUM_PRICE_PCT = 0.0030        # 空头中反向阈值，无量纲，[0.0015, 0.005]
+    DEFAULT_STRONG_PRICE_PCT = 0.005       # 强反向价格阈值（多空通用），无量纲，[0.004, 0.008]
 
     # 僵持防护参数
     DEFAULT_STAGNANT_WINDOW_SEC = 10       # 僵持判定窗口，秒，[5, 20]
@@ -79,9 +88,12 @@ class AddPositionManager:
     # 降级默认值
     DEFAULT_MARGIN_SAFETY_FACTOR = 0.8     # 保证金安全系数（当 AccountLedger 不可用时），无量纲，[0.7, 0.9]
     DEFAULT_CONSERVATIVE_TREND_SCORE = 0.4 # 保守趋势评分（当感知模块不可用时），无量纲，[0.2, 0.5]
-    DEFAULT_RISK_BUDGET_FALLBACK = 5000.0  # 降级风险预算（USD），当 AccountLedger 不可用时，[1000, 50000]
+    DEFAULT_RISK_BUDGET_FALLBACK = 5000.0  # 硬底线风险预算（USD），当缓存权益也失效时使用，[1000, 50000]
+    DEFAULT_CACHED_EQUITY_MAX_AGE_SEC = 3600  # 缓存权益最大有效期，秒，[600, 7200]
+    DEFAULT_CONSERVATIVE_EQUITY_PCT = 0.01 # 缓存权益的保守风险比例，无量纲，[0.005, 0.02]
     DEFAULT_MAX_COOLDOWN_AGE_SEC = 86400   # 冷却记录最大保留时间，秒，[3600, 172800]
     DEFAULT_MIN_QTY_STEP = 0.0             # 最小合约变动单位，默认 0 表示不裁剪
+    DEFAULT_MAX_LEVERAGE = 5               # 默认最大杠杆倍数，无量纲，[2, 20]
 
     # 标准化动作枚举
     ACTION_HOLD = "hold"
@@ -97,17 +109,28 @@ class AddPositionManager:
         self._circuit_breaker = None
         self._fragility_calculator = None
         self._account_ledger = None
+        self._symbol_mapper = None
+        self._position_snapshot = None
         self._negotiation_bus = None
         self._behavioral_logger = None
 
-        # 线程安全（保护加仓冷却时间戳等共享状态）
+        # 线程安全（保护加仓冷却时间戳、K 线序号、权益缓存等共享状态）
         self._lock = threading.Lock()
-        # 记录每个品种和方向的最后加仓时间，用于冷却校验
+        # 记录每个品种和方向的最后加仓 K 线序号（用于冷却校验，系统重启时从快照恢复）
+        self._last_add_bar_indices: Dict[str, int] = {}
+        # 记录每个品种和方向的最后加仓时间戳（用于过期清理）
         self._last_add_timestamps: Dict[str, float] = {}
+
         # K 线周期秒数（默认 60，由外部注入）
         self._bar_duration_seconds = 60
-        # 最小变动单位（由 symbol_mapper 或合约规格注入）
+        # 最小变动单位（由 SymbolMapper 注入）
         self._min_qty_step = 0.0
+        # 最大杠杆倍数（由 SymbolMapper 注入）
+        self._max_leverage = self.DEFAULT_MAX_LEVERAGE
+
+        # 权益缓存（AccountLedger 不可用时的降级数据源）
+        self._cached_equity = 0.0
+        self._cached_equity_timestamp = 0.0
 
         logger.info("[AddPosition] AddPositionManager 初始化完成")
 
@@ -119,10 +142,13 @@ class AddPositionManager:
         circuit_breaker: Optional[Any] = None,
         fragility_calculator: Optional[Any] = None,
         account_ledger: Optional[Any] = None,
+        symbol_mapper: Optional[Any] = None,
+        position_snapshot: Optional[Any] = None,
         negotiation_bus: Optional[Any] = None,
         behavioral_logger: Optional[Any] = None,
         bar_duration_seconds: int = 60,
-        min_qty_step: float = 0.0,
+        min_qty_step: float = -1.0,
+        max_leverage: int = 0,
     ) -> None:
         """注入外部依赖（可选注入，未注入时对应功能降级）"""
         self._profit_compression = profit_compression
@@ -130,17 +156,43 @@ class AddPositionManager:
         self._circuit_breaker = circuit_breaker
         self._fragility_calculator = fragility_calculator
         self._account_ledger = account_ledger
+        self._symbol_mapper = symbol_mapper
+        self._position_snapshot = position_snapshot
         self._negotiation_bus = negotiation_bus
         self._behavioral_logger = behavioral_logger
         self._bar_duration_seconds = bar_duration_seconds
-        self._min_qty_step = min_qty_step
+
+        # 合约规格
+        if min_qty_step > 0:
+            self._min_qty_step = min_qty_step
+        elif min_qty_step == 0.0:
+            logger.warning("[AddPosition] min_qty_step 为 0.0，精度裁剪未启用，订单可能被交易所拒绝")
+        else:
+            logger.warning("[AddPosition] min_qty_step 未注入，精度裁剪未启用")
+
+        if max_leverage > 0:
+            self._max_leverage = max_leverage
+        else:
+            logger.warning("[AddPosition] max_leverage 未注入，使用默认 %d 倍杠杆", self.DEFAULT_MAX_LEVERAGE)
+
+        # 系统重启时从快照恢复冷却记录
+        if position_snapshot is not None and hasattr(position_snapshot, 'get_add_cooldown_data'):
+            try:
+                cooldown_data = position_snapshot.get_add_cooldown_data()
+                if cooldown_data:
+                    with self._lock:
+                        self._last_add_bar_indices = cooldown_data.get("bar_indices", {})
+                        self._last_add_timestamps = cooldown_data.get("timestamps", {})
+                    logger.info("[AddPosition] 从快照恢复冷却记录: %d 条", len(self._last_add_bar_indices))
+            except Exception as e:
+                logger.warning("[AddPosition] 快照恢复失败: %s", e)
 
         if not profit_compression:
             logger.warning("[AddPosition] ProfitCompression 未注入，紧缩利润校验降级")
         if not visual_cortex:
             logger.warning("[AddPosition] VisualCortex 未注入，M12 与趋势校验降级")
         if not account_ledger:
-            logger.warning("[AddPosition] AccountLedger 未注入，保证金预检降级为保守估算")
+            logger.warning("[AddPosition] AccountLedger 未注入，保证金预检与风险预算降级为保守估算")
         if not negotiation_bus:
             logger.warning("[AddPosition] NegotiationBus 未注入，协商降级为本地决策")
 
@@ -154,6 +206,7 @@ class AddPositionManager:
         current_price: float,
         current_atr: float,
         timestamp: float,
+        current_bar_index: int,
         bar_duration_seconds: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
@@ -167,6 +220,7 @@ class AddPositionManager:
             current_price: 当前价格
             current_atr: 当前 ATR 值
             timestamp: 当前时间戳
+            current_bar_index: 当前 K 线序号
             bar_duration_seconds: K 线周期秒数，可选，默认使用注入值或 60
 
         Returns:
@@ -180,8 +234,7 @@ class AddPositionManager:
             "checks": {},
         }
 
-        # 使用传入的 K 线周期或已注入的值
-        effective_bar_seconds = bar_duration_seconds if bar_duration_seconds is not None else self._bar_duration_seconds
+        key = self._get_key(symbol, direction)
 
         # 1. 快速熔断检查
         if self._circuit_breaker is not None and hasattr(self._circuit_breaker, 'is_frozen'):
@@ -201,7 +254,7 @@ class AddPositionManager:
         # 2. 七维校验
         checks = self._run_seven_dimension_checks(
             symbol, direction, current_position, avg_entry, current_price,
-            current_atr, timestamp, effective_bar_seconds,
+            current_atr, current_bar_index, key,
         )
         failed_checks = [k for k, v in checks.items() if not v.get("passed", False)]
         data["checks"] = checks
@@ -213,10 +266,23 @@ class AddPositionManager:
                 "warnings": warnings,
             }
 
-        # 3. 四维仓位计算
-        add_multiplier = self._calc_add_multiplier(current_position, avg_entry, current_price, current_atr)
+        # 3. 七维校验通过后立即更新冷却 K 线序号（防止同一根 K 线内重复评估）
+        with self._lock:
+            self._last_add_bar_indices[key] = current_bar_index
+            self._last_add_timestamps[key] = timestamp
 
-        # 4. 保证金预检
+        # 4. 四维仓位计算
+        add_multiplier = self._calc_add_multiplier(current_position, avg_entry, current_price, current_atr)
+        if add_multiplier <= 0:
+            data["add_multiplier"] = 0.0
+            return {
+                "status": "ok",
+                "reason": "加仓倍数计算结果为零，取消加仓",
+                "data": data,
+                "warnings": warnings + ["zero_multiplier"],
+            }
+
+        # 5. 保证金预检
         if not self._check_margin(symbol, direction, current_position * add_multiplier, current_price):
             data["add_multiplier"] = add_multiplier
             return {
@@ -226,14 +292,11 @@ class AddPositionManager:
                 "warnings": warnings + ["margin_insufficient"],
             }
 
-        # 5. 清理过期冷却记录
+        # 6. 清理过期冷却记录
         self._purge_stale_timestamps(timestamp)
 
-        # 6. 更新冷却时间
-        with self._lock:
-            self._last_add_timestamps[self._get_key(symbol, direction)] = timestamp
-
         add_size = current_position * add_multiplier
+
         # 7. 合约精度裁剪
         if self._min_qty_step > 0:
             add_size = round(add_size / self._min_qty_step) * self._min_qty_step
@@ -242,7 +305,7 @@ class AddPositionManager:
                     "status": "ok",
                     "reason": "加仓量经精度裁剪后为零，取消加仓",
                     "data": data,
-                    "warnings": warnings + ["qty_step_too_small"],
+                    "warnings": warnings + ["qty_step_zero"],
                 }
 
         data["add_allowed"] = True
@@ -250,8 +313,8 @@ class AddPositionManager:
         data["add_size"] = add_size
 
         logger.info(
-            "[AddPosition] 加仓通过: symbol=%s, dir=%d, multiplier=%.3f, size=%.4f, price=%.2f",
-            symbol, direction, add_multiplier, add_size, current_price
+            "[AddPosition] 加仓通过: symbol=%s, dir=%d, bar=%d, multiplier=%.3f, size=%.4f",
+            symbol, direction, current_bar_index, add_multiplier, add_size
         )
 
         return {
@@ -272,7 +335,7 @@ class AddPositionManager:
         current_atr: float,
     ) -> Dict[str, Any]:
         """
-        加仓后行为评估（反向速裁 + 僵持防护）
+        加仓后行为评估（反向速裁 + 僵持防护），阈值根据持仓方向非对称
 
         Args:
             symbol: 交易对
@@ -309,8 +372,16 @@ class AddPositionManager:
                 "warnings": [],
             }
 
+        # 非对称阈值：多头对下跌更敏感，空头对上涨更敏感
+        if direction == 1:
+            micro_pct = self.LONG_MICRO_PRICE_PCT
+            medium_pct = self.LONG_MEDIUM_PRICE_PCT
+        else:
+            micro_pct = self.SHORT_MICRO_PRICE_PCT
+            medium_pct = self.SHORT_MEDIUM_PRICE_PCT
+
         # 微反向
-        if elapsed <= self.DEFAULT_REVERSAL_MICRO_SEC and price_change_pct >= self.DEFAULT_MICRO_PRICE_PCT:
+        if elapsed <= self.DEFAULT_REVERSAL_MICRO_SEC and price_change_pct >= micro_pct:
             return {
                 "status": "ok",
                 "reason": "加仓后微反向，收紧止损",
@@ -318,14 +389,14 @@ class AddPositionManager:
                 "warnings": ["micro_reversal"],
             }
         # 中反向
-        if elapsed <= self.DEFAULT_REVERSAL_MEDIUM_SEC and price_change_pct >= self.DEFAULT_MEDIUM_PRICE_PCT:
+        if elapsed <= self.DEFAULT_REVERSAL_MEDIUM_SEC and price_change_pct >= medium_pct:
             return {
                 "status": "ok",
                 "reason": "加仓后中反向，平掉加仓部分",
                 "data": {"action": self.ACTION_CLOSE_ADDED_ONLY},
                 "warnings": ["medium_reversal"],
             }
-        # 强反向
+        # 强反向（多空通用阈值）
         if elapsed <= self.DEFAULT_REVERSAL_STRONG_SEC and price_change_pct >= self.DEFAULT_STRONG_PRICE_PCT:
             return {
                 "status": "ok",
@@ -343,15 +414,17 @@ class AddPositionManager:
 
     # ========== 健康检查 ==========
     def health_check(self) -> Dict[str, Any]:
-        """模块自检"""
+        """模块自检，对关键依赖执行端到端验证"""
         try:
             deps_health = {
                 "profit_compression": self._profit_compression is not None,
                 "visual_cortex": self._visual_cortex is not None,
-                "account_ledger": self._account_ledger is not None,
                 "circuit_breaker": self._circuit_breaker is not None,
+                "account_ledger": self._account_ledger is not None,
+                "symbol_mapper": self._symbol_mapper is not None,
             }
-            # 对 AccountLedger 进行端到端验证
+
+            # 对 AccountLedger 执行端到端验证
             if self._account_ledger is not None and hasattr(self._account_ledger, 'health_check'):
                 try:
                     ledger_hc = self._account_ledger.health_check()
@@ -360,8 +433,18 @@ class AddPositionManager:
                 except Exception as e:
                     deps_health["account_ledger"] = f"health_check 异常: {str(e)}"
 
+            # 验证 AccountLedger 的 get_risk_budget 方法真实可用性
+            if self._account_ledger is not None and hasattr(self._account_ledger, 'get_risk_budget'):
+                try:
+                    budget = self._account_ledger.get_risk_budget()
+                    if budget <= 0:
+                        deps_health["account_ledger"] = f"风险预算异常: {budget}"
+                except Exception as e:
+                    deps_health["account_ledger"] = f"get_risk_budget 异常: {str(e)}"
+
             with self._lock:
-                cooldown_count = len(self._last_add_timestamps)
+                cooldown_count = len(self._last_add_bar_indices)
+                timestamps_count = len(self._last_add_timestamps)
 
             return {
                 "status": "ok",
@@ -369,6 +452,10 @@ class AddPositionManager:
                 "data": {
                     "dependencies": deps_health,
                     "cooldown_record_count": cooldown_count,
+                    "timestamp_record_count": timestamps_count,
+                    "min_qty_step": self._min_qty_step,
+                    "max_leverage": self._max_leverage,
+                    "cached_equity": self._cached_equity,
                 },
                 "warnings": [],
             }
@@ -379,7 +466,7 @@ class AddPositionManager:
     # ========== 私有方法 ==========
     def _run_seven_dimension_checks(
         self, symbol, direction, current_position, avg_entry,
-        current_price, current_atr, timestamp, bar_seconds,
+        current_price, current_atr, current_bar_index, key,
     ) -> Dict[str, Any]:
         """执行七维前置校验，返回各维度通过情况"""
         checks = {}
@@ -420,14 +507,13 @@ class AddPositionManager:
             "value": trend_score
         }
 
-        # 4. 加仓冷却计时
+        # 4. 加仓冷却计时（基于 K 线序号，非 wall clock 秒数）
         with self._lock:
-            last_add = self._last_add_timestamps.get(self._get_key(symbol, direction), 0)
-        required_cooldown = self.DEFAULT_COOLDOWN_BARS * bar_seconds
-        cooldown_ok = (timestamp - last_add) >= required_cooldown
+            last_bar = self._last_add_bar_indices.get(key, -999)
+        cooldown_ok = (current_bar_index - last_bar) >= self.DEFAULT_COOLDOWN_BARS
         checks["cooldown"] = {
             "passed": cooldown_ok,
-            "value": f"距上次加仓 {timestamp - last_add:.0f}s, 需要 {required_cooldown}s"
+            "value": f"当前 K 线: {current_bar_index}, 上次加仓 K 线: {last_bar}, 需要间隔: {self.DEFAULT_COOLDOWN_BARS}"
         }
 
         # 5. 波动率适宜度
@@ -457,14 +543,18 @@ class AddPositionManager:
             checks["m12_distance"] = {"passed": True, "reason": "降级: VisualCortex 不可用"}
 
         # 7. 总风险硬上限
-        risk_ok = current_position * current_price * 0.02 <= self._calc_risk_budget()
-        checks["total_risk"] = {"passed": risk_ok, "value": "通过" if risk_ok else "超限"}
+        risk_exposure = current_position * current_price * self.DEFAULT_MAX_RISK_BUDGET_PCT
+        risk_budget = self._calc_risk_budget()
+        risk_ok = risk_exposure <= risk_budget
+        checks["total_risk"] = {
+            "passed": risk_ok,
+            "value": f"风险敞口: {risk_exposure:.2f}, 预算: {risk_budget:.2f}"
+        }
 
         return checks
 
     def _calc_add_multiplier(self, current_position, avg_entry, current_price, current_atr) -> float:
         """四维加权计算加仓倍数"""
-        # 基础序列
         base_mult = 1.0
 
         # 趋势强度修正
@@ -501,7 +591,7 @@ class AddPositionManager:
         return multiplier
 
     def _check_margin(self, symbol, direction, position_size, price) -> bool:
-        """保证金预检"""
+        """保证金预检，使用真实杠杆率估算"""
         if self._account_ledger is not None and hasattr(self._account_ledger, 'get_margin_info'):
             try:
                 margin_info = self._account_ledger.get_margin_info(symbol, direction, position_size, price)
@@ -509,23 +599,38 @@ class AddPositionManager:
             except Exception as e:
                 logger.error("[AddPosition] 保证金查询异常: %s #RECOVERY: 检查 AccountLedger 服务", e)
 
-        # 保守估算
-        estimated_margin = position_size * price * (1.0 - self.DEFAULT_MARGIN_SAFETY_FACTOR)
+        # 保守估算：使用真实杠杆率
+        leverage = self._max_leverage if self._max_leverage > 0 else self.DEFAULT_MAX_LEVERAGE
+        estimated_margin = position_size * price / leverage
         budget = self._calc_risk_budget()
         sufficient = estimated_margin <= budget
         logger.debug(
-            "[AddPosition] 保证金估算: required=%.2f, budget=%.2f, sufficient=%s",
-            estimated_margin, budget, sufficient
+            "[AddPosition] 保证金估算: required=%.2f, budget=%.2f, leverage=%d, sufficient=%s",
+            estimated_margin, budget, leverage, sufficient
         )
         return sufficient
 
     def _calc_risk_budget(self) -> float:
-        """计算当前风险预算，若 AccountLedger 不可用则返回保守降级值"""
+        """计算当前风险预算，降级时使用缓存权益 × 保守比例"""
         if self._account_ledger is not None and hasattr(self._account_ledger, 'get_risk_budget'):
             try:
-                return self._account_ledger.get_risk_budget()
+                budget = self._account_ledger.get_risk_budget()
+                # 同时更新权益缓存
+                if hasattr(self._account_ledger, 'get_equity'):
+                    self._cached_equity = self._account_ledger.get_equity()
+                    self._cached_equity_timestamp = time.time()
+                return budget
             except Exception as e:
-                logger.warning("[AddPosition] 风险预算查询异常: %s，使用降级值", e)
+                logger.warning("[AddPosition] 风险预算查询异常: %s，尝试降级", e)
+
+        # 降级：使用缓存的权益 × 保守比例
+        if self._cached_equity > 0 and time.time() - self._cached_equity_timestamp < self.DEFAULT_CACHED_EQUITY_MAX_AGE_SEC:
+            fallback = self._cached_equity * self.DEFAULT_CONSERVATIVE_EQUITY_PCT
+            logger.debug("[AddPosition] 使用缓存权益降级: equity=%.2f, budget=%.2f", self._cached_equity, fallback)
+            return fallback
+
+        # 硬底线
+        logger.warning("[AddPosition] 所有降级数据源失效，使用硬底线 %s", self.DEFAULT_RISK_BUDGET_FALLBACK)
         return self.DEFAULT_RISK_BUDGET_FALLBACK
 
     def _purge_stale_timestamps(self, now: float) -> None:
@@ -536,7 +641,8 @@ class AddPositionManager:
                 if now - v > self.DEFAULT_MAX_COOLDOWN_AGE_SEC
             ]
             for k in stale_keys:
-                del self._last_add_timestamps[k]
+                self._last_add_timestamps.pop(k, None)
+                self._last_add_bar_indices.pop(k, None)
         if stale_keys:
             logger.debug("[AddPosition] 清理过期冷却记录: %d 条", len(stale_keys))
 
