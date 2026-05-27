@@ -25,6 +25,7 @@
 - 当 direction 无效时直接返回错误，拒绝执行，保证风控安全。
 - 当 lifecycle_stage 未知时，降级为 "maturity" 并在 warnings 中记录。
 - 所有错误返回均包含安全的止损候选值（保本价）和明确的警告信息，调用方可安全使用。
+- 止损倍数有硬性下限保护（MIN_STOP_ATR = 0.05），防止极端叠加场景下出现负数或零止损距离。
 
 资源管理：
 - 纯计算模块，无状态，无需资源管理。
@@ -46,22 +47,27 @@ class ProfitCompression:
     THRESHOLD_LARGE_PROFIT = 2.0      # 大盈阈值，浮盈/ATR，取值范围 [1.5, 3.0]
     THRESHOLD_EXTREME_PROFIT = 3.0    # 极端盈利阈值，浮盈/ATR，取值范围 [2.5, 5.0]
 
+    # 浮点比较容差，防止边界抖动导致阶段误判
+    EPSILON = 1e-9                    # 无量纲，用于 >= 比较的微容差
+
     # 各阶段止损 ATR 倍数
     STOP_ATR_MICRO = 0.6              # 微盈阶段，取值范围 [0.3, 0.8]
     STOP_ATR_MEDIUM = 0.8             # 中盈阶段，取值范围 [0.6, 1.0]
     STOP_ATR_LARGE = 0.4              # 大盈阶段，取值范围 [0.2, 0.5]
     STOP_ATR_EXTREME = 0.15           # 极端盈利阶段，取值范围 [0.1, 0.25]
 
+    # 止损倍数硬性下限，防止 M12 逆势 + 熔断叠加后出现负数或零
+    MIN_STOP_ATR = 0.05               # 最低止损 ATR 倍数，取值范围 [0.02, 0.10]
+
     # 加仓次数额外收紧系数（加仓次数越多，止损越紧）
-    # 取值含义：第 N 次加仓时，止损倍数额外乘以该系数
+    # 0-3 次使用精确映射，4 次及以上统一使用 MAX_TIGHTEN
     COMPRESSION_COUNT_TIGHTEN = {
-        0: 1.00,   # 无加仓
+        0: 1.00,   # 无加仓，不额外收紧
         1: 1.00,   # 1次加仓，暂不额外收紧
         2: 0.95,   # 2次加仓，收紧5%
         3: 0.88,   # 3次加仓，收紧12%
-        4: 0.80,   # 4次及以上，收紧20%
     }
-    COMPRESSION_COUNT_MAX_TIGHTEN = 0.80  # 最大收紧系数，用于4次及以上
+    COMPRESSION_COUNT_MAX_TIGHTEN = 0.80  # 4次及以上统一收紧20%
 
     # 熔断时加速紧缩系数
     CIRCUIT_BREAKER_ACCELERATION = 1.5  # 无量纲，取值范围 [1.2, 2.0]
@@ -159,11 +165,10 @@ class ProfitCompression:
         base_stop_atr = cls._get_base_stop_atr(stage)
 
         # 加仓次数额外收紧止损倍数（仓位越大止损越紧）
-        if compression_count >= 4:
-            base_stop_atr *= cls.COMPRESSION_COUNT_MAX_TIGHTEN
-        elif compression_count in cls.COMPRESSION_COUNT_TIGHTEN:
-            base_stop_atr *= cls.COMPRESSION_COUNT_TIGHTEN[compression_count]
-        # 否则 compression_count=0/1 保持不变
+        tighten = cls.COMPRESSION_COUNT_TIGHTEN.get(
+            compression_count, cls.COMPRESSION_COUNT_MAX_TIGHTEN
+        )
+        base_stop_atr *= tighten
 
         # M12 协同调整
         base_stop_atr += cls._get_m12_adjustment(m12_direction, direction, profit_atr_ratio)
@@ -178,6 +183,9 @@ class ProfitCompression:
             base_stop_atr *= 1.15
         elif effective_vol_pct < 30:
             base_stop_atr *= 0.85
+
+        # 硬性下限保护：防止 M12 逆势 + 熔断叠加后止损倍数变为负数或零
+        base_stop_atr = max(cls.MIN_STOP_ATR, base_stop_atr)
 
         # 计算新止损价（方向对称）
         if direction == 1:
@@ -270,7 +278,8 @@ class ProfitCompression:
     @classmethod
     def health_check(cls) -> Dict[str, Any]:
         """
-        模块自检：验证核心计算逻辑、常量完整性、降级路径、加仓加速逻辑
+        模块自检：验证核心计算逻辑、常量完整性、降级路径、加仓加速逻辑、
+        浮点边界鲁棒性、极端叠加场景下限保护
         """
         try:
             # 1. 正常多头
@@ -295,28 +304,70 @@ class ProfitCompression:
             assert res["status"] == "error", "无效方向应返回error"
             assert "invalid_direction" in res.get("warnings", []), "缺少invalid_direction标记"
 
-            # 6. 加仓加速逻辑验证：compression_count=4 且浮盈仅达 MEDIUM 时，应跳至 large
+            # 6. 加仓加速阶段跳跃验证
             stage_low = cls._determine_stage(1.0, "maturity", 0)   # 无加仓 → medium
             stage_high = cls._determine_stage(1.0, "maturity", 4)  # 4次加仓 → large
             assert stage_low == "medium", f"0次加仓应为medium，实际{stage_low}"
             assert stage_high == "large", f"4次加仓应跳至large，实际{stage_high}"
 
-            # 7. 加仓额外收紧系数验证
-            res_no_add = cls.calculate_new_stop(100.0, 102.0, 1, atr=2.0, compression_count=0)
-            res_add4 = cls.calculate_new_stop(100.0, 102.0, 1, atr=2.0, compression_count=4)
-            assert res_no_add["data"]["stop_atr_mult"] > res_add4["data"]["stop_atr_mult"], \
-                "4次加仓的止损倍数应小于0次加仓"
+            # 7. 同一阶段下加仓收紧系数精度验证（micro 阶段，profit_atr=0.6）
+            res_no_add = cls.calculate_new_stop(
+                100.0, 100.6, 1, atr=1.0, compression_count=0
+            )
+            res_add2 = cls.calculate_new_stop(
+                100.0, 100.6, 1, atr=1.0, compression_count=2
+            )
+            res_add3 = cls.calculate_new_stop(
+                100.0, 100.6, 1, atr=1.0, compression_count=3
+            )
+            res_add4 = cls.calculate_new_stop(
+                100.0, 100.6, 1, atr=1.0, compression_count=4
+            )
+            # 同一阶段（micro）下，基础倍数相同（0.6），但收紧系数不同
+            base = cls.STOP_ATR_MICRO  # 0.6
+            assert abs(res_no_add["data"]["stop_atr_mult"] - base * 1.00) < 0.01, \
+                "0次加仓收紧系数应为1.00"
+            assert abs(res_add2["data"]["stop_atr_mult"] - base * 0.95) < 0.01, \
+                "2次加仓收紧系数应为0.95"
+            assert abs(res_add3["data"]["stop_atr_mult"] - base * 0.88) < 0.01, \
+                "3次加仓收紧系数应为0.88"
+            assert abs(res_add4["data"]["stop_atr_mult"] - base * 0.80) < 0.01, \
+                "4次加仓收紧系数应为0.80"
 
-            # 8. 常量顺序验证
+            # 8. 浮点边界鲁棒性验证（EPSILON 容差）
+            exact_at_threshold = cls.THRESHOLD_MEDIUM_PROFIT
+            slightly_below = exact_at_threshold - cls.EPSILON * 0.5
+            stage_exact = cls._determine_stage(exact_at_threshold, "maturity", 0)
+            stage_slightly_below = cls._determine_stage(slightly_below, "maturity", 0)
+            assert stage_exact == "medium", \
+                f"恰好等于阈值应进入medium，实际{stage_exact}"
+            assert stage_slightly_below == "medium", \
+                f"略低于阈值（在EPSILON容差内）应仍为medium，实际{stage_slightly_below}"
+
+            # 9. 极端叠加场景下限保护验证
+            # 模拟逆势持仓 + 熔断 + 低浮盈的极端场景
+            res_extreme = cls.calculate_new_stop(
+                100.0, 100.5, 1,
+                atr=2.0,
+                m12_direction="strong_down",  # 多头但M12强向下
+                is_circuit_breaker_active=True,  # 熔断激活
+                compression_count=0,
+            )
+            assert res_extreme["data"]["stop_atr_mult"] >= cls.MIN_STOP_ATR, \
+                f"止损倍数({res_extreme['data']['stop_atr_mult']})应不低于MIN_STOP_ATR({cls.MIN_STOP_ATR})"
+
+            # 10. 常量顺序验证
             assert (cls.THRESHOLD_MICRO_PROFIT < cls.THRESHOLD_MEDIUM_PROFIT
                     < cls.THRESHOLD_LARGE_PROFIT < cls.THRESHOLD_EXTREME_PROFIT), \
                 "紧缩阈值必须递增"
             assert (0 < cls.STOP_ATR_EXTREME < cls.STOP_ATR_LARGE
                     < cls.STOP_ATR_MEDIUM), "止损倍数必须递减"
+            assert cls.MIN_STOP_ATR > 0, "MIN_STOP_ATR 必须为正数"
+            assert cls.EPSILON > 0, "EPSILON 必须为正数"
 
             return {
                 "status": "ok",
-                "reason": "ProfitCompression 全部自检通过（含加仓加速验证）",
+                "reason": "ProfitCompression 全部自检通过（含浮点鲁棒性、系数精度、极端叠加验证）",
                 "data": {
                     "thresholds": {
                         "micro": cls.THRESHOLD_MICRO_PROFIT,
@@ -331,6 +382,9 @@ class ProfitCompression:
                         "extreme": cls.STOP_ATR_EXTREME,
                     },
                     "compression_tighten": cls.COMPRESSION_COUNT_TIGHTEN,
+                    "max_tighten": cls.COMPRESSION_COUNT_MAX_TIGHTEN,
+                    "min_stop_atr": cls.MIN_STOP_ATR,
+                    "epsilon": cls.EPSILON,
                 },
                 "warnings": [],
             }
@@ -345,9 +399,13 @@ class ProfitCompression:
 
     # ========== 私有方法 ==========
     @classmethod
-    def _determine_stage(cls, profit_atr_ratio: float, lifecycle_stage: str, compression_count: int) -> str:
+    def _determine_stage(
+        cls, profit_atr_ratio: float, lifecycle_stage: str, compression_count: int
+    ) -> str:
         """
         根据浮盈幅度、生命周期阶段和加仓次数确定紧缩阶段
+
+        使用 EPSILON 容差防止浮点精度导致的边界抖动。
 
         Args:
             profit_atr_ratio: 浮盈 / ATR
@@ -357,36 +415,38 @@ class ProfitCompression:
         Returns:
             紧缩阶段字符串: micro/medium/large/extreme
         """
+        eps = cls.EPSILON
+
         # 孵化期始终为 micro，不因加仓加速
         if lifecycle_stage == "incubation":
             return "micro"
 
         # 加仓次数越多，跳过微盈阶段，更快进入激进紧缩
         if compression_count >= 4:
-            if profit_atr_ratio >= cls.THRESHOLD_LARGE_PROFIT:
+            if profit_atr_ratio >= cls.THRESHOLD_LARGE_PROFIT - eps:
                 return "extreme"
-            if profit_atr_ratio >= cls.THRESHOLD_MEDIUM_PROFIT:
+            if profit_atr_ratio >= cls.THRESHOLD_MEDIUM_PROFIT - eps:
                 return "large"
             return "medium"
         if compression_count >= 2:
-            if profit_atr_ratio >= cls.THRESHOLD_LARGE_PROFIT:
+            if profit_atr_ratio >= cls.THRESHOLD_LARGE_PROFIT - eps:
                 return "extreme"
-            if profit_atr_ratio >= cls.THRESHOLD_MEDIUM_PROFIT:
+            if profit_atr_ratio >= cls.THRESHOLD_MEDIUM_PROFIT - eps:
                 return "large"
-            if profit_atr_ratio >= cls.THRESHOLD_MICRO_PROFIT:
+            if profit_atr_ratio >= cls.THRESHOLD_MICRO_PROFIT - eps:
                 return "medium"
             return "micro"
 
         # 标准逻辑（无加仓或仅1次加仓）
-        if profit_atr_ratio >= cls.THRESHOLD_EXTREME_PROFIT:
+        if profit_atr_ratio >= cls.THRESHOLD_EXTREME_PROFIT - eps:
             return "extreme"
-        if profit_atr_ratio >= cls.THRESHOLD_LARGE_PROFIT:
+        if profit_atr_ratio >= cls.THRESHOLD_LARGE_PROFIT - eps:
             return "large"
-        if profit_atr_ratio >= cls.THRESHOLD_MEDIUM_PROFIT:
+        if profit_atr_ratio >= cls.THRESHOLD_MEDIUM_PROFIT - eps:
             return "medium"
-        if profit_atr_ratio >= cls.THRESHOLD_MICRO_PROFIT:
+        if profit_atr_ratio >= cls.THRESHOLD_MICRO_PROFIT - eps:
             return "micro"
-        return "micro"  # 浮亏或微利均为 micro
+        return "micro"
 
     @classmethod
     def _get_base_stop_atr(cls, stage: str) -> float:
@@ -400,7 +460,9 @@ class ProfitCompression:
         return stage_map.get(stage, cls.STOP_ATR_MICRO)
 
     @classmethod
-    def _get_m12_adjustment(cls, m12_direction: str, position_direction: int, profit_atr_ratio: float) -> float:
+    def _get_m12_adjustment(
+        cls, m12_direction: str, position_direction: int, profit_atr_ratio: float
+    ) -> float:
         """
         根据 M12 方向计算紧缩阈值的调整量
 
@@ -412,14 +474,13 @@ class ProfitCompression:
         Returns:
             ATR 倍数调整量（正数为延迟紧缩，负数为加速紧缩）
         """
-        # 判断持仓是否顺势
         is_aligned = (
-            (position_direction == 1 and m12_direction in ("strong_up", "weak_up")) or
-            (position_direction == -1 and m12_direction in ("strong_down", "weak_down"))
+            (position_direction == 1 and m12_direction in ("strong_up", "weak_up"))
+            or (position_direction == -1 and m12_direction in ("strong_down", "weak_down"))
         )
         is_counter = (
-            (position_direction == 1 and m12_direction in ("strong_down", "weak_down")) or
-            (position_direction == -1 and m12_direction in ("strong_up", "weak_up"))
+            (position_direction == 1 and m12_direction in ("strong_down", "weak_down"))
+            or (position_direction == -1 and m12_direction in ("strong_up", "weak_up"))
         )
 
         if is_counter:
