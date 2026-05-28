@@ -28,7 +28,9 @@
 
 import logging
 import threading
+import time
 from typing import Dict, Any, List, Tuple, Optional
+from collections import deque
 from enum import IntEnum
 
 logger = logging.getLogger(__name__)
@@ -65,7 +67,7 @@ class ConflictArbiter:
         ArbitrationPriority.SURVIVAL: "C++硬实时风控",
     }
 
-    def __init__(self):
+    def __init__(self, config: Optional[Dict[str, Any]] = None):
         # 统计信息（线程安全）
         self._stats_lock = threading.Lock()
         self._arbitration_count = 0
@@ -81,14 +83,15 @@ class ConflictArbiter:
         # 外部依赖注入
         self._behavioral_logger = None
 
+        # 从配置加载优先级顺序（支持动态扩展）
+        self._priority_chain = self._load_priority_chain(config)
+
         logger.info(
-            "ConflictArbiter 初始化完成，优先级链: SURVIVAL(%d) > RISK(%d) > PROFIT(%d) > EXECUTION(%d) > EVOLUTION(%d) > STRATEGY(%d)",
-            ArbitrationPriority.SURVIVAL.value,
-            ArbitrationPriority.RISK.value,
-            ArbitrationPriority.PROFIT_COMPRESSION.value,
-            ArbitrationPriority.EXECUTION.value,
-            ArbitrationPriority.EVOLUTION.value,
-            ArbitrationPriority.STRATEGY.value,
+            "ConflictArbiter 初始化完成，优先级链: %s",
+            " > ".join(
+                f"{self.PRIORITY_MODULE_MAP.get(p, '未知')}({p.value})"
+                for p in self._priority_chain
+            ),
         )
 
     # ========== 依赖注入 ==========
@@ -121,9 +124,9 @@ class ConflictArbiter:
         Returns:
             标准响应字典，data 中包含 final_allowed, final_size_pct, preferred_method, reason 等字段
         """
-        import time
         start_time = time.perf_counter()
-        warnings = []
+        warnings: List[str] = []
+        adjustment_log: List[Dict[str, Any]] = []
 
         # 参数校验
         pulse_id = getattr(pulse, 'pulse_id', 'unknown') if pulse is not None else 'unknown'
@@ -131,22 +134,27 @@ class ConflictArbiter:
 
         if pulse is None:
             logger.error("pulse 为 None #RECOVERY: 检查协商总线信号生成逻辑")
-            return self._conservative_result("pulse 为空，采用保守默认值", warnings, pulse_id="unknown")
+            return self._conservative_result(
+                "pulse 为空，采用保守默认值", warnings, adjustment_log, pulse_id="unknown"
+            )
 
         if not constraints:
             logger.warning(f"constraints 列表为空，pulse_id={pulse_id}")
-            return self._conservative_result("无约束响应，采用保守默认值", warnings, pulse_id=pulse_id, intent_type=intent_type)
+            return self._conservative_result(
+                "无约束响应，采用保守默认值", warnings, adjustment_log, pulse_id=pulse_id, intent_type=intent_type
+            )
 
         try:
             # 获取脉冲基本信息
             desired_size = getattr(pulse, 'desired_size_pct', 0.0)
 
-            # 1. 按优先级从高到低排序约束（内部自动过滤无效元素）
-            sorted_constraints = self._sort_by_priority(constraints)
+            # 1. 按优先级从高到低排序并去重约束
+            sorted_constraints = self._sort_by_priority(constraints, pulse_id)
             if not sorted_constraints:
                 logger.warning(f"有效约束为空，pulse_id={pulse_id}，采用保守默认值")
                 return self._conservative_result(
-                    "有效约束列表为空，无法进行仲裁", warnings, pulse_id=pulse_id, intent_type=intent_type
+                    "有效约束列表为空，无法进行仲裁", warnings, adjustment_log, pulse_id=pulse_id,
+                    intent_type=intent_type
                 )
 
             # 2. 逐层应用约束
@@ -154,11 +162,22 @@ class ConflictArbiter:
             final_size = desired_size
             final_method = "market_order"  # 默认市价单
             final_reason = "初始状态"
-            adjustment_log = []
 
             for constraint in sorted_constraints:
                 priority = self._get_constraint_priority(constraint)
                 module_name = self.PRIORITY_MODULE_MAP.get(priority, "未知模块")
+
+                # 记录每个约束的完整快照（用于审计，附带时间戳）
+                constraint_snapshot = {
+                    "module": module_name,
+                    "priority": priority.name,
+                    "priority_value": priority.value,
+                    "allowed": constraint.allowed,
+                    "allowed_size_pct": getattr(constraint, 'allowed_size_pct', None),
+                    "reason": constraint.adjustment_reason,
+                    "timestamp": time.time(),
+                }
+                adjustment_log.append(constraint_snapshot)
 
                 # 生存级约束：无条件覆盖
                 if priority == ArbitrationPriority.SURVIVAL:
@@ -168,14 +187,12 @@ class ConflictArbiter:
                         final_allowed = False
                         final_size = 0.0
                         final_reason = f"[SURVIVAL] {module_name} 触发生存级否决: {constraint.adjustment_reason}"
-                        adjustment_log.append(final_reason)
                         logger.warning(f"生存级否决: pulse_id={pulse_id}, {final_reason}")
                         break
 
                     if constraint.allowed_size_pct is not None:
                         final_size = min(final_size, constraint.allowed_size_pct)
                         final_reason = f"[SURVIVAL] {module_name} 允许，上限={final_size:.4%}"
-                        adjustment_log.append(final_reason)
                     continue
 
                 # 风控约束：不可被策略覆盖
@@ -186,14 +203,12 @@ class ConflictArbiter:
                         final_allowed = False
                         final_size = 0.0
                         final_reason = f"[RISK] {module_name} 否决: {constraint.adjustment_reason}"
-                        adjustment_log.append(final_reason)
                         logger.info(f"风控否决: pulse_id={pulse_id}, {constraint.adjustment_reason}")
                         break
 
                     if constraint.allowed_size_pct is not None:
                         final_size = min(final_size, constraint.allowed_size_pct)
                         final_reason = f"[RISK] {module_name} 限制仓位上限={final_size:.4%}"
-                        adjustment_log.append(final_reason)
                     if constraint.preferred_method:
                         final_method = constraint.preferred_method
                     continue
@@ -207,15 +222,17 @@ class ConflictArbiter:
                         if compression_stage == "large_profit":
                             final_size *= self.DEFAULT_COMPRESSION_LARGE_PROFIT
                             final_reason = f"[PROFIT] 大盈阶段，加仓仓位缩减至 {final_size:.4%}"
-                            adjustment_log.append(final_reason)
                             logger.debug(f"紧缩利润联动: pulse_id={pulse_id}, 大盈阶段缩减")
                             warnings.append("suggest_extended_stop_buffer")
+                            if final_size < 0.001:
+                                warnings.append("final_size_may_be_below_min_order_qty")
                         elif compression_stage == "extreme":
                             final_size *= self.DEFAULT_COMPRESSION_EXTREME
                             final_reason = f"[PROFIT] 极端紧缩阶段，仓位缩减至 {final_size:.4%}"
-                            adjustment_log.append(final_reason)
                             logger.debug(f"紧缩利润联动: pulse_id={pulse_id}, 极端紧缩阶段缩减")
                             warnings.append("suggest_extended_stop_buffer")
+                            if final_size < 0.001:
+                                warnings.append("final_size_may_be_below_min_order_qty")
                     continue
 
                 # 执行能力反馈
@@ -242,7 +259,6 @@ class ConflictArbiter:
                 if priority == ArbitrationPriority.STRATEGY:
                     if final_reason == "初始状态":
                         final_reason = f"[STRATEGY] 策略期望仓位={final_size:.4%}"
-                        adjustment_log.append(final_reason)
                     continue
 
             # 3. 组装最终结果
@@ -284,9 +300,11 @@ class ConflictArbiter:
             }
 
         except Exception as e:
-            logger.error(f"仲裁异常: {e} #RECOVERY: 检查 NeuroPulse/NeuroConstraint 结构完整性，已回退保守默认值")
+            logger.error(
+                f"仲裁异常: {e} #RECOVERY: 检查 NeuroPulse/NeuroConstraint 结构完整性，已回退保守默认值"
+            )
             return self._conservative_result(
-                f"仲裁异常: {str(e)}", warnings, pulse_id=pulse_id, intent_type=intent_type
+                f"仲裁异常: {str(e)}", warnings, adjustment_log, pulse_id=pulse_id, intent_type=intent_type
             )
 
     def batch_arbitrate(
@@ -350,20 +368,18 @@ class ConflictArbiter:
             标准健康检查响应字典
         """
         try:
-            expected_order = [
-                ArbitrationPriority.SURVIVAL,
-                ArbitrationPriority.RISK,
-                ArbitrationPriority.PROFIT_COMPRESSION,
-                ArbitrationPriority.EXECUTION,
-                ArbitrationPriority.EVOLUTION,
-                ArbitrationPriority.STRATEGY,
-            ]
-            is_chain_valid = expected_order == sorted(expected_order, reverse=True)
+            expected_order = sorted(self._priority_chain, reverse=True)
+            is_chain_valid = self._priority_chain == expected_order
 
             # 获取性能统计
             latency_samples = list(self._latency_samples)
-            p50 = sorted(latency_samples)[len(latency_samples) // 2] if latency_samples else 0
-            p95 = sorted(latency_samples)[int(len(latency_samples) * 0.95)] if len(latency_samples) >= 20 else 0
+            if latency_samples:
+                sorted_latency = sorted(latency_samples)
+                p50 = sorted_latency[len(sorted_latency) // 2]
+                p95 = sorted_latency[int(len(sorted_latency) * 0.95)] if len(sorted_latency) >= 20 else 0
+            else:
+                p50 = 0
+                p95 = 0
 
             return {
                 "status": "ok" if is_chain_valid else "degraded",
@@ -398,45 +414,108 @@ class ConflictArbiter:
             }
 
     # ========== 私有方法 ==========
-    def _sort_by_priority(self, constraints: List[Any]) -> List[Any]:
-        """按优先级从高到低排序约束响应列表，自动过滤无效元素"""
+    def _load_priority_chain(self, config: Optional[Dict[str, Any]]) -> List[ArbitrationPriority]:
+        """
+        从配置加载优先级链，支持动态扩展
+
+        如果配置中指定了 priority_order，按配置顺序构建；
+        否则使用 ArbitrationPriority 枚举的默认顺序（数值降序）
+        """
+        if config and 'priority_order' in config:
+            chain = []
+            for name in config['priority_order']:
+                name_upper = name.upper()
+                try:
+                    chain.append(ArbitrationPriority[name_upper])
+                except KeyError:
+                    logger.warning(f"配置中的优先级名称无效: {name}，已跳过")
+
+            if chain:
+                # 完整性校验：确保所有必需的优先级均被包含
+                required_priorities = {ArbitrationPriority.SURVIVAL, ArbitrationPriority.RISK}
+                missing = required_priorities - set(chain)
+                if missing:
+                    logger.error(
+                        f"配置中的优先级链缺少关键优先级: {[p.name for p in missing]}，"
+                        f"将使用默认优先级链以确保安全 #RECOVERY: 检查 negotiation_layer.yaml 中 priority_order 配置"
+                    )
+                    return sorted(ArbitrationPriority, key=lambda p: p.value, reverse=True)
+
+                logger.info(f"从配置加载优先级链: {[p.name for p in chain]}")
+                return chain
+
+        return sorted(ArbitrationPriority, key=lambda p: p.value, reverse=True)
+
+    def _sort_by_priority(self, constraints: List[Any], pulse_id: str = "unknown") -> List[Any]:
+        """
+        按优先级从高到低排序约束响应列表，自动过滤无效元素并去重
+
+        去重时保留更严格的约束（更小的 allowed_size_pct 或不允许）
+        """
         valid_constraints = [c for c in constraints if c is not None]
         if not valid_constraints:
             return []
+
         if len(valid_constraints) < len(constraints):
             logger.warning(
-                f"constraints 列表中存在 {len(constraints) - len(valid_constraints)} 个无效元素，已过滤"
+                f"constraints 列表中存在 {len(constraints) - len(valid_constraints)} 个无效元素，已过滤，pulse_id={pulse_id}"
             )
+
+        # 基于 module_source 去重，保留更严格的约束
+        deduplicated: Dict[str, Any] = {}
+        for c in valid_constraints:
+            module = getattr(c, 'module_source', '')
+            if not module:
+                deduplicated[f"_unidentified_{id(c)}"] = c
+                continue
+
+            if module in deduplicated:
+                existing = deduplicated[module]
+                # 保留更严格的约束
+                if c.allowed_size_pct is not None:
+                    if existing.allowed_size_pct is None or c.allowed_size_pct < existing.allowed_size_pct:
+                        deduplicated[module] = c
+                elif not c.allowed and existing.allowed:
+                    deduplicated[module] = c
+            else:
+                deduplicated[module] = c
+
+        if len(deduplicated) < len(valid_constraints):
+            logger.warning(
+                f"constraints 列表包含重复模块，已去重: {len(valid_constraints)} -> {len(deduplicated)}，pulse_id={pulse_id}"
+            )
+
         return sorted(
-            valid_constraints,
+            deduplicated.values(),
             key=lambda c: self._get_constraint_priority(c),
             reverse=True,
         )
 
-    @staticmethod
-    def _get_constraint_priority(constraint: Any) -> ArbitrationPriority:
+    def _get_constraint_priority(self, constraint: Any) -> ArbitrationPriority:
         """
         从约束对象中提取优先级，附带鸭子类型保护
 
         优先级映射规则：
-        - 携带 survival_override 标记 → SURVIVAL
-        - 携带显式 priority 字段 → 对应优先级
-        - 通过 module_source 字段按关键词匹配
-        - 默认 → STRATEGY
+        1. 优先使用显式 priority 字段（整数，对应 ArbitrationPriority 枚举值）
+        2. 携带 survival_override 标记 → SURVIVAL
+        3. 通过 module_source 字段按关键词匹配
+        4. 默认 → STRATEGY
         """
         if not hasattr(constraint, 'allowed'):
             return ArbitrationPriority.STRATEGY
 
-        if getattr(constraint, 'survival_override', False):
-            return ArbitrationPriority.SURVIVAL
-
-        # 优先通过显式的 priority 字段获取
+        # 1. 显式 priority 字段（最优先）
         explicit_priority = getattr(constraint, 'priority', None)
         if explicit_priority is not None and isinstance(explicit_priority, int):
             for p in ArbitrationPriority:
                 if p.value == explicit_priority:
                     return p
 
+        # 2. 生存级标记
+        if getattr(constraint, 'survival_override', False):
+            return ArbitrationPriority.SURVIVAL
+
+        # 3. module_source 关键词匹配
         module = getattr(constraint, 'module_source', '')
         if not module:
             logger.warning("约束对象缺少 module_source 字段，默认使用 STRATEGY 优先级")
@@ -458,10 +537,22 @@ class ConflictArbiter:
         self,
         reason: str,
         warnings: List[str],
+        adjustment_log: List[Dict[str, Any]],
         pulse_id: str = "unknown",
         intent_type: str = "unknown",
     ) -> Dict[str, Any]:
         """生成保守默认结果（不允许开仓），附带脉冲标识以支持全链路追踪"""
+        # 追加异常信息到调整日志
+        adjustment_log.append({
+            "module": "ConflictArbiter",
+            "priority": "FALLBACK",
+            "priority_value": -1,
+            "allowed": False,
+            "allowed_size_pct": 0.0,
+            "reason": reason,
+            "timestamp": time.time(),
+        })
+
         return {
             "status": "ok",
             "reason": reason,
@@ -472,7 +563,7 @@ class ConflictArbiter:
                 "final_size_pct": self.DEFAULT_CONSERVATIVE_SIZE_PCT,
                 "preferred_method": self.DEFAULT_CONSERVATIVE_METHOD,
                 "arbitration_reason": reason,
-                "adjustment_log": [reason],
+                "adjustment_log": adjustment_log,
                 "survival_override": False,
             },
             "warnings": warnings,
