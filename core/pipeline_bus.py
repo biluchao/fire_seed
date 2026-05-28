@@ -1,556 +1,530 @@
 """
-火种系统 · 流程总线入口 (PipelineBus)
+火种系统 · 协商总线入口 (NegotiationBus)
 
 核心职责：
-1. 管理交易流水线的全生命周期，包括流水线实例的创建、激活、阶段推进、异常终止与资源回收
-2. 协调调度四个子模块（阶段调度器、看门狗、熔断器、上下文传递器），对外提供统一的流水线操作接口
+1. 作为跨模块协商层的统一入口，负责初始化、管理和调度四个子模块（语义向量、冲突仲裁、预协商缓存、超时回退）
+2. 对外提供标准化的协商接口，所有模块的意图与约束均通过此入口转换为标准化 NeuroPulse 并获取 NeuroConstraint 响应
+3. 实现分级锁与优先级通道，保障极端行情下 P0/P1 级指令不被阻塞，同时防止高并发下的缓存击穿与约束空窗
+4. 提供线程安全的快速通道，确保 P0 指令无锁执行；异步告警具备流控，防止线程风暴；健康检查具备超时保护
 
 外部依赖（真实模块接口）：
-- core.pipeline_bus.stage_scheduler.StageScheduler : 负责六阶段的串行推进逻辑与异步事件订阅
-- core.pipeline_bus.watchdog.Watchdog : 为每条流水线提供独立的超时监控与强制终止
-- core.pipeline_bus.circuit_breaker.CircuitBreaker : 按流水线类型统计连续异常次数，触发熔断与逐步恢复
-- core.pipeline_bus.context_passer.ContextPasser : 负责阶段间处理结果的标准化传递与完整性校验
-- core.negotiation_bus.NegotiationBus : 发布流水线状态变更事件（完成、异常、熔断）
-- core.behavioral_logger.BehavioralLogger : 记录流水线生命周期日志与异常事件
+- core.negotiation_bus.neuro_pulse.NeuroPulse : 通用语义向量与约束响应的定义与验证 (encode_intent 必须为纯函数、线程安全)
+- core.negotiation_bus.conflict_arbiter.ConflictArbiter : 多模块约束冲突的优先级仲裁 (collect/resolve 必须为线程安全)
+- core.negotiation_bus.predictive_cache.PredictiveCache : 预协商缓存管理与命中检测 (get/set 必须为线程安全)
+- core.negotiation_bus.timeout_fallback.TimeoutFallback : 硬超时安全回退与模块降级
+- core.risk_monitor.risk_color_manager.RiskColorManager : (可选) 获取当前风险状态哈希，用于缓存时效性校验
 
 接口契约：
-- create_pipeline(symbol: str, strategy: str, signal: Dict[str, Any]) -> Dict[str, Any] : 创建新流水线实例
-- advance_stage(line_id: str, stage_result: Dict[str, Any]) -> Dict[str, Any] : 推进流水线到下一阶段
-- abort_pipeline(line_id: str, reason: str) -> Dict[str, Any] : 异常终止流水线并回收资源
-- complete_pipeline(line_id: str, final_result: Dict[str, Any]) -> Dict[str, Any] : 正常完成流水线
-- get_pipeline_status(line_id: str) -> Dict[str, Any] : 查询流水线当前状态
-- get_active_pipeline_count() -> Dict[str, Any] : 获取活跃流水线总数，附带僵死流水线预警
-- health_check() -> Dict[str, Any] : 模块自检，包含熔断器摘要与看门狗健康
+- register_module(module_name: str, constraints: Dict) -> Dict[str, Any] : 注册模块约束到协商层
+- negotiate(intent: Dict[str, Any], skip_cache: bool = False) -> Dict[str, Any] : 发起一次完整协商，返回最终执行方案
+- health_check() -> Dict[str, Any] : 模块自检（含端到端穿透测试，不污染生产缓存，具备锁获取超时）
+- inject_risk_monitor(risk_monitor) -> None : 注入风险监控模块，用于缓存风险状态校验
+- inject_alert_handler(handler: Callable) -> None : 注入告警处理器（异步执行，具备流控）
 - 所有公共方法输出字典固定包含 "status" (str), "reason" (str), "data" (Dict), "warnings" (List[str])
 
 异常与降级：
-- 当 StageScheduler 不可用时，流水线推进降级为直接阶段递增，跳过预加载和异步事件订阅
-- 当 Watchdog 不可用时，流水线仍正常运行但无超时保护，同时发出告警；连续注册失败将触发创建拒绝
-- 当 CircuitBreaker 不可用时，默认允许所有流水线创建，不进行熔断判定
-- 当 ContextPasser 不可用时，阶段间上下文传递降级为直接引用传递，不进行完整性校验
-- 所有降级值在类常量区明确声明
+- 当任一子模块初始化失败时，该子模块功能自动降级为保守默认值（如冲突仲裁失败则返回最保守约束）
+- 当 NeuroPulse 不可用时，拒绝所有协商请求并返回错误码
+- 当冲突仲裁器不可用或约束收集失败时，直接返回保守决策，避免无约束执行
+- 快速通道中若仲裁器方法抛出 RuntimeError（数据竞争），回退为保守决策
+- 健康检查若在1秒内无法获取锁，返回“阻塞”状态，防止僵死
 
 资源管理：
-- 本模块维护活跃流水线的字典，在流水线完成或终止时自动清理
-- 通过 max_parallel_lines 常量限制最大并发流水线数，防止内存膨胀
-- 线程锁保护活跃流水线字典的并发访问
-- 模块销毁时自动清理所有活跃流水线
+- 本模块不持有任何外部资源句柄
+- 子模块均为无状态或自包含状态，生命周期随本模块实例自动管理
+- 采用分级锁：`_register_lock` 保护注册表，高优先级与普通优先级协商分别使用独立锁，`_cache_lock` 保护缓存
+- 异步告警使用线程池 + 有界队列，最大并发 2 线程，防止线程风暴
+- 健康检查锁获取超时 1 秒，超时自动放弃并返回降级状态
 """
 
 import time
 import logging
 import threading
-from typing import Dict, Any, List, Optional
-from collections import deque
-from enum import Enum
+from typing import Dict, Any, Optional, Callable
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+import queue
 
 logger = logging.getLogger(__name__)
 
 
-class PipelineStage(Enum):
-    """流水线六阶段枚举"""
-    SIGNAL_SCAN = "S1"
-    SIGNAL_CONFIRM = "S2"
-    ORDER_EXEC = "S3"
-    ADD_MANAGE = "S4"
-    PROFIT_GUARD = "S5"
-    ATTRIBUTION = "S6"
+class NegotiationBus:
+    """协商总线入口，负责子模块装配与请求路由"""
 
-
-class PipelineStatus(Enum):
-    """流水线状态枚举"""
-    ACTIVE = "active"
-    ABORTED = "aborted"
-    COMPLETED = "completed"
-
-
-class PipelineBus:
-    """全链路流程总线，管理交易流水线的创建与调度"""
-
-    # ========== 类常量（默认配置，附带单位与取值范围注释） ==========
-    DEFAULT_MAX_PARALLEL_LINES = 3          # 最大并行流水线数，无量纲，取值范围 [1, 10]
-    DEFAULT_AUTO_RETRY_COUNT = 1            # 阶段失败自动重试次数，无量纲，取值范围 [0, 3]
-    DEFAULT_ABORT_ON_STAGE_FAILURE = True   # 阶段失败是否终止流水线，布尔值
-    MAX_WATCHDOG_REGISTER_FAILURES = 3      # 看门狗连续注册失败阈值，无量纲，[2, 10]
-    PIPELINE_CREATION_RATE_WINDOW_SEC = 60  # 创建速率监控窗口，秒，[30, 300]
-    PIPELINE_CREATION_RATE_THRESHOLD = 30   # 每分钟创建最大数，无量纲，[5, 100]
-
-    # 显式阶段顺序映射，不依赖枚举声明顺序
-    _STAGE_NEXT_MAP = {
-        PipelineStage.SIGNAL_SCAN: PipelineStage.SIGNAL_CONFIRM,
-        PipelineStage.SIGNAL_CONFIRM: PipelineStage.ORDER_EXEC,
-        PipelineStage.ORDER_EXEC: PipelineStage.ADD_MANAGE,
-        PipelineStage.ADD_MANAGE: PipelineStage.PROFIT_GUARD,
-        PipelineStage.PROFIT_GUARD: PipelineStage.ATTRIBUTION,
-        PipelineStage.ATTRIBUTION: None,          # 终点
-    }
-
-    # 阶段超时配置（微秒）
-    STAGE_TIMEOUTS = {
-        PipelineStage.SIGNAL_SCAN: 500,
-        PipelineStage.SIGNAL_CONFIRM: 200,
-        PipelineStage.ORDER_EXEC: 1000,
-        PipelineStage.ADD_MANAGE: 500,
-        PipelineStage.PROFIT_GUARD: 100,
-        PipelineStage.ATTRIBUTION: 100000,
-    }
-
-    STAGE_DESCRIPTIONS = {
-        PipelineStage.SIGNAL_SCAN: "信号嗅探",
-        PipelineStage.SIGNAL_CONFIRM: "信号确认",
-        PipelineStage.ORDER_EXEC: "订单执行",
-        PipelineStage.ADD_MANAGE: "加仓管理",
-        PipelineStage.PROFIT_GUARD: "利润保护",
-        PipelineStage.ATTRIBUTION: "归因闭环",
-    }
-
-    # 流水线预期总超时（微秒），用于僵死检测
-    PIPELINE_TOTAL_TIMEOUT_US = sum(STAGE_TIMEOUTS.values())
+    # 类常量
+    CACHE_TTL_SEC = 0.0005          # 缓存有效期 500 微秒
+    P0_URGENCY_THRESHOLD = 9       # P0 级指令最低紧急度
+    P1_URGENCY_THRESHOLD = 6       # P1 级指令最低紧急度（用于分级锁）
+    HEALTH_CHECK_LOCK_TIMEOUT = 1.0  # 健康检查获取锁超时(秒)
+    ALERT_MAX_WORKERS = 2           # 告警线程池最大线程数
+    ALERT_QUEUE_SIZE = 50           # 告警队列容量
+    ALERT_DEDUP_SECONDS = 5.0       # 告警去重窗口(秒)
 
     def __init__(self):
-        self._active_lines: Dict[str, Dict[str, Any]] = {}
-        self._line_counter: int = 0
-        self._lock = threading.Lock()
+        # 子模块实例（延迟初始化）
+        self._neuro_pulse = None
+        self._conflict_arbiter = None
+        self._predictive_cache = None
+        self._timeout_fallback = None
 
-        # 外部依赖
-        self._stage_scheduler = None
-        self._watchdog = None
-        self._circuit_breaker = None
-        self._context_passer = None
-        self._negotiation_bus = None
-        self._behavioral_logger = None
+        # 可选依赖
+        self._risk_monitor = None
+        self._alert_handler = None
 
-        # 看门狗注册失败计数器（按策略）
-        self._watchdog_failure_counts: Dict[str, int] = {}
-        self._watchdog_failure_lock = threading.Lock()
+        # 子模块可用性标记
+        self._submodule_status = {
+            "neuro_pulse": False,
+            "conflict_arbiter": False,
+            "predictive_cache": False,
+            "timeout_fallback": False,
+        }
 
-        # 流水线创建速率监控
-        self._creation_timestamps: deque = deque()
+        # 分级锁
+        self._register_lock = threading.Lock()
+        self._high_priority_lock = threading.Lock()   # P0/P1 级指令
+        self._normal_priority_lock = threading.Lock() # 普通请求
+        self._cache_lock = threading.Lock()
 
-        logger.info("PipelineBus 初始化完成，最大并行流水线: %d", self.DEFAULT_MAX_PARALLEL_LINES)
+        # 异步告警设施（线程池 + 有界队列 + 去重记录）
+        self._alert_executor = ThreadPoolExecutor(max_workers=self.ALERT_MAX_WORKERS, thread_name_prefix="negotiation_alert")
+        self._alert_queue = queue.Queue(maxsize=self.ALERT_QUEUE_SIZE)
+        self._alert_dedup: Dict[str, float] = {}
+        self._alert_dedup_lock = threading.Lock()
 
-    # ========== 依赖注入 ==========
-    def inject_dependencies(
-        self,
-        stage_scheduler: Optional[Any] = None,
-        watchdog: Optional[Any] = None,
-        circuit_breaker: Optional[Any] = None,
-        context_passer: Optional[Any] = None,
-        negotiation_bus: Optional[Any] = None,
-        behavioral_logger: Optional[Any] = None,
-    ) -> None:
-        if stage_scheduler is not None:
-            self._stage_scheduler = stage_scheduler
-            logger.info("StageScheduler 注入成功")
-        else:
-            logger.warning("StageScheduler 未注入，流水线推进降级为直接阶段递增")
+        # 初始化子模块（带降级与告警）
+        self._init_submodules()
 
-        if watchdog is not None:
-            self._watchdog = watchdog
-            logger.info("Watchdog 注入成功")
-        else:
-            logger.warning("Watchdog 未注入，流水线无超时保护")
+        logger.info("NegotiationBus 初始化完成，子模块状态: %s", self._submodule_status)
 
-        if circuit_breaker is not None:
-            self._circuit_breaker = circuit_breaker
-            logger.info("CircuitBreaker 注入成功")
-        else:
-            logger.warning("CircuitBreaker 未注入，不进行熔断判定")
+    # ========== 可选依赖注入 ==========
+    def inject_risk_monitor(self, risk_monitor: Any) -> None:
+        """
+        注入风险监控模块，用于缓存时效性校验。
+        注入时会校验接口兼容性，不满足则拒绝注入。
+        """
+        if not hasattr(risk_monitor, 'get_risk_state_hash'):
+            logger.warning("RiskMonitor 缺少 get_risk_state_hash 方法，拒绝注入")
+            return
+        self._risk_monitor = risk_monitor
+        logger.info("RiskMonitor 注入协商层成功")
 
-        if context_passer is not None:
-            self._context_passer = context_passer
-            logger.info("ContextPasser 注入成功")
-        else:
-            logger.warning("ContextPasser 未注入，上下文传递降级为直接引用")
+    def inject_alert_handler(self, handler: Callable) -> None:
+        """注入告警处理器，用于推送严重故障。处理器接收 (level: str, message: str) 参数。"""
+        self._alert_handler = handler
 
-        if negotiation_bus is not None:
-            self._negotiation_bus = negotiation_bus
-            logger.info("NegotiationBus 注入成功")
-        else:
-            logger.warning("NegotiationBus 未注入，流水线状态变更事件不推送")
+    # ========== 子模块初始化 ==========
+    def _init_submodules(self) -> None:
+        """按依赖顺序初始化子模块，任一失败自动降级并告警"""
+        # 1. 语义向量（核心依赖，必须可用）
+        try:
+            from core.negotiation_bus.neuro_pulse import NeuroPulse
+            self._neuro_pulse = NeuroPulse()
+            self._submodule_status["neuro_pulse"] = True
+            logger.info("NeuroPulse 子模块初始化成功")
+        except Exception as e:
+            self._report_fatal("NeuroPulse", e)
+            return
 
-        if behavioral_logger is not None:
-            self._behavioral_logger = behavioral_logger
-            logger.info("BehavioralLogger 注入成功")
-        else:
-            logger.warning("BehavioralLogger 未注入，日志降级为标准 logger")
+        # 2. 冲突仲裁
+        try:
+            from core.negotiation_bus.conflict_arbiter import ConflictArbiter
+            self._conflict_arbiter = ConflictArbiter()
+            self._submodule_status["conflict_arbiter"] = True
+            logger.info("ConflictArbiter 子模块初始化成功")
+        except Exception as e:
+            self._report_degraded("ConflictArbiter", e)
+
+        # 3. 预协商缓存
+        try:
+            from core.negotiation_bus.predictive_cache import PredictiveCache
+            self._predictive_cache = PredictiveCache()
+            self._submodule_status["predictive_cache"] = True
+            logger.info("PredictiveCache 子模块初始化成功")
+        except Exception as e:
+            self._report_degraded("PredictiveCache", e)
+
+        # 4. 超时回退
+        try:
+            from core.negotiation_bus.timeout_fallback import TimeoutFallback
+            self._timeout_fallback = TimeoutFallback()
+            self._submodule_status["timeout_fallback"] = True
+            logger.info("TimeoutFallback 子模块初始化成功")
+        except Exception as e:
+            self._report_degraded("TimeoutFallback", e)
+
+    def _report_fatal(self, module: str, error: Exception) -> None:
+        msg = f"致命: {module} 初始化失败，协商层不可用"
+        logger.error("%s: %s #RECOVERY: 检查对应模块文件完整性", msg, error)
+        self._push_alert("critical", msg)
+
+    def _report_degraded(self, module: str, error: Exception) -> None:
+        msg = f"降级: {module} 初始化失败，将使用保守默认值"
+        logger.warning("%s: %s", msg, error)
+        self._push_alert("warning", msg)
+
+    def _push_alert(self, level: str, message: str) -> None:
+        """
+        异步推送告警，使用线程池 + 有界队列 + 去重，防止线程风暴。
+        """
+        if not self._alert_handler:
+            return
+
+        # 去重检查
+        dedup_key = f"{level}:{message[:100]}"
+        now = time.time()
+        with self._alert_dedup_lock:
+            last_time = self._alert_dedup.get(dedup_key, 0)
+            if now - last_time < self.ALERT_DEDUP_SECONDS:
+                return
+            self._alert_dedup[dedup_key] = now
+
+        # 尝试将告警任务放入队列
+        try:
+            self._alert_queue.put_nowait((level, message))
+        except queue.Full:
+            logger.warning("告警队列已满，丢弃告警: %s", message)
+            return
+
+        # 提交执行（线程池会自动限制并发）
+        try:
+            self._alert_executor.submit(self._do_push_alert, level, message)
+        except RuntimeError:
+            logger.warning("告警线程池已关闭，无法推送告警")
+
+    def _do_push_alert(self, level: str, message: str) -> None:
+        """实际执行告警推送的工作线程"""
+        try:
+            self._alert_handler(level, message)
+        except Exception:
+            pass
 
     # ========== 公共接口 ==========
-    def create_pipeline(self, symbol: str, strategy: str, signal: Dict[str, Any]) -> Dict[str, Any]:
-        if not symbol:
-            return {"status": "error", "reason": "交易品种不能为空", "data": {}, "warnings": ["invalid_symbol"]}
-        if not strategy:
-            return {"status": "error", "reason": "策略来源不能为空", "data": {}, "warnings": ["invalid_strategy"]}
-
-        with self._lock:
-            # 检查创建速率
-            self._check_creation_rate()
-
-            if len(self._active_lines) >= self.DEFAULT_MAX_PARALLEL_LINES:
-                logger.warning("创建流水线失败: 已达最大并行数 %d", self.DEFAULT_MAX_PARALLEL_LINES)
-                return {
-                    "status": "error",
-                    "reason": f"已达最大并行流水线数 ({self.DEFAULT_MAX_PARALLEL_LINES})",
-                    "data": {"active_count": len(self._active_lines)},
-                    "warnings": ["max_parallel_reached"],
-                }
-
-            # 熔断检查
-            if self._circuit_breaker is not None:
-                try:
-                    if self._circuit_breaker.is_open(strategy):
-                        logger.warning("创建流水线被熔断器拒绝: strategy=%s", strategy)
-                        return {
-                            "status": "error",
-                            "reason": f"策略 {strategy} 处于熔断冷却期",
-                            "data": {},
-                            "warnings": ["circuit_breaker_open"],
-                        }
-                except Exception as e:
-                    logger.warning("熔断器查询异常，放行流水线创建: %s", e)
-
-            # 看门狗注册失败率检查
-            if self._watchdog is not None and self._is_watchdog_degraded(strategy):
-                logger.error("看门狗连续注册失败，拒绝创建流水线: strategy=%s", strategy)
-                return {
-                    "status": "error",
-                    "reason": f"看门狗服务不可用，流水线创建被拒绝",
-                    "data": {},
-                    "warnings": ["watchdog_unavailable"],
-                }
-
-            # 创建流水线
-            self._line_counter += 1
-            line_id = f"PL_{self._line_counter:06d}_{int(time.time())}"
-            pipeline = {
-                "id": line_id,
-                "symbol": symbol,
-                "strategy": strategy,
-                "current_stage": PipelineStage.SIGNAL_CONFIRM,
-                "signal": signal,
-                "position": None,
-                "status": PipelineStatus.ACTIVE.value,
-                "stage_history": [],
-                "created_at": time.time(),
-                "retry_count": 0,
-                "stage_start_time": time.time(),  # 当前阶段开始时间
+    def register_module(self, module_name: str, constraints: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        向协商层注册一个模块的约束条件
+        """
+        if not self._neuro_pulse:
+            return {
+                "status": "error",
+                "reason": "协商层核心不可用，拒绝注册",
+                "data": {},
+                "warnings": ["neuro_pulse_unavailable"],
             }
-            self._active_lines[line_id] = pipeline
 
-            # 看门狗注册
-            if self._watchdog is not None:
-                try:
-                    self._watchdog.register(line_id, self.STAGE_TIMEOUTS[pipeline["current_stage"]])
-                    self._reset_watchdog_failure(strategy)  # 注册成功，重置失败计数
-                except Exception as e:
-                    self._record_watchdog_failure(strategy)
-                    logger.error("看门狗注册失败: %s #RECOVERY: 检查看门狗服务状态", e)
+        if not module_name or not isinstance(module_name, str):
+            return {
+                "status": "error",
+                "reason": "无效的模块名称",
+                "data": {},
+                "warnings": ["invalid_module_name"],
+            }
 
-            logger.info("流水线已创建: id=%s, symbol=%s, strategy=%s, stage=%s",
-                        line_id, symbol, strategy, pipeline["current_stage"].value)
+        with self._register_lock:
+            try:
+                if not hasattr(self._neuro_pulse, 'validate_constraints'):
+                    logger.error("NeuroPulse 缺少 validate_constraints 方法")
+                    return {
+                        "status": "error",
+                        "reason": "核心子模块接口不兼容",
+                        "data": {},
+                        "warnings": ["interface_mismatch"],
+                    }
+
+                validated = self._neuro_pulse.validate_constraints(constraints)
+                if not validated.get("valid", False):
+                    return {
+                        "status": "error",
+                        "reason": f"约束格式验证失败: {validated.get('reason', '未知')}",
+                        "data": validated,
+                        "warnings": ["constraint_validation_failed"],
+                    }
+
+                if self._conflict_arbiter and hasattr(self._conflict_arbiter, 'register'):
+                    self._conflict_arbiter.register(module_name, validated["constraints"])
+                    logger.info("模块 %s 已注册到协商层", module_name)
+
+                return {
+                    "status": "ok",
+                    "reason": f"模块 {module_name} 注册成功",
+                    "data": {"module": module_name, "registered": True},
+                    "warnings": [],
+                }
+            except Exception as e:
+                logger.error("注册模块失败: %s #RECOVERY: 检查约束格式是否合法", e)
+                return {
+                    "status": "error",
+                    "reason": f"注册异常: {str(e)}",
+                    "data": {},
+                    "warnings": [f"registration_error: {str(e)}"],
+                }
+
+    def negotiate(self, intent: Dict[str, Any], skip_cache: bool = False) -> Dict[str, Any]:
+        """
+        发起一次完整的协商流程。
+        对于 P0 级生存指令（urgency >= 9），绕过锁队列直接走快速通道。
+        对于 P1 级指令（urgency >= 6），使用高优先级锁。
+        参数 skip_cache=True 将跳过缓存写入（用于健康检查等避免污染生产缓存）。
+        """
+        if not self._neuro_pulse:
+            return {
+                "status": "error",
+                "reason": "协商层核心不可用",
+                "data": {"allowed": False, "reason": "negotiation_bus_unavailable"},
+                "warnings": ["neuro_pulse_unavailable"],
+            }
+
+        urgency = intent.get("urgency", 0)
+        if isinstance(urgency, (int, float)) and urgency >= self.P0_URGENCY_THRESHOLD:
+            return self._fast_negotiate(intent)
+
+        # 根据紧急度选择锁
+        if isinstance(urgency, (int, float)) and urgency >= self.P1_URGENCY_THRESHOLD:
+            with self._high_priority_lock:
+                return self._standard_negotiate(intent, skip_cache=skip_cache)
+        else:
+            with self._normal_priority_lock:
+                return self._standard_negotiate(intent, skip_cache=skip_cache)
+
+    # ========== 编码辅助 ==========
+    def _encode_intent_safe(self, intent: Dict[str, Any]) -> Any:
+        """
+        安全编码意图。NeuroPulse.encode_intent 必须为纯函数，不修改内部状态。
+        此方法对外保证线程安全。
+        """
+        if not hasattr(self._neuro_pulse, 'encode_intent'):
+            raise AttributeError("NeuroPulse 缺少 encode_intent 方法")
+        return self._neuro_pulse.encode_intent(intent)
+
+    # ========== 快速通道 ==========
+    def _fast_negotiate(self, intent: Dict[str, Any]) -> Dict[str, Any]:
+        """P0 级指令快速通道：无锁执行，直接仲裁。若仲裁器出现数据竞争则回退保守决策。"""
+        try:
+            pulse = self._encode_intent_safe(intent)
+        except Exception as e:
+            logger.error("快速通道意图编码失败: %s", e)
+            return {
+                "status": "error",
+                "reason": f"意图编码失败: {str(e)}",
+                "data": {"allowed": False},
+                "warnings": ["intent_encode_failed"],
+            }
+
+        constraints = self._collect_constraints(pulse)
+        if constraints is None:
+            return {
+                "status": "error",
+                "reason": "约束收集失败，执行保守决策",
+                "data": self._get_conservative_decision(pulse),
+                "warnings": ["constraint_collection_failed"],
+            }
+
+        try:
+            if self._conflict_arbiter and hasattr(self._conflict_arbiter, 'resolve'):
+                final_decision = self._conflict_arbiter.resolve(pulse, constraints)
+            else:
+                final_decision = self._get_conservative_decision(pulse)
+        except RuntimeError as e:
+            logger.error("快速通道仲裁数据竞争: %s，回退保守决策", e)
+            final_decision = self._get_conservative_decision(pulse)
+
+        if self._timeout_fallback and hasattr(self._timeout_fallback, 'apply'):
+            final_decision = self._timeout_fallback.apply(pulse, final_decision)
 
         return {
             "status": "ok",
-            "reason": f"流水线 {line_id} 创建成功",
-            "data": {"line_id": line_id},
-            "warnings": [],
+            "reason": f"快速协商完成: {'允许' if final_decision.get('allowed') else '拒绝'}",
+            "data": final_decision,
+            "warnings": final_decision.get("warnings", []),
         }
 
-    def advance_stage(self, line_id: str, stage_result: Dict[str, Any]) -> Dict[str, Any]:
-        if not line_id:
-            return {"status": "error", "reason": "流水线ID不能为空", "data": {}, "warnings": ["invalid_line_id"]}
+    # ========== 标准协商 ==========
+    def _standard_negotiate(self, intent: Dict[str, Any], skip_cache: bool = False) -> Dict[str, Any]:
+        """常规协商流程（需在对应优先级锁内调用）"""
+        try:
+            pulse = self._encode_intent_safe(intent)
+        except Exception as e:
+            logger.error("意图编码失败: %s", e)
+            return {
+                "status": "error",
+                "reason": f"意图编码失败: {str(e)}",
+                "data": {"allowed": False},
+                "warnings": ["intent_encode_failed"],
+            }
 
-        with self._lock:
-            pipeline = self._active_lines.get(line_id)
-            if pipeline is None:
-                logger.warning("流水线不存在: %s", line_id)
-                return {"status": "error", "reason": f"流水线 {line_id} 不存在", "data": {}, "warnings": ["pipeline_not_found"]}
-            if pipeline["status"] != PipelineStatus.ACTIVE.value:
-                logger.warning("流水线非活跃状态: id=%s, status=%s", line_id, pipeline["status"])
-                return {"status": "error", "reason": f"流水线 {line_id} 状态为 {pipeline['status']}", "data": {}, "warnings": ["pipeline_not_active"]}
-
-            # 计算当前阶段耗时
-            stage_start = pipeline.get("stage_start_time", time.time())
-            duration_us = int((time.time() - stage_start) * 1_000_000)
-
-            current_stage = pipeline["current_stage"]
-            pipeline["stage_history"].append({
-                "stage": current_stage.value,
-                "result": stage_result.get("status", "unknown"),
-                "duration_us": duration_us,
-                "timestamp": time.time(),
-            })
-
-            # 喂狗
-            if self._watchdog is not None:
-                try:
-                    self._watchdog.feed(line_id)
-                except Exception as e:
-                    logger.warning("看门狗喂狗失败: %s", e)
-
-            result_status = stage_result.get("status", "unknown")
-
-            if result_status == "continue":
-                next_stage = self._STAGE_NEXT_MAP.get(current_stage)
-                if next_stage is None:
-                    return self._finalize_pipeline(line_id, pipeline, "所有阶段已完成", PipelineStatus.COMPLETED)
-
-                pipeline["current_stage"] = next_stage
-                pipeline["retry_count"] = 0
-                pipeline["stage_start_time"] = time.time()
-
-                if self._watchdog is not None:
-                    try:
-                        self._watchdog.update_timeout(line_id, self.STAGE_TIMEOUTS[next_stage])
-                    except Exception as e:
-                        logger.warning("看门狗超时更新失败: %s", e)
-
-                logger.info("流水线阶段推进: id=%s, %s → %s, 耗时 %dμs", line_id, current_stage.value, next_stage.value, duration_us)
+        # 1. 尝试从缓存获取（带时效性校验）
+        if not skip_cache:
+            cached = self._get_cached_decision(pulse)
+            if cached:
                 return {
                     "status": "ok",
-                    "reason": f"流水线 {line_id} 推进至 {next_stage.value}",
-                    "data": {"line_id": line_id, "previous_stage": current_stage.value, "current_stage": next_stage.value},
+                    "reason": "预协商缓存命中",
+                    "data": cached,
                     "warnings": [],
                 }
 
-            elif result_status == "abort":
-                return self._finalize_pipeline(line_id, pipeline, stage_result.get("reason", "阶段返回终止"), PipelineStatus.ABORTED)
-
-            elif result_status == "complete":
-                return self._finalize_pipeline(line_id, pipeline, "阶段返回完成", PipelineStatus.COMPLETED)
-
+        # 2. 收集约束
+        constraints = self._collect_constraints(pulse)
+        if constraints is None:
+            final_decision = self._get_conservative_decision(pulse)
+            logger.warning("约束收集失败，采用保守决策")
+        else:
+            # 3. 冲突仲裁
+            if self._conflict_arbiter and hasattr(self._conflict_arbiter, 'resolve'):
+                final_decision = self._conflict_arbiter.resolve(pulse, constraints)
             else:
-                # 重试逻辑
-                retry_max = self.DEFAULT_AUTO_RETRY_COUNT
-                if pipeline["retry_count"] < retry_max:
-                    pipeline["retry_count"] += 1
-                    logger.warning("流水线阶段结果未知，重试 %d/%d: id=%s", pipeline["retry_count"], retry_max, line_id)
-                    return {
-                        "status": "ok",
-                        "reason": f"阶段结果未知，重试 {pipeline['retry_count']}/{retry_max}",
-                        "data": {"line_id": line_id},
-                        "warnings": ["unknown_result_retry"],
-                    }
-                else:
-                    # 重试耗尽前先取消看门狗
-                    if self._watchdog is not None:
-                        try:
-                            self._watchdog.unregister(line_id)
-                        except Exception as e:
-                            logger.warning("重试耗尽注销看门狗失败: %s", e)
-                    return self._finalize_pipeline(line_id, pipeline, f"重试耗尽 ({retry_max}次)", PipelineStatus.ABORTED)
+                final_decision = self._get_conservative_decision(pulse)
 
-    def abort_pipeline(self, line_id: str, reason: str = "") -> Dict[str, Any]:
-        if not line_id:
-            return {"status": "error", "reason": "流水线ID不能为空", "data": {}, "warnings": ["invalid_line_id"]}
-        with self._lock:
-            pipeline = self._active_lines.get(line_id)
-            if pipeline is None:
-                return {"status": "error", "reason": f"流水线 {line_id} 不存在", "data": {}, "warnings": ["pipeline_not_found"]}
-            return self._finalize_pipeline(line_id, pipeline, reason, PipelineStatus.ABORTED)
+        # 4. 超时回退
+        if self._timeout_fallback and hasattr(self._timeout_fallback, 'apply'):
+            final_decision = self._timeout_fallback.apply(pulse, final_decision)
 
-    def complete_pipeline(self, line_id: str, final_result: Dict[str, Any]) -> Dict[str, Any]:
-        if not line_id:
-            return {"status": "error", "reason": "流水线ID不能为空", "data": {}, "warnings": ["invalid_line_id"]}
-        with self._lock:
-            pipeline = self._active_lines.get(line_id)
-            if pipeline is None:
-                return {"status": "error", "reason": f"流水线 {line_id} 不存在", "data": {}, "warnings": ["pipeline_not_found"]}
-            return self._finalize_pipeline(line_id, pipeline, "正常完成", PipelineStatus.COMPLETED, final_result)
-
-    def get_pipeline_status(self, line_id: str) -> Dict[str, Any]:
-        if not line_id:
-            return {"status": "error", "reason": "流水线ID不能为空", "data": {}, "warnings": ["invalid_line_id"]}
-        with self._lock:
-            pipeline = self._active_lines.get(line_id)
-            if pipeline is None:
-                return {"status": "ok", "reason": f"流水线 {line_id} 不存在（可能已完成或已终止）", "data": {"line_id": line_id, "exists": False}, "warnings": []}
-            return {
-                "status": "ok",
-                "reason": f"流水线 {line_id} 当前状态: {pipeline['status']}",
-                "data": {
-                    "line_id": line_id,
-                    "symbol": pipeline["symbol"],
-                    "strategy": pipeline["strategy"],
-                    "current_stage": pipeline["current_stage"].value,
-                    "status": pipeline["status"],
-                    "created_at": pipeline["created_at"],
-                    "stage_count": len(pipeline["stage_history"]),
-                },
-                "warnings": [],
-            }
-
-    def get_active_pipeline_count(self) -> Dict[str, Any]:
-        with self._lock:
-            now = time.time()
-            lines_info = []
-            stuck_lines = []
-            for p in self._active_lines.values():
-                elapsed = now - p["created_at"]
-                info = {
-                    "line_id": p["id"],
-                    "symbol": p["symbol"],
-                    "strategy": p["strategy"],
-                    "current_stage": p["current_stage"].value,
-                    "elapsed_sec": round(elapsed, 3),
-                }
-                lines_info.append(info)
-                if elapsed * 1_000_000 > self.PIPELINE_TOTAL_TIMEOUT_US:
-                    stuck_lines.append(info["line_id"])
-
-            warnings = []
-            if stuck_lines:
-                warnings.append(f"可能存在僵死流水线: {stuck_lines}")
+        # 5. 更新缓存（健康检查不写入）
+        if not skip_cache and final_decision.get("allowed", False):
+            self._set_cached_decision(pulse, final_decision)
 
         return {
             "status": "ok",
-            "reason": f"当前活跃流水线: {len(self._active_lines)}",
-            "data": {
-                "active_count": len(self._active_lines),
-                "max_capacity": self.DEFAULT_MAX_PARALLEL_LINES,
-                "lines": lines_info,
-                "stuck_lines": stuck_lines,
-            },
-            "warnings": warnings,
+            "reason": f"协商完成: {'允许' if final_decision.get('allowed') else '拒绝'}",
+            "data": final_decision,
+            "warnings": final_decision.get("warnings", []),
+        }
+
+    # ========== 缓存管理 ==========
+    def _get_cached_decision(self, pulse: Any) -> Optional[Dict[str, Any]]:
+        """从缓存获取决策，并校验风险哈希与TTL"""
+        if not self._predictive_cache or not hasattr(self._predictive_cache, 'get'):
+            return None
+        with self._cache_lock:
+            entry = self._predictive_cache.get(pulse)
+            if not entry:
+                return None
+            if time.time() - entry.get("timestamp", 0) > self.CACHE_TTL_SEC:
+                return None
+            if self._risk_monitor:
+                try:
+                    current_hash = self._risk_monitor.get_risk_state_hash()
+                    if entry.get("risk_hash") != current_hash:
+                        return None
+                except Exception:
+                    return None
+            return entry.get("decision")
+
+    def _set_cached_decision(self, pulse: Any, decision: Dict[str, Any]) -> None:
+        """写入缓存，附带风险状态哈希与时间戳"""
+        if not self._predictive_cache or not hasattr(self._predictive_cache, 'set'):
+            return
+        entry = {
+            "decision": decision,
+            "timestamp": time.time(),
+        }
+        if self._risk_monitor:
+            try:
+                entry["risk_hash"] = self._risk_monitor.get_risk_state_hash()
+            except Exception:
+                pass
+        with self._cache_lock:
+            self._predictive_cache.set(pulse, entry)
+
+    # ========== 约束收集 ==========
+    def _collect_constraints(self, pulse: Any) -> Optional[Dict[str, Any]]:
+        """收集约束，失败返回 None 而非空字典，避免无约束执行"""
+        if self._conflict_arbiter and hasattr(self._conflict_arbiter, 'collect'):
+            try:
+                return self._conflict_arbiter.collect(pulse)
+            except Exception as e:
+                logger.error("约束收集异常: %s", e)
+                return None
+        return None
+
+    def _get_conservative_decision(self, pulse: Any) -> Dict[str, Any]:
+        """返回最保守决策（仲裁器降级时使用）"""
+        return {
+            "allowed": False,
+            "reason": "协商层降级，采用最保守策略",
+            "allowed_size_pct": 0.0,
+            "preferred_method": "none",
+            "warnings": ["negotiation_bus_degraded"],
         }
 
     # ========== 健康检查 ==========
     def health_check(self) -> Dict[str, Any]:
+        """
+        模块自检：包含端到端穿透测试。
+        使用带超时的锁获取避免在高负载下僵死。
+        测试过程不污染生产缓存。
+        """
         try:
-            if not hasattr(self, '_active_lines') or not hasattr(self, '_lock'):
-                return {"status": "degraded", "reason": "核心数据结构未初始化", "data": {}, "warnings": ["core_not_initialized"]}
+            if not self._neuro_pulse:
+                return {
+                    "status": "error",
+                    "reason": "核心子模块 NeuroPulse 不可用",
+                    "data": {},
+                    "warnings": ["neuro_pulse_critical_failure"],
+                }
 
-            with self._lock:
-                active_count = len(self._active_lines)
+            # 尝试获取普通优先级锁（带超时）
+            acquired = self._normal_priority_lock.acquire(timeout=self.HEALTH_CHECK_LOCK_TIMEOUT)
+            if not acquired:
+                return {
+                    "status": "degraded",
+                    "reason": f"健康检查获取锁超时({self.HEALTH_CHECK_LOCK_TIMEOUT}s)，协商层高负载",
+                    "data": {},
+                    "warnings": ["health_check_timeout"],
+                }
 
-            # 查询熔断器状态摘要
-            breaker_summary = {}
-            if self._circuit_breaker is not None and hasattr(self._circuit_breaker, 'get_all_status'):
+            try:
+                # 端到端穿透测试（不写缓存）
+                test_intent = {
+                    "intent_type": "health_probe",
+                    "urgency": 0,
+                    "desired_size_pct": 0.0,
+                }
+                # 直接调用标准协商，跳过锁（因为已持有锁）
+                test_result = self._standard_negotiate(test_intent, skip_cache=True)
+                if test_result["status"] == "error":
+                    return {
+                        "status": "error",
+                        "reason": f"端到端协商测试失败: {test_result.get('reason')}",
+                        "data": test_result,
+                        "warnings": ["e2e_test_failed"],
+                    }
+            finally:
+                self._normal_priority_lock.release()
+
+            # 子模块健康检查
+            sub_health = {}
+            for name, available in self._submodule_status.items():
+                if not available:
+                    continue
+                instance = getattr(self, f"_{name}", None)
+                if instance is None:
+                    continue
                 try:
-                    breaker_summary = self._circuit_breaker.get_all_status()
+                    if hasattr(instance, "health_check"):
+                        sub_health[name] = instance.health_check()
+                    else:
+                        sub_health[name] = {"status": "ok", "message": "无 health_check 方法"}
                 except Exception as e:
-                    logger.warning("熔断器状态查询失败: %s", e)
+                    sub_health[name] = {"status": "error", "message": str(e)}
+
+            all_ok = all(self._submodule_status.values())
 
             return {
-                "status": "ok",
-                "reason": f"PipelineBus 正常，活跃流水线: {active_count}",
+                "status": "ok" if all_ok else "degraded",
+                "reason": f"协商层状态: {'正常' if all_ok else '部分降级'}",
                 "data": {
-                    "active_pipelines": active_count,
-                    "max_capacity": self.DEFAULT_MAX_PARALLEL_LINES,
-                    "circuit_breaker_status": breaker_summary,
-                    "dependencies": {
-                        "stage_scheduler": self._stage_scheduler is not None,
-                        "watchdog": self._watchdog is not None,
-                        "circuit_breaker": self._circuit_breaker is not None,
-                        "context_passer": self._context_passer is not None,
-                        "negotiation_bus": self._negotiation_bus is not None,
-                        "behavioral_logger": self._behavioral_logger is not None,
-                    },
+                    "submodules": self._submodule_status,
+                    "sub_health": sub_health,
+                    "e2e_test": "passed",
                 },
-                "warnings": [],
+                "warnings": [] if all_ok else [
+                    f"degraded_submodules: {[k for k, v in self._submodule_status.items() if not v]}"
+                ],
             }
         except Exception as e:
-            logger.error("健康检查失败: %s #RECOVERY: 检查锁状态和字典完整性", e)
-            return {"status": "error", "reason": f"健康检查异常: {str(e)}", "data": {}, "warnings": [f"health_check_failed: {str(e)}"]}
-
-    # ========== 私有方法 ==========
-    def _finalize_pipeline(
-        self, line_id: str, pipeline: Dict[str, Any], reason: str,
-        final_status: PipelineStatus, final_result: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        """终结流水线，先使用数据再移除"""
-        pipeline["status"] = final_status.value
-        pipeline["completed_at"] = time.time()
-        if final_result:
-            pipeline["final_result"] = final_result
-
-        # 先使用流水线信息进行后续操作
-        if final_status == PipelineStatus.COMPLETED:
-            logger.info("流水线完成: id=%s, symbol=%s, strategy=%s, 耗时=%.2fs",
-                        line_id, pipeline["symbol"], pipeline["strategy"],
-                        pipeline.get("completed_at", 0) - pipeline.get("created_at", 0))
-        else:
-            logger.warning("流水线终止: id=%s, symbol=%s, strategy=%s, 原因=%s",
-                           line_id, pipeline["symbol"], pipeline["strategy"], reason)
-
-        # 看门狗注销
-        if self._watchdog is not None:
-            try:
-                self._watchdog.unregister(line_id)
-            except Exception as e:
-                logger.warning("看门狗注销失败: %s", e)
-
-        # 熔断器记录（区分成功/失败）
-        if self._circuit_breaker is not None:
-            try:
-                if final_status == PipelineStatus.ABORTED:
-                    if hasattr(self._circuit_breaker, 'record_failure'):
-                        self._circuit_breaker.record_failure(pipeline["strategy"])
-                elif final_status == PipelineStatus.COMPLETED:
-                    if hasattr(self._circuit_breaker, 'record_success'):
-                        self._circuit_breaker.record_success(pipeline["strategy"])
-            except Exception as e:
-                logger.warning("熔断器记录失败: %s", e)
-
-        # 推送事件
-        if self._negotiation_bus is not None and hasattr(self._negotiation_bus, 'publish_event'):
-            try:
-                self._negotiation_bus.publish_event(
-                    event_type="pipeline_status_change",
-                    line_id=line_id, symbol=pipeline["symbol"], strategy=pipeline["strategy"],
-                    final_status=final_status.value, reason=reason, timestamp=time.time(),
-                )
-            except Exception as e:
-                logger.warning("协商总线事件推送失败: %s", e)
-
-        if self._behavioral_logger is not None:
-            try:
-                self._behavioral_logger.log_event(
-                    event_type="pipeline_finalized",
-                    details={
-                        "line_id": line_id, "symbol": pipeline["symbol"], "strategy": pipeline["strategy"],
-                        "final_status": final_status.value, "reason": reason,
-                        "stage_history": pipeline.get("stage_history", []),
-                    },
-                )
-            except Exception as e:
-                logger.warning("行为日志记录失败: %s", e)
-
-        # 最后从活跃字典移除
-        del self._active_lines[line_id]
-
-        return {
-            "status": "ok",
-            "reason": f"流水线 {line_id} 已{final_status.value}: {reason}",
-            "data": {"line_id": line_id, "final_status": final_status.value, "reason": reason},
-            "warnings": [],
-        }
-
-    def _check_creation_rate(self) -> None:
-        """监控流水线创建速率，超阈值发出告警"""
-        now = time.time()
-        self._creation_timestamps.append(now)
-        # 清理过期时间戳
-        while self._creation_timestamps and self._creation_timestamps[0] < now - self.PIPELINE_CREATION_RATE_WINDOW_SEC:
-            self._creation_timestamps.popleft()
-        if len(self._creation_timestamps) > self.PIPELINE_CREATION_RATE_THRESHOLD:
-            logger.error(
-                "流水线创建速率过高: %d 次/分钟，可能存在异常触发 #RECOVERY: 检查策略引擎信号频率",
-                len(self._creation_timestamps)
-            )
-
-    def _is_watchdog_degraded(self, strategy: str) -> bool:
-        """检查某策略的看门狗是否已连续失败达到阈值"""
-        with self._watchdog_failure_lock:
-            cnt = self._watchdog_failure_counts.get(strategy, 0)
-            return cnt >= self.MAX_WATCHDOG_REGISTER_FAILURES
-
-    def _record_watchdog_failure(self, strategy: str) -> None:
-        """记录看门狗注册失败"""
-        with self._watchdog_failure_lock:
-            self._watchdog_failure_counts[strategy] = self._watchdog_failure_counts.get(strategy, 0) + 1
-
-    def _reset_watchdog_failure(self, strategy: str) -> None:
-        """重置看门狗失败计数"""
-        with self._watchdog_failure_lock:
-            self._watchdog_failure_counts[strategy] = 0
+            logger.error("健康检查失败: %s #RECOVERY: 检查子模块文件完整性", e)
+            return {
+                "status": "error",
+                "reason": f"健康检查异常: {str(e)}",
+                "data": {},
+                "warnings": [f"health_check_failed: {str(e)}"],
+    }
