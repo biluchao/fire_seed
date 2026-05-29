@@ -1,40 +1,38 @@
 """
-火种系统 · 协商总线超时回退处理器 (TimeoutFallback)
+火种系统 · 超时回退处理器 (TimeoutFallback)
 
 核心职责：
-1. 维护每个已注册模块的超时阈值和安全回退值，在模块超时未响应时提供保守的默认响应
-2. 持续追踪各模块的响应时间统计（P95），自动判定模块是否需要降级，触发告警与行为日志
+1. 为协商总线各模块提供超时后的安全回退值，确保任何模块响应超时时系统仍能以保守策略继续运行
+2. 基于固定时间窗口监控各模块的超时频率，自动触发告警，并保护关键安全字段不可被配置覆盖
 
 外部依赖（真实模块接口）：
-- core.negotiation_bus.NegotiationBus : 获取已注册模块列表及其注册时声明的超时阈值
-- core.behavioral_logger.BehavioralLogger : 记录降级事件与超时统计
+- core.utils.config_loader.ConfigLoader : 加载模块超时与回退配置，支持热重载
+- core.behavioral_logger.BehavioralLogger : 记录超时事件与统计信息
 
 接口契约：
-- register_module(module_name: str, timeout_ms: float, fallback_data: Dict[str, Any]) -> Dict[str, Any]
-- record_response(module_name: str, elapsed_ms: float) -> Dict[str, Any]
-- get_fallback(module_name: str) -> Dict[str, Any]
-- get_module_health(module_name: str) -> Dict[str, Any]
-- get_all_health() -> Dict[str, Any]
-- health_check() -> Dict[str, Any]
+- get_fallback(module_name: str) -> Dict[str, Any] : 返回指定模块的超时安全回退值（深拷贝，调用方可安全修改）
+- record_timeout(module_name: str, elapsed_us: float) -> Dict[str, Any] : 记录一次超时事件
+- record_call(module_name: str) -> None : 记录一次对模块的正常调用（用于计算超时率）
+- health_check() -> Dict[str, Any] : 模块自检，结果带缓存
+- on_config_changed() -> None : 配置热重载回调
 - 所有公共方法输出字典固定包含 "status" (str), "reason" (str), "data" (Dict), "warnings" (List[str])
 
 异常与降级：
-- 当传入未注册的模块名时，返回通用保守默认值，并记录 WARNING 日志
-- 当模块响应时间统计样本不足时，使用 timeout_ms * 2 作为 P95 的保守估计值
-- 所有降级值在类常量区明确声明
+- 当 ConfigLoader 不可用时，使用内置硬编码安全默认值（最保守策略）
+- 当 BehavioralLogger 不可用时，超时事件仅记录本地日志
+- 所有回退值在类常量区声明，关键安全字段（如风控的 allowed）不可被配置覆盖
 
 资源管理：
-- 本模块维护每个模块的响应时间滑动窗口，定期清理过期数据
-- 统计数据使用独立锁保护，避免与协商总线主锁产生死锁
-- 不持有任何外部资源句柄
+- 本模块持有各模块超时统计的固定时间窗口数据，定期清理过期时间戳
+- 不持有外部资源句柄，两把锁分别保护回退值与统计数据，避免高频统计阻塞核心协商
 """
 
 import time
 import logging
 import threading
+import copy
 from typing import Dict, Any, List, Optional
-from collections import deque
-import numpy as np
+from collections import defaultdict, deque
 
 logger = logging.getLogger(__name__)
 
@@ -42,342 +40,245 @@ logger = logging.getLogger(__name__)
 class TimeoutFallback:
     """协商总线超时回退处理器"""
 
-    # ========== 类常量（默认配置，附带单位与取值范围注释） ==========
-    DEFAULT_TIMEOUT_MS = 300              # 默认超时时间，毫秒，取值范围 [50, 1000]
-    DEFAULT_WINDOW_SAMPLES = 50           # 响应时间滑动窗口最大样本数，无量纲，[20, 200]
-    DEGRADATION_THRESHOLD_RATIO = 1.5     # 降级判定阈值：P95 超时超过此倍率则降级，无量纲，[1.2, 3.0]
-    RECOVERY_THRESHOLD_RATIO = 0.8        # 恢复阈值：P95 回落至此倍率以下则恢复，无量纲，[0.5, 1.0]
-    MIN_SAMPLES_FOR_EVAL = 5              # 最小有效样本数，无量纲，[3, 20]
-    CLEANUP_INTERVAL_SEC = 300            # 统计清理间隔，秒，[120, 900]
-    MAX_DATA_AGE_SEC = 1800               # 统计数据最大保留时间，秒，[600, 3600]
-    FALLBACK_DEFAULT_DATA = {              # 通用保守默认值（作为最后回退）
-        "allowed": False,
-        "allowed_size_pct": 0.0,
-        "preferred_method": "limit_order",
-        "suggested_delay_us": 500,
-        "adjustment_reason": "模块超时，使用全局默认保守值",
+    # ========== 类常量 ==========
+    STATS_WINDOW_SEC = 600                 # 超时统计时间窗口，秒，[300, 900]
+    HIGH_TIMEOUT_RATE_THRESHOLD = 0.2     # 超时率超过 20% 触发告警
+    MIN_SAMPLES_FOR_ALERT = 20            # 最少总样本数才触发告警
+
+    # 内存告警阈值（每个模块的单个时间戳队列）
+    MAX_QUEUE_LENGTH_WARNING = 1_000_000  # 队列长度超过此值发出警告
+
+    # 健康检查缓存有效期
+    HEALTH_CHECK_CACHE_TTL_SEC = 10.0
+
+    # 关键安全字段：这些字段的值在任何情况下都不可被配置文件覆盖
+    IMMUTABLE_FIELDS = {
+        "risk_monitor": {"allowed": False, "allow_close": True},
+        "circuit_breaker": {"allowed": False},
+    }
+
+    # 内置硬编码回退值（配置不可用时的最后防线）
+    HARD_FALLBACKS = {
+        "risk_monitor": {
+            "allowed": False,
+            "allowed_size_pct": 0.0,
+            "adjustment_reason": "风控模块超时，默认禁止开仓/加仓，允许平仓",
+            "allow_close": True,
+        },
+        "execution_gateway": {
+            "allowed": True,
+            "preferred_method": "limit_order",
+            "max_slippage_bps": 1.0,
+            "adjustment_reason": "执行网关超时，默认使用保守限价单",
+        },
+        "profit_compression": {
+            "stop_price": None,
+            "adjustment_reason": "紧缩利润模块超时，使用上一帧有效止损",
+        },
+        "position_sizer": {
+            "allowed": True,
+            "allowed_size_pct": 0.0,          # 仅适用于 open/add，平仓不受此限制
+            "allow_unlimited_for_close": True, # 平仓不限制仓位
+            "adjustment_reason": "仓位计算超时，禁止新开仓，允许平仓",
+        },
     }
 
     def __init__(self):
-        # 模块注册表：module_name -> {timeout_ms, fallback_data}
-        self._registry: Dict[str, Dict[str, Any]] = {}
+        # 从配置加载的超时参数缓存
+        self._module_configs: Dict[str, Dict[str, Any]] = {}
+        # 自定义回退值（从配置加载，可能被安全字段覆盖）
+        self._custom_fallbacks: Dict[str, Dict[str, Any]] = {}
 
-        # 响应时间统计：module_name -> deque of elapsed_ms
-        self._response_stats: Dict[str, deque] = {}
+        # 超时统计：固定时间窗口，存储时间戳
+        self._timeout_timestamps: Dict[str, deque] = defaultdict(deque)
+        self._call_timestamps: Dict[str, deque] = defaultdict(deque)
 
-        # 模块降级状态：module_name -> bool
-        self._degraded_modules: Dict[str, bool] = {}
-
-        # 降级触发时间记录：module_name -> float
-        self._degraded_since: Dict[str, float] = {}
-
-        # 外部依赖注入
-        self._negotiation_bus = None
+        # 外部依赖
+        self._config_loader = None
         self._behavioral_logger = None
 
-        # 线程安全锁
-        self._registry_lock = threading.Lock()
-        self._stats_lock = threading.Lock()
+        # 线程安全：分离低频回退值锁与高频统计锁
+        self._lock_fallback = threading.Lock()  # 保护回退值、配置
+        self._lock_stats = threading.Lock()     # 保护超时统计时间戳
 
-        # 清理定时器
-        self._last_cleanup = time.time()
+        # 健康检查缓存
+        self._health_cache: Optional[Dict[str, Any]] = None
+        self._health_cache_time = 0.0
 
-        logger.info("TimeoutFallback 初始化完成")
+        logger.info("TimeoutFallback 初始化完成，已加载 %d 个硬编码回退值", len(self.HARD_FALLBACKS))
 
     # ========== 依赖注入 ==========
     def inject_dependencies(
         self,
-        negotiation_bus: Optional[Any] = None,
+        config_loader: Optional[Any] = None,
         behavioral_logger: Optional[Any] = None,
     ) -> None:
         """
-        注入外部依赖（可选注入，未注入时对应功能降级）
-
-        Args:
-            negotiation_bus: 协商总线实例（可选）
-            behavioral_logger: 行为日志实例（可选）
+        注入外部依赖，并立即加载配置与一致性校验
         """
-        if negotiation_bus is not None:
-            self._negotiation_bus = negotiation_bus
-            logger.info("NegotiationBus 注入成功")
+        if config_loader is not None:
+            self._config_loader = config_loader
+            self._load_config_from_loader()
+            logger.info("ConfigLoader 注入成功，已加载 %d 个模块配置", len(self._module_configs))
         else:
-            logger.warning("NegotiationBus 未注入，降级为本地日志")
+            logger.warning("ConfigLoader 未注入，将仅使用硬编码回退值")
 
         if behavioral_logger is not None:
             self._behavioral_logger = behavioral_logger
             logger.info("BehavioralLogger 注入成功")
         else:
-            logger.warning("BehavioralLogger 未注入，降级为标准 logger")
+            logger.warning("BehavioralLogger 未注入，超时事件仅记录本地日志")
+
+        # 校验回退值一致性
+        self._validate_consistency()
+
+    def on_config_changed(self) -> None:
+        """配置热重载回调，由 ConfigLoader 在配置变更后调用"""
+        loader = self._config_loader
+        if loader is not None:
+            self._load_config_from_loader(loader)
+            self._validate_consistency()
+            logger.info("配置热重载完成，已更新 %d 个模块配置", len(self._module_configs))
 
     # ========== 公共接口 ==========
-    @classmethod
-    def register_module(
-        cls,
-        module_name: str,
-        timeout_ms: float,
-        fallback_data: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        """
-        注册模块的超时阈值与安全回退值
-
-        Args:
-            module_name: 模块名称（如 'risk_monitor.circuit_breaker'）
-            timeout_ms: 超时阈值（毫秒）
-            fallback_data: 超时后返回的安全回退数据字典
-
-        Returns:
-            标准响应字典
-        """
-        if not module_name or not isinstance(module_name, str):
-            return {
-                "status": "error",
-                "reason": f"无效模块名称: {module_name}",
-                "data": {},
-                "warnings": [f"invalid_module_name: {module_name}"],
-            }
-
-        # 使用实例方法需要 self，这里调整为实例方法
-        pass
-
-    def register_module_instance(
-        self,
-        module_name: str,
-        timeout_ms: float,
-        fallback_data: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        """
-        注册模块的超时阈值与安全回退值（实例方法）
-
-        Args:
-            module_name: 模块名称
-            timeout_ms: 超时阈值（毫秒）
-            fallback_data: 超时后返回的安全回退数据字典
-
-        Returns:
-            标准响应字典
-        """
-        if not module_name or not isinstance(module_name, str):
-            return {
-                "status": "error",
-                "reason": f"无效模块名称: {module_name}",
-                "data": {},
-                "warnings": [f"invalid_module_name: {module_name}"],
-            }
-
-        if timeout_ms <= 0:
-            logger.warning(f"模块 {module_name} 超时阈值无效({timeout_ms}ms)，使用默认值 {self.DEFAULT_TIMEOUT_MS}ms")
-            timeout_ms = self.DEFAULT_TIMEOUT_MS
-
-        with self._registry_lock:
-            self._registry[module_name] = {
-                "timeout_ms": timeout_ms,
-                "fallback_data": fallback_data or self.FALLBACK_DEFAULT_DATA.copy(),
-            }
-            # 初始化响应统计
-            if module_name not in self._response_stats:
-                self._response_stats[module_name] = deque(maxlen=self.DEFAULT_WINDOW_SAMPLES)
-
-        logger.info(f"注册模块 {module_name}，超时阈值={timeout_ms}ms")
-        return {
-            "status": "ok",
-            "reason": f"模块 {module_name} 注册成功",
-            "data": {"module_name": module_name, "timeout_ms": timeout_ms},
-            "warnings": [],
-        }
-
-    def record_response(self, module_name: str, elapsed_ms: float) -> Dict[str, Any]:
-        """
-        记录模块的响应时间
-
-        Args:
-            module_name: 模块名称
-            elapsed_ms: 本次响应耗时（毫秒）
-
-        Returns:
-            标准响应字典
-        """
-        if module_name not in self._registry:
-            logger.warning(f"模块 {module_name} 未注册，无法记录响应时间")
-            return {
-                "status": "error",
-                "reason": f"模块 {module_name} 未注册",
-                "data": {},
-                "warnings": [f"unregistered_module: {module_name}"],
-            }
-
-        if elapsed_ms <= 0:
-            return {
-                "status": "error",
-                "reason": f"无效响应时间: {elapsed_ms}ms",
-                "data": {},
-                "warnings": ["invalid_elapsed_ms"],
-            }
-
-        with self._stats_lock:
-            if module_name not in self._response_stats:
-                self._response_stats[module_name] = deque(maxlen=self.DEFAULT_WINDOW_SAMPLES)
-            self._response_stats[module_name].append(elapsed_ms)
-
-        return {
-            "status": "ok",
-            "reason": f"已记录模块 {module_name} 响应时间 {elapsed_ms:.1f}ms",
-            "data": {"module_name": module_name, "elapsed_ms": elapsed_ms},
-            "warnings": [],
-        }
-
     def get_fallback(self, module_name: str) -> Dict[str, Any]:
         """
-        获取指定模块的安全回退值（在模块超时时调用）
+        获取指定模块的超时安全回退值（返回深拷贝，调用方可安全修改）
 
         Args:
             module_name: 模块名称
 
         Returns:
-            标准响应字典，data 中包含回退值
+            标准响应字典，data 中包含回退值字典的深拷贝
         """
-        with self._registry_lock:
-            reg = self._registry.get(module_name)
+        with self._lock_fallback:
+            if module_name in self._custom_fallbacks:
+                fallback = copy.deepcopy(self._custom_fallbacks[module_name])
+            elif module_name in self.HARD_FALLBACKS:
+                fallback = copy.deepcopy(self.HARD_FALLBACKS[module_name])
+            else:
+                logger.warning("未找到模块 %s 的回退值，使用通用默认值", module_name)
+                fallback = {
+                    "allowed": False,
+                    "allowed_size_pct": 0.0,
+                    "adjustment_reason": f"未配置 {module_name} 的回退值，默认拒绝",
+                }
 
-        if reg is None:
-            logger.warning(
-                f"模块 {module_name} 未注册，返回全局默认回退值 #RECOVERY: 检查模块是否正确注册"
-            )
-            return {
-                "status": "ok",
-                "reason": f"模块 {module_name} 未注册，使用全局默认保守值",
-                "data": self.FALLBACK_DEFAULT_DATA.copy(),
-                "warnings": [f"unregistered_module: {module_name}"],
-            }
-
-        fallback = reg["fallback_data"].copy()
         return {
             "status": "ok",
-            "reason": f"返回模块 {module_name} 的安全回退值 (超时阈值={reg['timeout_ms']}ms)",
+            "reason": f"返回 {module_name} 的超时回退值（深拷贝）",
             "data": fallback,
             "warnings": [],
         }
 
-    def get_module_health(self, module_name: str) -> Dict[str, Any]:
+    def record_timeout(self, module_name: str, elapsed_us: float) -> Dict[str, Any]:
         """
-        获取指定模块的响应健康状态
+        记录一次模块响应超时事件
 
         Args:
             module_name: 模块名称
-
-        Returns:
-            标准响应字典，data 中包含 p95, is_degraded 等字段
-        """
-        with self._registry_lock:
-            reg = self._registry.get(module_name)
-
-        if reg is None:
-            return {
-                "status": "error",
-                "reason": f"模块 {module_name} 未注册",
-                "data": {},
-                "warnings": [f"unregistered_module: {module_name}"],
-            }
-
-        timeout_ms = reg["timeout_ms"]
-
-        with self._stats_lock:
-            stats = self._response_stats.get(module_name)
-
-        p95 = self._calculate_p95(stats) if stats else None
-        sample_count = len(stats) if stats else 0
-
-        if p95 is None:
-            p95 = timeout_ms * 2
-            sample_note = f"样本不足({sample_count}<{self.MIN_SAMPLES_FOR_EVAL})，使用保守估计"
-        else:
-            sample_note = f"样本充足({sample_count})"
-
-        ratio = p95 / timeout_ms if timeout_ms > 0 else 1.0
-        is_degraded = self._degraded_modules.get(module_name, False)
-
-        return {
-            "status": "ok",
-            "reason": f"模块 {module_name} 响应健康: P95={p95:.1f}ms, 降级={is_degraded}",
-            "data": {
-                "module_name": module_name,
-                "p95_ms": round(p95, 1),
-                "timeout_ms": timeout_ms,
-                "ratio": round(ratio, 2),
-                "sample_count": sample_count,
-                "is_degraded": is_degraded,
-                "degraded_since": self._degraded_since.get(module_name),
-                "note": sample_note,
-            },
-            "warnings": [],
-        }
-
-    def get_all_health(self) -> Dict[str, Any]:
-        """
-        获取所有已注册模块的健康状态汇总
+            elapsed_us: 实际耗时（微秒）
 
         Returns:
             标准响应字典
         """
-        all_modules = {}
-        degraded_count = 0
-        with self._registry_lock:
-            module_names = list(self._registry.keys())
+        if elapsed_us < 0:
+            logger.warning("无效耗时: %s elapsed_us=%s，使用 0 替代", module_name, elapsed_us)
+            elapsed_us = 0.0
 
-        for name in module_names:
-            health = self.get_module_health(name)
-            if health["status"] == "ok":
-                all_modules[name] = health["data"]
-                if health["data"].get("is_degraded"):
-                    degraded_count += 1
+        now = time.time()
+        with self._lock_stats:
+            self._timeout_timestamps[module_name].append(now)
+            self._prune_timestamps(self._timeout_timestamps[module_name])
+            timeout_rate = self._get_timeout_rate(module_name)
+
+        logger.debug("记录超时: %s, 耗时=%.1fμs, 超时率=%.2f%%", module_name, elapsed_us, timeout_rate * 100)
+
+        warnings = []
+        if timeout_rate > self.HIGH_TIMEOUT_RATE_THRESHOLD:
+            msg = f"{module_name} 超时率过高 ({timeout_rate:.1%})，建议检查模块健康状态"
+            warnings.append(msg)
+            logger.error("%s #RECOVERY: 检查模块日志、增加超时阈值或重启该模块", msg)
+            if self._behavioral_logger is not None:
+                try:
+                    self._behavioral_logger.log_event(
+                        event_type="high_timeout_rate",
+                        details={"module": module_name, "timeout_rate": timeout_rate},
+                    )
+                except Exception as e:
+                    logger.warning("行为日志记录失败: %s", e)
 
         return {
             "status": "ok",
-            "reason": f"已评估 {len(all_modules)} 个模块，{degraded_count} 个处于降级状态",
+            "reason": f"已记录 {module_name} 的超时事件",
             "data": {
-                "total_modules": len(all_modules),
-                "degraded_count": degraded_count,
-                "modules": all_modules,
+                "module": module_name,
+                "elapsed_us": elapsed_us,
+                "timeout_rate": round(timeout_rate, 4),
             },
-            "warnings": [],
+            "warnings": warnings,
         }
+
+    def record_call(self, module_name: str) -> None:
+        """
+        记录一次对模块的正常调用（用于计算超时率）。
+        此方法使用独立锁，不会阻塞 get_fallback。
+        """
+        now = time.time()
+        with self._lock_stats:
+            dq = self._call_timestamps[module_name]
+            dq.append(now)
+            # 内存保护告警
+            if len(dq) > self.MAX_QUEUE_LENGTH_WARNING and len(dq) % 100000 == 0:
+                logger.warning(
+                    "%s 调用队列长度=%d，检查 STATS_WINDOW_SEC 是否过大或剪枝是否正常",
+                    module_name, len(dq)
+                )
+            self._prune_timestamps(dq)
 
     # ========== 健康检查 ==========
     def health_check(self) -> Dict[str, Any]:
-        """
-        模块自检
+        """模块自检（带结果缓存）"""
+        now = time.time()
+        if self._health_cache and (now - self._health_cache_time) < self.HEALTH_CHECK_CACHE_TTL_SEC:
+            return self._health_cache
 
-        Returns:
-            标准健康检查响应字典
-        """
         try:
-            with self._registry_lock:
-                registry_size = len(self._registry)
-                module_names = list(self._registry.keys())
-                # 在锁内获取快照
-                registry_snapshot = {
-                    name: {"timeout_ms": self._registry[name]["timeout_ms"]}
-                    for name in module_names
-                }
+            with self._lock_stats:
+                timeout_summary = {}
+                for mod in list(self._timeout_timestamps.keys()):
+                    rate = self._get_timeout_rate(mod)
+                    timeout_summary[mod] = {
+                        "timeout_count": len(self._timeout_timestamps[mod]),
+                        "call_count": len(self._call_timestamps[mod]),
+                        "timeout_rate": round(rate, 4),
+                    }
 
-            with self._stats_lock:
-                stat_sizes = {name: len(q) for name, q in self._response_stats.items()}
+            with self._lock_fallback:
+                active_fallbacks = {}
+                for mod in set(list(self.HARD_FALLBACKS.keys()) + list(self._custom_fallbacks.keys())):
+                    if mod in self._custom_fallbacks:
+                        active_fallbacks[mod] = {"source": "custom_config", "value": self._custom_fallbacks[mod]}
+                    else:
+                        active_fallbacks[mod] = {"source": "hard_coded", "value": self.HARD_FALLBACKS[mod]}
 
-            return {
+            result = {
                 "status": "ok",
-                "reason": f"TimeoutFallback 正常，已注册 {registry_size} 个模块",
+                "reason": f"TimeoutFallback 正常，监控 {len(timeout_summary)} 个活跃模块",
                 "data": {
-                    "registry_size": registry_size,
-                    "modules": registry_snapshot,
-                    "sample_counts": stat_sizes,
-                    "dependencies": {
-                        "negotiation_bus": self._negotiation_bus is not None,
-                        "behavioral_logger": self._behavioral_logger is not None,
-                    },
+                    "active_modules": len(timeout_summary),
+                    "timeout_summary": timeout_summary,
+                    "active_fallbacks": active_fallbacks,
+                    "hard_fallback_count": len(self.HARD_FALLBACKS),
+                    "custom_fallback_count": len(self._custom_fallbacks),
                 },
                 "warnings": [],
             }
+            self._health_cache = result
+            self._health_cache_time = now
+            return result
         except Exception as e:
-            logger.error(f"健康检查失败: {e} #RECOVERY: 检查锁状态和数据结构完整性")
+            logger.error("健康检查失败: %s #RECOVERY: 检查锁状态及统计数据完整性", e)
             return {
                 "status": "error",
                 "reason": f"健康检查异常: {str(e)}",
@@ -386,88 +287,68 @@ class TimeoutFallback:
             }
 
     # ========== 私有方法 ==========
+    def _load_config_from_loader(self, loader: Any = None) -> None:
+        """从 ConfigLoader 加载超时与回退配置"""
+        if loader is None:
+            loader = self._config_loader
+        if loader is None:
+            return
+
+        try:
+            config = loader.get("module_timeout", {})
+            modules = config.get("modules", {})
+            with self._lock_fallback:
+                for mod_name, mod_config in modules.items():
+                    self._module_configs[mod_name] = mod_config
+                    if "fallback" in mod_config:
+                        fallback = self._validate_fallback(mod_config["fallback"])
+                        # 强制覆盖不可变安全字段
+                        if mod_name in self.IMMUTABLE_FIELDS:
+                            fallback.update(self.IMMUTABLE_FIELDS[mod_name])
+                            logger.debug("已对 %s 应用不可变安全字段", mod_name)
+                        self._custom_fallbacks[mod_name] = fallback
+        except Exception as e:
+            logger.error("加载超时配置失败: %s #RECOVERY: 检查 config/system/module_timeout.yaml 语法", e)
+
     @staticmethod
-    def _calculate_p95(stats: deque) -> Optional[float]:
-        """计算响应时间的 P95 分位值"""
-        if not stats:
-            return None
-        raw = list(stats)
-        if len(raw) < 2:
-            return float(raw[0])
-        return float(np.percentile(raw, 95))
+    def _validate_fallback(fallback: Dict[str, Any]) -> Dict[str, Any]:
+        """验证并补全回退字典的必要字段"""
+        required = ["adjustment_reason"]
+        for key in required:
+            if key not in fallback:
+                fallback[key] = "回退值缺少说明"
+        if "allowed" not in fallback:
+            fallback["allowed"] = False
+        return fallback
 
-    def _cleanup_expired_stats(self) -> None:
-        """定期清理过期的响应统计（细粒度锁）"""
-        now = time.time()
-        if now - self._last_cleanup < self.CLEANUP_INTERVAL_SEC:
-            return
+    def _validate_consistency(self) -> None:
+        """验证自定义回退值与硬编码回退值的关键安全字段一致性"""
+        with self._lock_fallback:
+            for mod_name in self._custom_fallbacks:
+                if mod_name in self.HARD_FALLBACKS and mod_name in self.IMMUTABLE_FIELDS:
+                    custom = self._custom_fallbacks[mod_name]
+                    for field, expected in self.IMMUTABLE_FIELDS[mod_name].items():
+                        actual = custom.get(field)
+                        if actual != expected:
+                            logger.error(
+                                "安全字段冲突: %s.%s 期望=%s, 实际=%s, 已强制覆盖",
+                                mod_name, field, expected, actual
+                            )
+            logger.info("回退值一致性校验完成")
 
-        expired_modules = []
-        cutoff = now - self.MAX_DATA_AGE_SEC
+    def _prune_timestamps(self, dq: deque) -> None:
+        """清理时间戳队列中的过期数据（需在 _lock_stats 内调用）"""
+        cutoff = time.time() - self.STATS_WINDOW_SEC
+        while dq and dq[0] < cutoff:
+            dq.popleft()
 
-        # 先找出需要清理的模块
-        with self._stats_lock:
-            for module_name in list(self._response_stats.keys()):
-                stats = self._response_stats[module_name]
-                if stats and len(stats) > 0:
-                    first_entry_time = stats[0]
-                    if isinstance(first_entry_time, float) and first_entry_time < cutoff:
-                        expired_modules.append(module_name)
-
-        # 再逐个清理
-        for module_name in expired_modules:
-            with self._stats_lock:
-                if module_name in self._response_stats:
-                    self._response_stats[module_name].clear()
-                    logger.debug(f"清理模块 {module_name} 的过期响应统计")
-
-        self._last_cleanup = now
-
-    def _check_degradation(self, module_name: str) -> None:
-        """检查模块是否需要降级或恢复"""
-        health = self.get_module_health(module_name)
-        if health["status"] != "ok":
-            return
-
-        data = health["data"]
-        ratio = data.get("ratio", 0)
-        is_currently_degraded = self._degraded_modules.get(module_name, False)
-
-        if not is_currently_degraded and ratio > self.DEGRADATION_THRESHOLD_RATIO:
-            # 触发降级
-            self._degraded_modules[module_name] = True
-            self._degraded_since[module_name] = time.time()
-            logger.warning(
-                f"模块 {module_name} 进入降级状态 (P95={data['p95_ms']:.1f}ms, "
-                f"超时阈值={data['timeout_ms']}ms, 比率={ratio:.2f})"
-            )
-            self._log_degradation_event(module_name, "degraded", data)
-
-        elif is_currently_degraded and ratio < self.RECOVERY_THRESHOLD_RATIO:
-            # 恢复
-            self._degraded_modules[module_name] = False
-            degraded_duration = time.time() - self._degraded_since.get(module_name, time.time())
-            logger.info(
-                f"模块 {module_name} 从降级状态恢复 (持续 {degraded_duration:.0f}s, "
-                f"当前 P95={data['p95_ms']:.1f}ms)"
-            )
-            if module_name in self._degraded_since:
-                del self._degraded_since[module_name]
-            self._log_degradation_event(module_name, "recovered", data)
-
-    def _log_degradation_event(self, module_name: str, event: str, health_data: Dict[str, Any]) -> None:
-        """记录降级/恢复事件到行为日志"""
-        if self._behavioral_logger is not None and hasattr(self._behavioral_logger, 'log_event'):
-            try:
-                self._behavioral_logger.log_event(
-                    event_type=f"module_{event}",
-                    details={
-                        "module": module_name,
-                        "event": event,
-                        "p95_ms": health_data.get("p95_ms"),
-                        "timeout_ms": health_data.get("timeout_ms"),
-                        "ratio": health_data.get("ratio"),
-                    },
-                )
-            except Exception as e:
-                logger.warning(f"行为日志记录失败: {e}")
+    def _get_timeout_rate(self, module_name: str) -> float:
+        """
+        计算窗口内超时率（需在 _lock_stats 内调用）。
+        由于追加时已即时剪枝，队列长度即为窗口内有效计数，无需再次遍历。
+        """
+        timeout_count = len(self._timeout_timestamps[module_name])
+        call_count = len(self._call_timestamps[module_name])
+        if call_count < self.MIN_SAMPLES_FOR_ALERT:
+            return 0.0
+        return timeout_count / call_count if call_count > 0 else 0.0
