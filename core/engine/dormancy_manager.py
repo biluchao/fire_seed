@@ -49,11 +49,13 @@ class DormancyManager:
     DEEP_DORMANCY_LIGHT_DURATION_SEC = 86400.0  # 浅层休眠持续时长（秒）后进入深层，[43200, 259200]
     DEEP_DORMANCY_CONSECUTIVE_LOSSES = 10        # 连续亏损笔数触发深层休眠，[5, 30]
     DEEP_DORMANCY_WAKE_VOLATILITY_PCT = 30.0     # 波动率回升至该分位（0-100）以上可唤醒深层，[20, 50]
+    DEEP_DORMANCY_REQUIRE_SHARPE_THRESHOLD = 0.0  # 深层休眠要求全策略夏普低于此值，用于复合确认，[-1.0, 0.5]
 
     # 冬眠
     HIBERNATION_ALL_SHARPE_DAYS = 7            # 全策略夏普<0持续天数触发冬眠，[3, 30]
     HIBERNATION_ALL_SHARPE_THRESHOLD = -0.5    # 触发冬眠的夏普阈值，[-2.0, 0.0]
     HIBERNATION_WAKE_MANUAL_ONLY = True         # 冬眠是否仅支持人工唤醒
+    HIBERNATION_RECOVERY_STABLE_SEC = 86400.0   # 夏普恢复至阈值以上后，需稳定此时间才重置计时器，秒，[43200, 259200]
 
     # 唤醒步骤
     WAKEUP_STEP1_DURATION_SEC = 1800.0          # 第一步：恢复降频感知，观察市场（秒），[300, 3600]
@@ -62,6 +64,7 @@ class DormancyManager:
     WAKEUP_STEP2_MIN_WINRATE = 0.5               # 试探交易最小胜率，[0.3, 0.7]
     WAKEUP_STEP3_STABLE_SEC = 7200.0            # 第三步：观察标签下稳定运行时间（秒），[1800, 21600]
     WAKEUP_STEP3_REQUIRED_SHARPE = 0.0           # 第三步稳定期要求的最低滚动夏普，[-0.5, 0.5]
+    WAKEUP_TOTAL_TIMEOUT_SEC = 604800.0          # 唤醒流程总超时（秒，默认7天），超时后锁定休眠等待人工，[86400, 2592000]
 
     # 其他
     ANOMALY_REGRESSION_DELAY_SEC = 60.0          # 唤醒异常回退后的等待时间（秒），[30, 600]
@@ -81,6 +84,11 @@ class DormancyManager:
 
         # 冬眠前置计时器（用于持续时间校验）
         self._sharpe_below_start = 0.0
+        # 夏普恢复稳定计时器
+        self._sharpe_recovery_start = 0.0
+
+        # 唤醒流程总计时器
+        self._wakeup_process_start_time = 0.0
 
         # 唤醒回退计数器
         self._wakeup_regression_count = 0
@@ -138,63 +146,94 @@ class DormancyManager:
 
             triggered_level = None
             reason = ""
+            context_snapshot = {
+                "no_signal_duration": no_signal_duration,
+                "balance_index": balance_index,
+                "consecutive_losses": consecutive_losses,
+                "all_sharpe": all_sharpe,
+            }
 
-            # 冬眠检测（最高优先级，需持续时间校验）
+            # --- 冬眠检测（最高优先级，含持续时间校验与恢复稳定期） ---
             if all_sharpe < self.HIBERNATION_ALL_SHARPE_THRESHOLD:
+                # 记录首次跌破时间
                 if self._sharpe_below_start == 0.0:
                     self._sharpe_below_start = time.time()
-                elif time.time() - self._sharpe_below_start >= self.HIBERNATION_ALL_SHARPE_DAYS * 86400:
+                # 如果之前有恢复计时，现在再次跌破，则恢复计时重置
+                self._sharpe_recovery_start = 0.0
+                # 检查是否满足持续时间
+                if (time.time() - self._sharpe_below_start
+                        >= self.HIBERNATION_ALL_SHARPE_DAYS * 86400):
                     triggered_level = "hibernation"
                     reason = (
                         f"全策略夏普 ({all_sharpe:.2f}) 持续低于冬眠阈值 "
                         f"{self.HIBERNATION_ALL_SHARPE_DAYS} 天"
                     )
-                    self._sharpe_below_start = 0.0
             else:
-                # 夏普恢复，重置计时器
-                self._sharpe_below_start = 0.0
+                # 夏普恢复到阈值以上
+                if self._sharpe_below_start != 0.0:
+                    if self._sharpe_recovery_start == 0.0:
+                        self._sharpe_recovery_start = time.time()
+                    # 检查是否已稳定足够久
+                    if (time.time() - self._sharpe_recovery_start
+                            >= self.HIBERNATION_RECOVERY_STABLE_SEC):
+                        # 风险解除，重置所有计时器
+                        self._sharpe_below_start = 0.0
+                        self._sharpe_recovery_start = 0.0
+                        logger.info("冬眠风险解除：夏普已稳定恢复，重置计时器")
+                else:
+                    # 从未触发过，保持正常
+                    pass
 
-            if triggered_level is None:
-                if self._current_state == "deep_dormancy":
-                    # 已在深层休眠，检查是否应升级到冬眠
-                    if consecutive_losses >= self.DEEP_DORMANCY_CONSECUTIVE_LOSSES * 2:
-                        triggered_level = "hibernation"
-                        reason = f"深层休眠期间连续亏损 {consecutive_losses} 笔，触发冬眠"
+            # --- 深层休眠检测（复合确认：连续亏损 + 夏普低于阈值） ---
+            if triggered_level is None and self._current_state != "hibernation":
+                if consecutive_losses >= self.DEEP_DORMANCY_CONSECUTIVE_LOSSES and \
+                   all_sharpe < self.DEEP_DORMANCY_REQUIRE_SHARPE_THRESHOLD:
+                    # 深层休眠触发条件满足
+                    if self._current_state == "light_dormancy":
+                        light_duration = time.time() - self._light_dormancy_start_time
+                        if light_duration >= self.DEEP_DORMANCY_LIGHT_DURATION_SEC:
+                            triggered_level = "deep_dormancy"
+                            reason = (f"浅层休眠超时 + 连续亏损 {consecutive_losses} 笔 "
+                                      f"且夏普 {all_sharpe:.2f} < {self.DEEP_DORMANCY_REQUIRE_SHARPE_THRESHOLD}")
+                        else:
+                            # 浅层未超时，但连续亏损已达到深层标准，仍可升级
+                            triggered_level = "deep_dormancy"
+                            reason = (f"连续亏损 {consecutive_losses} 笔 "
+                                      f"且夏普 {all_sharpe:.2f} < {self.DEEP_DORMANCY_REQUIRE_SHARPE_THRESHOLD}，升级为深层休眠")
+                    elif self._current_state == "deep_dormancy":
+                        # 已深层，不需要再触发
+                        pass
+                    elif self._current_state == "active":
+                        # 活跃状态下直接进入浅层休眠，而不是深层
+                        triggered_level = "light_dormancy"
+                        reason = (f"连续亏损 {consecutive_losses} 笔，进入浅层休眠冷静期")
                 elif self._current_state == "light_dormancy":
-                    # 检查浅层是否应升级为深层
+                    # 浅层休眠超时升级（即使无连续亏损）
                     light_duration = time.time() - self._light_dormancy_start_time
                     if light_duration >= self.DEEP_DORMANCY_LIGHT_DURATION_SEC:
                         triggered_level = "deep_dormancy"
                         reason = f"浅层休眠已持续 {light_duration:.0f} 秒，升级为深层休眠"
-                    elif consecutive_losses >= self.DEEP_DORMANCY_CONSECUTIVE_LOSSES:
-                        triggered_level = "deep_dormancy"
-                        reason = f"连续亏损 {consecutive_losses} 笔，触发深层休眠"
-                elif self._current_state == "active":
-                    # 浅层休眠检测
-                    if (no_signal_duration >= self.LIGHT_DORMANCY_NO_SIGNAL_SEC or
-                            balance_index <= self.LIGHT_DORMANCY_BALANCE_INDEX_MIN):
-                        triggered_level = "light_dormancy"
-                        if no_signal_duration >= self.LIGHT_DORMANCY_NO_SIGNAL_SEC:
-                            reason = f"连续无信号 {no_signal_duration:.0f} 秒，触发浅层休眠"
-                        else:
-                            reason = (
-                                f"平衡指数 {balance_index:.1f} 低于阈值 "
-                                f"{self.LIGHT_DORMANCY_BALANCE_INDEX_MIN}"
-                            )
-                    # 活跃状态下连续亏损达到深层阈值时直接升级
-                    elif consecutive_losses >= self.DEEP_DORMANCY_CONSECUTIVE_LOSSES * 2:
-                        triggered_level = "deep_dormancy"
+
+            # --- 浅层休眠检测（仅在活跃状态） ---
+            if triggered_level is None and self._current_state == "active":
+                if (no_signal_duration >= self.LIGHT_DORMANCY_NO_SIGNAL_SEC or
+                        balance_index <= self.LIGHT_DORMANCY_BALANCE_INDEX_MIN):
+                    triggered_level = "light_dormancy"
+                    if no_signal_duration >= self.LIGHT_DORMANCY_NO_SIGNAL_SEC:
+                        reason = f"连续无信号 {no_signal_duration:.0f} 秒，触发浅层休眠"
+                    else:
                         reason = (
-                            f"活跃状态下连续亏损 {consecutive_losses} 笔，"
-                            f"直接升级为深层休眠"
+                            f"平衡指数 {balance_index:.1f} 低于阈值 "
+                            f"{self.LIGHT_DORMANCY_BALANCE_INDEX_MIN}"
                         )
 
             # 执行状态转换
             warnings = []
             if triggered_level:
+                logger.warning("触发休眠: %s, 原因: %s, 快照: %s",
+                               triggered_level, reason, context_snapshot)
                 self._transition_to(triggered_level)
                 warnings.append(f"触发休眠: {triggered_level}")
-                logger.warning("触发休眠: %s, 原因: %s", triggered_level, reason)
             else:
                 logger.debug("休眠评估完成，无需进入休眠")
 
@@ -211,12 +250,7 @@ class DormancyManager:
             }
 
     def get_dormancy_state(self) -> Dict[str, Any]:
-        """
-        返回当前休眠状态及元数据
-
-        Returns:
-            标准响应字典
-        """
+        """返回当前休眠状态及元数据"""
         with self._state_lock:
             return {
                 "status": "ok",
@@ -239,14 +273,6 @@ class DormancyManager:
     ) -> Dict[str, Any]:
         """
         执行一步渐进唤醒流程，调用方需根据返回的 action 调整系统状态
-
-        Args:
-            signal_present: 是否出现 A 级或以上信号（用于浅层唤醒）
-            market_vol_ok: 市场波动率是否回升至唤醒阈值以上（用于深层唤醒）
-            trial_result: 试探交易的结果字典，应包含 "success" (bool) 和 "pnl" (float)
-
-        Returns:
-            标准响应字典，data 中包含建议的下一步动作和当前唤醒步骤
         """
         with self._state_lock:
             if self._current_state == "active":
@@ -255,6 +281,23 @@ class DormancyManager:
                     "reason": "系统处于活跃状态，无需唤醒",
                     "data": {"action": "none", "wakeup_step": None},
                     "warnings": [],
+                }
+
+            # 唤醒流程总超时检查
+            if self._wakeup_process_start_time == 0.0:
+                self._wakeup_process_start_time = time.time()
+            total_elapsed = time.time() - self._wakeup_process_start_time
+            if total_elapsed >= self.WAKEUP_TOTAL_TIMEOUT_SEC:
+                logger.error(
+                    "唤醒流程总超时 (%.1f 秒)，锁定休眠 #RECOVERY: 人工检查策略有效性",
+                    total_elapsed
+                )
+                self._wakeup_step = None
+                return {
+                    "status": "error",
+                    "reason": "唤醒流程超时，休眠已锁定",
+                    "data": {"action": "locked", "wakeup_step": None},
+                    "warnings": ["wakeup_timeout"],
                 }
 
             # 冬眠不支持自动唤醒
@@ -271,41 +314,41 @@ class DormancyManager:
             reason = ""
             warnings = []
 
-            # 浅层休眠唤醒条件
+            # 浅层休眠唤醒
             if self._current_state == "light_dormancy":
                 if signal_present and self.LIGHT_DORMANCY_WAKE_A_SIGNAL:
-                    # 直接唤醒到活跃
                     self._transition_to("active")
                     action = "full_wakeup"
                     reason = "A级信号触发浅层休眠唤醒"
                 elif self._wakeup_step is None:
-                    # 开始渐进唤醒
                     new_step = "step1"
                     self._wakeup_step = new_step
                     self._wakeup_step_start_time = time.time()
+                    self._wakeup_process_start_time = time.time() if self._wakeup_process_start_time == 0.0 else self._wakeup_process_start_time
                     action = "enter_step1"
                     reason = "启动渐进唤醒第一步：恢复降频感知"
 
-            # 深层休眠唤醒条件
+            # 深层休眠唤醒
             elif self._current_state == "deep_dormancy":
                 if market_vol_ok:
                     if self._wakeup_step is None:
                         new_step = "step1"
                         self._wakeup_step = new_step
                         self._wakeup_step_start_time = time.time()
+                        self._wakeup_process_start_time = time.time() if self._wakeup_process_start_time == 0.0 else self._wakeup_process_start_time
                         action = "enter_step1"
                         reason = "波动率回升，启动渐进唤醒"
                     else:
-                        # 继续当前唤醒步骤
                         action, new_step, reason = self._advance_wakeup_step(trial_result)
 
+            # 活跃状态下但仍有唤醒步骤残留（异常恢复）
             elif self._current_state == "active" and self._wakeup_step is not None:
-                # 活跃状态下继续完成剩余的唤醒步骤
                 action, new_step, reason = self._advance_wakeup_step(trial_result)
 
             if action == "full_wakeup":
                 self._wakeup_step = None
                 self._wakeup_regression_count = 0
+                self._wakeup_process_start_time = 0.0
 
             return {
                 "status": "ok",
@@ -320,12 +363,7 @@ class DormancyManager:
 
     # ========== 健康检查 ==========
     def health_check(self) -> Dict[str, Any]:
-        """
-        模块自检
-
-        Returns:
-            标准健康检查响应字典
-        """
+        """模块自检"""
         try:
             with self._state_lock:
                 current_state = self._current_state
@@ -366,13 +404,19 @@ class DormancyManager:
             self._trial_trades_done = 0
             self._trial_trades_won = 0
             self._wakeup_regression_count = 0
+            self._wakeup_process_start_time = 0.0
 
         logger.info("休眠状态转换: %s -> %s", old_state, new_state)
         if self._behavioral_logger:
             try:
                 self._behavioral_logger.log_event(
                     event_type="dormancy_transition",
-                    details={"from": old_state, "to": new_state, "timestamp": time.time()},
+                    details={
+                        "from": old_state,
+                        "to": new_state,
+                        "timestamp": time.time(),
+                        "reason": "evaluate_dormancy triggered"
+                    },
                 )
             except Exception as e:
                 logger.warning(f"行为日志记录失败: {e}")
@@ -392,7 +436,6 @@ class DormancyManager:
                     "step1",
                     f"第一步观察中，已耗时 {elapsed:.0f}s/{self.WAKEUP_STEP1_DURATION_SEC}s",
                 )
-
         elif step == "step2":
             if trial_result is not None:
                 self._trial_trades_done += 1
@@ -415,8 +458,8 @@ class DormancyManager:
                     if self._wakeup_regression_count >= self.MAX_WAKEUP_REGRESSIONS:
                         self._wakeup_step = None
                         logger.error(
-                            f"唤醒回退次数 ({self._wakeup_regression_count}) 超过上限，"
-                            f"锁定休眠状态 #RECOVERY: 人工检查策略有效性，确认市场状态是否适合自动唤醒"
+                            f"唤醒回退次数 ({self._wakeup_regression_count}) 超过上限，锁定休眠状态 "
+                            f"#RECOVERY: 人工检查策略有效性，确认市场状态是否适合自动唤醒"
                         )
                         return (
                             "locked",
@@ -441,7 +484,6 @@ class DormancyManager:
                     "step2",
                     f"等待试探交易 ({self._trial_trades_done}/{self.WAKEUP_STEP2_TRIAL_TRADES})",
                 )
-
         elif step == "step3":
             elapsed = time.time() - self._wakeup_step_start_time
             if elapsed >= self.WAKEUP_STEP3_STABLE_SEC:
@@ -453,5 +495,4 @@ class DormancyManager:
                     "step3",
                     f"稳定观察中，已耗时 {elapsed:.0f}s/{self.WAKEUP_STEP3_STABLE_SEC}s",
                 )
-
         return "hold", step, "未知步骤"
