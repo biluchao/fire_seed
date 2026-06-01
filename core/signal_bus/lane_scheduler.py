@@ -29,6 +29,7 @@
 
 资源管理：
 - 本模块使用 threading.Lock 保护共享统计数据结构
+- 极速车道 dispatch 采用无锁路径，避免锁竞争导致的延迟超标
 - 不持有任何需要手动释放的外部资源句柄
 """
 
@@ -80,7 +81,7 @@ class LaneScheduler:
                 "dispatched": 0,               # 已调度任务数
                 "executed": 0,                 # 已执行任务数
                 "dropped": 0,                  # 丢弃任务数
-                "degraded_from": 0,            # 从该车道降级出去的任务数
+                "degraded_from": 0,            # 从该车道降级出去的任务数（原始车道计数）
                 "queue_full_events": 0,        # 队列满载次数
                 "latency_history": deque(maxlen=self.DEFAULT_STATS_WINDOW),
                 "core_borrowed_by": None,       # 当前被哪个车道借用（仅对express有效）
@@ -89,7 +90,7 @@ class LaneScheduler:
             for lane in ["express", "fast", "normal", "slow"]
         }
 
-        # 极速车道正在执行的任务计数
+        # 极速车道正在执行的任务计数（用于空闲判定）
         self._express_active_count = 0
 
         # 动态核心借用状态
@@ -97,11 +98,14 @@ class LaneScheduler:
         self._core_borrow_start = 0.0        # 借用开始时间戳
         self._core_borrower = None            # 借用者车道名
 
+        # 消费端存活监控
+        self._last_consume_time = time.time()
+
         # 外部依赖注入
         self._negotiation_bus = None
         self._behavioral_logger = None
 
-        # 线程安全
+        # 线程安全（保护非极速车道的统计和队列操作；极速车道 dispatch 使用无锁路径）
         self._lock = threading.Lock()
 
         logger.info("LaneScheduler 初始化完成，极速队列=%d, 快速队列=%d, 普通队列=%d, 慢速队列=%d",
@@ -166,34 +170,60 @@ class LaneScheduler:
         signal["_dispatched_at"] = time.time()
         signal["_target_lane"] = target_lane
 
+        # 极速车道到达时强制回收被借用的核心
+        if target_lane == "express" and self._core_borrowed:
+            self.release_express_core()
+            logger.warning("极速信号到达，强制回收被借用的核心")
+
+        # 极速车道采用无锁路径，避免与统计/借用操作争锁导致延迟超标
+        if target_lane == "express":
+            queue = self._queues["express"]
+            if len(queue) < queue.maxlen:
+                queue.append(signal)
+                # 无锁更新统计（Python GIL 保证整型操作原子性）
+                self._stats["express"]["dispatched"] += 1
+                logger.debug(f"信号已调度至极速车道 (无锁路径), urgency={urgency}")
+                return {
+                    "status": "ok",
+                    "reason": "信号已路由至极速车道（无锁路径）",
+                    "data": {"lane": target_lane, "urgency": urgency},
+                    "warnings": [],
+                }
+            else:
+                # 无锁路径满，进入带锁路径做最终检查
+                return self._dispatch_with_lock(signal, target_lane)
+
+        # 非极速车道走带锁路径
+        return self._dispatch_with_lock(signal, target_lane)
+
+    def _dispatch_with_lock(self, signal: Dict[str, Any], target_lane: str) -> Dict[str, Any]:
+        """非极速车道或极速队列满时的调度路径，使用锁保护"""
+        urgency = signal.get("urgency", 0)
         with self._lock:
             queue = self._queues[target_lane]
-            if len(queue) >= queue.maxlen:
-                # 队列满，尝试降级
-                degraded = self._degrade_signal(signal, target_lane)
-                self._stats[target_lane]["queue_full_events"] += 1
-                logger.warning(
-                    f"{target_lane} 队列已满，信号降级至 {degraded} #RECOVERY: "
-                    f"检查下游消费速度或扩大队列容量"
-                )
+            if len(queue) < queue.maxlen:
+                queue.append(signal)
+                self._stats[target_lane]["dispatched"] += 1
                 return {
-                    "status": "degraded",
-                    "reason": f"{target_lane} 队列已满，信号降级至 {degraded}",
-                    "data": {"lane": degraded, "urgency": urgency,
-                             "degradation_chain": signal.get("_degradation_chain", [])},
-                    "warnings": [f"{target_lane}_queue_full"],
+                    "status": "ok",
+                    "reason": f"信号已路由至 {target_lane} 车道",
+                    "data": {"lane": target_lane, "urgency": urgency},
+                    "warnings": [],
                 }
-
-            queue.append(signal)
-            self._stats[target_lane]["dispatched"] += 1
-
-        logger.debug(f"信号已调度至 {target_lane} 车道, urgency={urgency}")
-        return {
-            "status": "ok",
-            "reason": f"信号已路由至 {target_lane} 车道",
-            "data": {"lane": target_lane, "urgency": urgency},
-            "warnings": [],
-        }
+            # 队列满，尝试降级
+            degraded = self._degrade_signal(signal, target_lane)
+            self._stats[target_lane]["queue_full_events"] += 1
+            logger.warning(
+                f"{target_lane} 队列已满，信号降级至 {degraded} #RECOVERY: "
+                f"检查下游消费速度或扩大队列容量"
+            )
+            return {
+                "status": "degraded",
+                "reason": f"{target_lane} 队列已满，信号降级至 {degraded}",
+                "data": {"lane": degraded, "urgency": urgency,
+                         "degradation_chain": signal.get("_degradation_chain", [])},
+                "warnings": [f"{target_lane}_queue_full"],
+            }
 
     def get_lane_stats(self, lane_name: str) -> Dict[str, Any]:
         """
@@ -347,6 +377,10 @@ class LaneScheduler:
         Returns:
             标准响应字典
         """
+        # 无论车道名是否有效，先更新存活时间戳，证明消费端存活
+        with self._lock:
+            self._last_consume_time = time.time()
+
         if lane_name not in self._stats:
             logger.warning(f"无效车道名称: {lane_name}")
             return {
@@ -379,9 +413,26 @@ class LaneScheduler:
         return {"status": "ok", "reason": "极速任务计数+1", "data": {}, "warnings": []}
 
     def mark_express_task_done(self) -> Dict[str, Any]:
-        """下游执行模块通知：极速任务执行完成"""
+        """
+        下游执行模块通知：极速任务执行完成
+        
+        注意：调用方必须确保 mark_express_task_start 和 mark_express_task_done 
+        成对调用。如果 done 被意外多调，此处将记录错误并拒绝递减，以暴露上游 bug。
+        """
         with self._lock:
-            self._express_active_count = max(0, self._express_active_count - 1)
+            if self._express_active_count <= 0:
+                logger.error(
+                    "express_active_count 异常递减，当前值=%d #RECOVERY: "
+                    "检查下游模块是否正确配对调用 mark_express_task_start/done",
+                    self._express_active_count
+                )
+                return {
+                    "status": "error",
+                    "reason": "express_active_count 异常递减，计数已为零或负",
+                    "data": {"current_count": self._express_active_count},
+                    "warnings": ["counter_underflow"],
+                }
+            self._express_active_count -= 1
         return {"status": "ok", "reason": "极速任务计数-1", "data": {}, "warnings": []}
 
     # ========== 健康检查 ==========
@@ -401,6 +452,9 @@ class LaneScheduler:
                     "warnings": ["queues_not_initialized"],
                 }
 
+            needs_core_notify = False
+            notified_borrower = None
+
             with self._lock:
                 total_queued = sum(len(q) for q in self._queues.values())
                 total_dispatched = sum(s["dispatched"] for s in self._stats.values())
@@ -409,21 +463,79 @@ class LaneScheduler:
                 if self._core_borrowed:
                     core_borrow_duration_ms = (time.time() - self._core_borrow_start) * 1000
 
+                express_depth = len(self._queues["express"])
+                fast_depth = len(self._queues["fast"])
+
+                now = time.time()
+                last_consume_ago = now - self._last_consume_time
+
+                # 核心借用超时检测（在锁内完成状态变更）
+                core_borrow_timeout = (
+                    self._core_borrowed and
+                    (now - self._core_borrow_start) > 30.0
+                )
+                if core_borrow_timeout:
+                    logger.error("核心借用超时 30 秒，强制回收 #RECOVERY: 检查快速车道消费线程是否异常退出")
+                    notified_borrower = self._core_borrower
+                    self._core_borrowed = False
+                    self._core_borrow_start = 0.0
+                    self._core_borrower = None
+                    self._stats["express"]["core_borrowed_by"] = None
+                    self._stats["express"]["core_borrowed_at"] = 0
+                    needs_core_notify = True
+
+            # 消费端存活检测
+            consumer_stalled = last_consume_ago > 5.0
+
+            # 消费饥饿检测：最近有消费但队列深度仍然很高
+            consumer_starving = (
+                not consumer_stalled and
+                last_consume_ago < 1.0 and
+                (express_depth > self.DEFAULT_EXPRESS_QUEUE_SIZE // 2 or
+                 fast_depth > self.DEFAULT_FAST_QUEUE_SIZE // 2)
+            )
+
+            # 综合状态判定
+            if consumer_stalled:
+                status = "critical"
+                reason = "消费端可能已停止工作，超过 5 秒无执行记录"
+            elif consumer_starving or core_borrow_timeout:
+                status = "degraded"
+                reason = "消费端性能下降或核心借用异常"
+            else:
+                status = "ok"
+                reason = f"LaneScheduler 正常，总队列深度: {total_queued}, 已调度: {total_dispatched}"
+
+            warnings = []
+            if consumer_stalled:
+                warnings.append("consumer_stalled")
+            if consumer_starving:
+                warnings.append("consumer_starving")
+            if core_borrow_timeout:
+                warnings.append("core_borrow_timeout")
+
+            # 锁外通知核心状态变更
+            if needs_core_notify and notified_borrower:
+                self._notify_core_status("released", notified_borrower)
+
             return {
-                "status": "ok",
-                "reason": f"LaneScheduler 正常，总队列深度: {total_queued}, 已调度: {total_dispatched}",
+                "status": status,
+                "reason": reason,
                 "data": {
                     "total_queued": total_queued,
                     "total_dispatched": total_dispatched,
                     "total_dropped": total_dropped,
+                    "express_queue_depth": express_depth,
+                    "fast_queue_depth": fast_depth,
                     "core_borrowed": self._core_borrowed,
                     "core_borrow_duration_ms": round(core_borrow_duration_ms, 1),
+                    "last_consume_seconds_ago": round(last_consume_ago, 1),
                     "dependencies": {
                         "negotiation_bus": self._negotiation_bus is not None,
                         "behavioral_logger": self._behavioral_logger is not None,
                     },
                 },
-                "warnings": [],
+                "warnings": warnings,
             }
         except Exception as e:
             logger.error(f"健康检查失败: {e} #RECOVERY: 检查锁状态和队列数据结构完整性")
@@ -439,6 +551,7 @@ class LaneScheduler:
         """
         信号降级处理：队列满载时，按优先级降级至下一级车道
         若已是慢速车道，则丢弃信号
+        采用显式循环替代递归，避免锁持有时间过长和隐式递归依赖
 
         Args:
             signal: 待降级的信号
@@ -453,31 +566,40 @@ class LaneScheduler:
             "normal": "slow",
         }
 
-        target = degradation_chain.get(current_lane)
-        if target is None:
-            # 已是慢速车道，丢弃
-            self._stats[current_lane]["dropped"] += 1
-            pulse_id = signal.get('pulse_id', 'unknown')
-            logger.error(
-                f"信号已丢弃: {pulse_id} #RECOVERY: 检查慢速车道消费线程是否阻塞"
+        # 记录原始车道，用于 degraded_from 计数
+        original_lane = signal.get("_original_lane", current_lane)
+        if "_original_lane" not in signal:
+            signal["_original_lane"] = current_lane
+            signal["_degradation_chain"] = []
+
+        lane = current_lane
+        while True:
+            target = degradation_chain.get(lane)
+            if target is None:
+                # 已是慢速车道，丢弃
+                self._stats[lane]["dropped"] += 1
+                pulse_id = signal.get('pulse_id', 'unknown')
+                logger.error(
+                    f"信号已丢弃: {pulse_id} #RECOVERY: 检查慢速车道消费线程是否阻塞"
+                )
+                self._notify_signal_dropped(pulse_id, lane)
+                return "dropped"
+
+            # 记录降级链路
+            signal["_degradation_chain"].append(
+                {"from": lane, "to": target, "reason": "queue_full"}
             )
-            self._notify_signal_dropped(pulse_id, current_lane)
-            return "dropped"
 
-        # 记录降级链路
-        chain = signal.get("_degradation_chain", [])
-        chain.append({"from": current_lane, "to": target, "reason": "queue_full"})
-        signal["_degradation_chain"] = chain
-        self._stats[current_lane]["degraded_from"] += 1
+            target_queue = self._queues[target]
+            if len(target_queue) < target_queue.maxlen:
+                target_queue.append(signal)
+                self._stats[target]["dispatched"] += 1
+                # 在原始车道递增 degraded_from
+                self._stats[original_lane]["degraded_from"] += 1
+                return target
 
-        # 检查目标车道是否也满载
-        target_queue = self._queues[target]
-        if len(target_queue) >= target_queue.maxlen:
-            return self._degrade_signal(signal, target)
-
-        target_queue.append(signal)
-        self._stats[target]["dispatched"] += 1
-        return target
+            # 目标也满载，继续向下一级降级
+            lane = target
 
     def _notify_core_status(self, status: str, lane: str) -> None:
         """通知协商总线核心借用状态变更"""
