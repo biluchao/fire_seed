@@ -32,6 +32,7 @@
 """
 
 import atexit
+import bisect
 import gc
 import os
 import signal
@@ -180,17 +181,23 @@ class GlobalExceptionHandler:
 
         now = time.time()
 
-        # 更新统计（先持有锁更新数据，然后释放锁）
+        # 启动真空期保护：如果所有核心依赖都不可用，说明系统仍在启动中，
+        # 此时全局异常不可被静默吞下，必须立即退出。
+        if self._emergency_simplifier is None and self._negotiation_bus is None:
+            logger.critical(
+                f"启动阶段全局异常 [{exc_type}] {exc_message}，依赖不可用，中止启动 "
+                f"#RECOVERY: 检查模块初始化顺序，确保依赖注入先于异常处理"
+            )
+            sys.exit(1)
+
         with self._stats_lock:
-            self._exception_records.append({
+            self._record_exception({
                 "timestamp": now,
                 "type": exc_type,
                 "message": exc_message,
                 "module": module_name,
                 "function": function_name,
-            })
-            self._exception_count_total += 1
-            self._exception_per_minute.append(now)
+            }, now)
 
             # 清理过期的每分钟记录，并计算当前分钟内的异常数
             minute_cutoff = now - 60
@@ -198,10 +205,13 @@ class GlobalExceptionHandler:
                 self._exception_per_minute.popleft()
             exceptions_this_minute = len(self._exception_per_minute)
 
+            # 主动清理统计窗口内过期数据
+            self._purge_expired_records(now)
+
             # 判定响应等级（在锁内完成，保证原子性）
             response_level = self._determine_response_level(now, exceptions_this_minute)
 
-        # 记录异常日志
+        # 记录异常日志（锁外）
         self._log_exception(exc_type, exc_message, module_name, function_name, response_level)
 
         warnings = []
@@ -220,9 +230,7 @@ class GlobalExceptionHandler:
                     if self._emergency_simplifier is None:
                         response_level = self.RESPONSE_WARNING
                         warnings.append("EmergencySimplifier 不可用，跳过降维，降级为告警")
-                    else:
-                        # 保留降维意图，后续执行
-                        pass
+                    # 否则保留降维意图，后续执行
 
             if response_level == self.RESPONSE_DEGRADATION:
                 warnings.append("全局异常触发紧急降维")
@@ -230,12 +238,12 @@ class GlobalExceptionHandler:
                 self._submit_diagnosis_task(exc_type, exc_message, context)
                 success = self._execute_degradation(exc_type, exc_message, now)
                 if not success:
-                    # 降维失败，判断是否需要硬退出
                     if exceptions_this_minute >= self.DEFAULT_MAX_EXCEPTIONS_PER_MINUTE:
                         warnings.append("紧急降维失败且异常密度超高，执行硬退出")
                         logger.critical(
                             "紧急降维失败，异常密度超高，执行硬退出 #RECOVERY: 检查 EmergencySimplifier 模块状态，手动重启系统"
                         )
+                        self._release_all_locks()
                         self._hard_exit(exc_type, exc_message)
                     else:
                         response_level = self.RESPONSE_WARNING
@@ -244,6 +252,7 @@ class GlobalExceptionHandler:
         elif response_level == self.RESPONSE_HARD_EXIT:
             warnings.append("异常密度超限，触发硬退出")
             self._push_alert(exc_type, exc_message, module_name, function_name)
+            self._release_all_locks()
             self._hard_exit(exc_type, exc_message)
 
         # 上报健康状态（锁外调用）
@@ -262,24 +271,17 @@ class GlobalExceptionHandler:
         }
 
     def get_error_stats(self) -> Dict[str, Any]:
-        """
-        获取异常统计摘要
-
-        Returns:
-            标准响应字典，data 中包含异常总数、近1小时分布、最近10条异常记录
-        """
+        """获取异常统计摘要"""
         with self._stats_lock:
             total = self._exception_count_total
             records = list(self._exception_records)
             recent = records[-10:] if records else []
 
-            # 按类型分组统计
             by_type: Dict[str, int] = {}
             for rec in records:
                 exc_type = rec["type"]
                 by_type[exc_type] = by_type.get(exc_type, 0) + 1
 
-        # GC 统计
         with self._gc_stats_lock:
             gc_pauses = list(self._recent_gc_pauses)
             gc_stats = {
@@ -303,12 +305,7 @@ class GlobalExceptionHandler:
 
     # ========== 健康检查 ==========
     def health_check(self) -> Dict[str, Any]:
-        """
-        模块自检
-
-        Returns:
-            标准健康检查响应字典
-        """
+        """模块自检"""
         try:
             if not hasattr(self, "_initialized") or not self._initialized:
                 return {
@@ -318,10 +315,22 @@ class GlobalExceptionHandler:
                     "warnings": ["not_initialized"],
                 }
 
-            with self._stats_lock:
+            # 尝试获取锁，超时则判定为降级
+            lock_acquired = self._stats_lock.acquire(timeout=0.1)
+            if not lock_acquired:
+                return {
+                    "status": "degraded",
+                    "reason": "无法获取统计锁，可能存在死锁或长时间持锁",
+                    "data": {},
+                    "warnings": ["lock_timeout"],
+                }
+
+            try:
                 total = self._exception_count_total
                 window_count = len(self._exception_records)
                 window_usage_pct = round(window_count / self.DEFAULT_STATS_WINDOW_SEC * 100, 1)
+            finally:
+                self._stats_lock.release()
 
             gc_monitor_alive = (
                 self._gc_monitor_thread is not None and self._gc_monitor_thread.is_alive()
@@ -355,6 +364,16 @@ class GlobalExceptionHandler:
             }
 
     # ========== 私有方法 ==========
+    def _record_exception(self, record: Dict[str, Any], now: float) -> None:
+        """
+        原子性地记录一条异常（必须在持有 _stats_lock 时调用）
+
+        将 append 操作封装为单一方法，防止未来被拆分到锁外。
+        """
+        self._exception_records.append(record)
+        self._exception_per_minute.append(now)
+        self._exception_count_total += 1
+
     def _determine_response_level(self, now: float, exceptions_this_minute: int) -> int:
         """根据异常密度和冷却期判定响应等级（必须在持有 _stats_lock 时调用）"""
         # 检查冷却期
@@ -367,11 +386,14 @@ class GlobalExceptionHandler:
         if exceptions_this_minute >= self.DEFAULT_MAX_EXCEPTIONS_PER_MINUTE:
             return self.RESPONSE_HARD_EXIT
 
-        # 突发判定
+        # 突发判定：从尾部反向扫描，避免 O(N) 遍历
         burst_cutoff = now - self.DEFAULT_BURST_INTERVAL_SEC
-        burst_count = sum(
-            1 for r in self._exception_records if r["timestamp"] >= burst_cutoff
-        )
+        burst_count = 0
+        for r in reversed(self._exception_records):
+            if r["timestamp"] >= burst_cutoff:
+                burst_count += 1
+            else:
+                break
 
         if burst_count >= self.DEFAULT_BURST_THRESHOLD:
             return self.RESPONSE_DEGRADATION
@@ -409,7 +431,6 @@ class GlobalExceptionHandler:
                 f"全局异常静默记录 [{exc_type}] {exc_message} (模块={module}, 函数={function})"
             )
 
-        # 行为日志
         if self._behavioral_logger is not None:
             try:
                 self._behavioral_logger.log_event(
@@ -472,16 +493,19 @@ class GlobalExceptionHandler:
             logger.error("EmergencySimplifier 不可用，无法执行降维")
             return False
 
+        burst_count = self._get_burst_count(now)
+        level = self._select_degradation_level(burst_count)
+
         try:
             result = self._emergency_simplifier.trigger_degradation(
-                level="heavy",
+                level=level,
                 reason=f"全局异常触发: {exc_type} - {exc_message[:100]}",
             )
             if result.get("status") == "ok":
                 with self._stats_lock:
                     self._last_degradation_time = now
                     self._last_response_level = self.RESPONSE_DEGRADATION
-                logger.warning("紧急降维执行成功，系统进入降级运行模式")
+                logger.warning("紧急降维执行成功，系统进入降级运行模式，级别=%s", level)
                 return True
             else:
                 logger.error(f"紧急降维执行失败: {result.get('reason', '未知原因')}")
@@ -489,6 +513,38 @@ class GlobalExceptionHandler:
         except Exception as e:
             logger.error(f"紧急降维执行异常: {e}")
             return False
+
+    def _get_burst_count(self, now: float) -> int:
+        """获取当前时间窗口内的突发异常数（反向扫描，避免 O(N) 遍历）"""
+        burst_cutoff = now - self.DEFAULT_BURST_INTERVAL_SEC
+        count = 0
+        for r in reversed(self._exception_records):
+            if r["timestamp"] >= burst_cutoff:
+                count += 1
+            else:
+                break
+        return count
+
+    def _select_degradation_level(self, burst_count: int) -> str:
+        """根据突发异常数动态选择降维深度"""
+        if burst_count >= self.DEFAULT_BURST_THRESHOLD * 4:
+            return "heavy"
+        elif burst_count >= self.DEFAULT_BURST_THRESHOLD * 2:
+            return "medium"
+        else:
+            return "light"
+
+    def _release_all_locks(self) -> None:
+        """紧急释放本线程持有的所有锁，防止死锁"""
+        for lock_name, lock in [("_stats_lock", self._stats_lock), ("_gc_stats_lock", self._gc_stats_lock)]:
+            if lock.locked():
+                try:
+                    lock.release()
+                except RuntimeError:
+                    # 锁被其他线程持有（理论上不会发生，因为调用者应持有锁）
+                    logger.warning(f"{lock_name} 被其他线程持有，无法释放，继续退出")
+                except Exception as e:
+                    logger.warning(f"释放 {lock_name} 时异常: {e}")
 
     def _hard_exit(self, exc_type: str, exc_message: str) -> None:
         """
@@ -508,12 +564,27 @@ class GlobalExceptionHandler:
         except Exception:
             pass
 
-        # 停止 GC 监控线程
+        # 在释放锁之前，尝试通过行为日志记录最终审计记录
+        if self._behavioral_logger is not None:
+            try:
+                self._behavioral_logger.log_event(
+                    event_type="system_hard_exit",
+                    details={
+                        "exception_type": exc_type,
+                        "message": exc_message[:500],
+                        "timestamp": time.time(),
+                        "reason": "异常密度超过安全阈值或降维失败",
+                    },
+                    immediate_flush=True,  # 要求立即刷盘，不经过缓冲
+                )
+            except Exception:
+                pass  # 行为日志不可用，无法记录，但仍继续退出
+
         self._gc_monitor_stop.set()
         if self._gc_monitor_thread is not None and self._gc_monitor_thread.is_alive():
             self._gc_monitor_thread.join(timeout=2.0)
 
-        # 尝试 sys.exit，允许 atexit 回调执行
+        # 使用 alarm 防止退出流程被无限阻塞
         has_alarm = False
         try:
             signal.alarm(self.HARD_EXIT_TIMEOUT_SEC)
@@ -555,10 +626,29 @@ class GlobalExceptionHandler:
             except Exception as e:
                 logger.warning(f"健康状态上报失败: {e}")
 
+    def _purge_expired_records(self, now: float) -> None:
+        """
+        清理统计窗口内的过期记录，防止内存无限增长（必须在持有 _stats_lock 时调用）
+        当队列异常庞大时采用二分查找截断，正常情况使用 while popleft。
+        """
+        cutoff = now - self.DEFAULT_STATS_WINDOW_SEC
+
+        # 紧急截断：如果队列异常庞大（超过 10000 条），使用二分查找加速
+        if len(self._exception_records) > 10000:
+            timestamps = [r["timestamp"] for r in self._exception_records]
+            keep_idx = bisect.bisect_left(timestamps, cutoff)
+            if keep_idx > 0:
+                for _ in range(keep_idx):
+                    self._exception_records.popleft()
+            return
+
+        # 正常路径：逐条弹出过期记录
+        while self._exception_records and self._exception_records[0]["timestamp"] < cutoff:
+            self._exception_records.popleft()
+
     # ========== GC 监控 ==========
     def _start_gc_monitor(self) -> None:
         """启动 GC 监控守护线程"""
-        # Python 3.11+ 使用轮询模式
         self._gc_monitor_thread = threading.Thread(
             target=self._gc_monitor_loop,
             daemon=True,
@@ -576,8 +666,8 @@ class GlobalExceptionHandler:
                 current_count = gc.get_count()[0]
                 collections = current_count - self._last_gc_count
                 if collections > 0:
-                    # 优先使用 duration 字段（秒），否则自行测量
                     stats = gc.get_stats()
+                    # 优先使用 duration 字段（秒），否则回退到估算
                     total_pause = sum(
                         s.get("duration", 0) for s in stats
                     ) * 1000  # 转为毫秒
