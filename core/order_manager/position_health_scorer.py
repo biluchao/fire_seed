@@ -2,360 +2,499 @@
 火种系统 · 持仓健康度评分器 (PositionHealthScorer)
 
 核心职责：
-1. 基于浮盈状态、持仓时长、订单簿方向、趋势强度、成交量配合等多维度，计算持仓的综合健康评分（0-100）
-2. 提供分阶段健康评估，支持秒级快速评估（加仓决策）与分钟级深度评估（生命周期结构调整）
+1. 基于六维加权模型为每笔活跃持仓实时计算健康度评分，浮盈使用ATR标准化（上限5倍ATR），
+   OBI得分采用连续映射（方向一致时与OBI绝对值成正比，方向相反时最低10分）
+2. 支持秒级快速评估与分钟级深度评估，输出标准化健康等级、诊断原因与可执行建议
+3. 支持从配置文件动态加载权重与阈值，支持运行时热重载（要求提供完整权重集）
+4. 内置缓存命中率、评分分布统计与最近评分历史，为运维提供完整的可观测性
 
 外部依赖（真实模块接口）：
-- 本模块为纯计算单元，所有市场数据通过 evaluate() 方法的参数传入，不直接依赖感知层模块。
-- 依赖注入接口（inject_dependencies）为未来扩展预留，当前版本不直接调用注入对象。
+- core.perception.olfactory_cortex.OlfactoryCortex : get_current_obi() -> float
+- core.perception.multi_band_pll.MultiBandPLL : is_locked, get_instantaneous_frequency() -> float
+- core.perception.tactile_cortex.TactileCortex : get_trade_pulse() -> float (成交量分位数 0-1)
+- core.order_manager.lifecycle_stages.LifecycleStages : get_stage(position_id) -> str
+- core.account_ledger.AccountLedger : get_position(position_id) -> Dict
+  (需包含: unrealized_pnl_pct(float,百分比), atr_at_entry_pct(float), direction(int), entry_timestamp(float))
+- core.negotiation_bus.NegotiationBus : publish_alert(...)
+- core.behavioral_logger.BehavioralLogger : log_event(...)
+- core.utils.config_loader.ConfigLoader : get(section) -> Dict
 
 接口契约：
-- evaluate(position_id: str, profit_atr: float, hold_seconds: float, direction: int,
-    obi_direction: Optional[int], pll_frequency: Optional[float],
-    volume_cv: Optional[float]) -> Dict[str, Any]
-- set_weights(weights: Dict[str, float]) -> None : 动态调整评分权重（由条件权重引擎调用）
-- get_weights() -> Dict[str, float] : 获取当前生效的权重配置
+- evaluate_health(position_id: str, mode: str = "fast") -> Dict[str, Any]
+  输出: {"status","error_code","reason","data":{"score","level","dimensions","diagnosis","suggestion"}}
+- get_all_unhealthy_positions(threshold: float = 40.0) -> Dict[str, Any]
 - health_check() -> Dict[str, Any]
-- 所有公共方法输出字典固定包含 "status" (str), "reason" (str), "data" (Dict), "warnings" (List[str])
+- reload_config(config: Dict) -> None   # 必须包含全部六个权重键
+  所有公共方法输出字典固定包含 "status", "reason", "data", "warnings"
 
 异常与降级：
-- 当 obi_direction/pll_frequency/volume_cv 为 None 时，自动使用类常量中的中性默认值，并在 warnings 中标记
-- 当权重总和偏差超过 1% 时，拒绝本次调整，保留原有权重
-- 任何未预期的内部异常将返回降级评分（50分），并记录完整错误信息，保证调用方安全
+- ATR值异常时使用1.0作为默认值，标准化后上限5倍ATR
+- 浮盈比例量级异常时降级为默认分并记录ERROR
+- 当任何外部感知模块不可用时，对应维度返回中性分
+- 当AccountLedger不可用时，评分器拒绝工作
+- 权重总和偏离1.0超过0.01时，拒绝应用并保留原有权重
+- 深度探测前二次校验依赖非空，防止热替换场景下的竞态
 
 资源管理：
-- 本模块为纯计算模块，不持有任何外部资源句柄
-- 所有中间计算结果在方法返回后自动回收
+- 缓存采用OrderedDict实现LRU淘汰，最大条目1000
+- 评分历史每持仓保留5条
+- danger级别告警同时写入独立紧急日志文件
+- 不持有外部资源句柄，线程锁自动回收
 """
 
+import time
 import logging
-from typing import Dict, Any, Optional
+import threading
+from collections import OrderedDict
+from typing import Dict, Any, List, Optional
 
 logger = logging.getLogger(__name__)
 
+# 独立紧急告警文件路径
+EMERGENCY_ALERT_FILE = "/var/log/fire_seed/emergency_alerts.log"
+
 
 class PositionHealthScorer:
-    """持仓健康度评分器（六维加权模型）"""
+    """持仓健康度评分器"""
 
-    # ========== 类常量（默认配置，附带单位与取值范围注释） ==========
-    # 六维权重（降级默认值，运行时可通过 set_weights 动态覆盖）
-    DEFAULT_WEIGHT_PROFIT_STATE = 0.25        # 浮盈状态权重，无量纲，[0.10, 0.40]
-    DEFAULT_WEIGHT_DURATION = 0.20           # 持仓时长权重，无量纲，[0.10, 0.30]
-    DEFAULT_WEIGHT_OBI_ALIGNMENT = 0.20      # OBI方向匹配权重，无量纲，[0.10, 0.30]
-    DEFAULT_WEIGHT_PLL_FREQUENCY = 0.20      # 锁相环频率权重，无量纲，[0.10, 0.30]
-    DEFAULT_WEIGHT_VOLUME_CONFIRM = 0.15     # 成交量配合权重，无量纲，[0.05, 0.25]
+    # ========== 默认配置（可从配置文件覆盖） ==========
+    WEIGHT_PROFIT = 0.25
+    WEIGHT_DURATION = 0.20
+    WEIGHT_OBI = 0.20
+    WEIGHT_PLL = 0.20
+    WEIGHT_VOLUME = 0.10
+    WEIGHT_FRESHNESS = 0.05
 
-    # 持仓时长最优窗口（秒），用于评分
-    OPTIMAL_HOLD_MIN = 60                    # 最优持仓起始秒数，取值范围 [30, 120]
-    OPTIMAL_HOLD_MAX = 180                   # 最优持仓结束秒数，取值范围 [120, 300]
+    SCORE_HEALTHY = 80.0
+    SCORE_DEGRADED = 60.0
+    SCORE_CRITICAL = 40.0
 
-    # 评分函数参数
-    PLL_FULL_SCORE_FREQUENCY = 0.02          # PLL 频率满分阈值，无量纲，[0.015, 0.04]
-    OBI_REVERSE_TOLERANCE_SCORE = 0.3        # OBI 反向时的过渡分数，无量纲，[0.1, 0.5]
+    CACHE_TTL_FAST = 0.2
+    CACHE_TTL_DEEP = 10.0
+    MAX_CACHE_SIZE = 1000
+    MAX_ALERT_TIMERS = 500
+    MAX_SCORE_HISTORY = 5        # 每持仓保留最近N条评分
+    DEEP_PROBE_INTERVAL = 60.0   # 深度探测间隔（秒）
+    ALERT_COOLDOWN = 30.0
+    DEFAULT_DIM_SCORE = 50.0
+    ALL_WEIGHT_KEYS = {"profit", "duration", "obi", "pll", "volume", "freshness"}
 
-    # 降级默认值（当外部依赖不可用时）
-    DEFAULT_OBI_SCORE = 0.5                  # OBI 中性得分，无量纲，[0.0, 1.0]
-    DEFAULT_PLL_FREQUENCY = 0.0              # PLL 频率降级值，无量纲，[0.0, 0.05]
-    DEFAULT_VOLUME_SCORE = 0.5               # 成交量中性得分，无量纲，[0.0, 1.0]
-
-    # 快速评估与深度评估的维度权重调整
-    FAST_MODE_DIMENSIONS = ["profit_state", "duration", "obi_alignment"]
-    DEEP_MODE_DIMENSIONS = ["profit_state", "duration", "obi_alignment", "pll_frequency", "volume_confirm"]
-
-    # 降级评分（内部异常时使用）
-    DEGRADED_HEALTH_SCORE = 50.0             # 降级评分，取值范围 [0, 100]
-
-    # 权重总和允许的最大偏差
-    WEIGHT_TOLERANCE = 0.01                  # 权重偏差容忍度，无量纲，[0.001, 0.05]
-
-    def __init__(self):
-        # 动态权重（初始化为默认值，可通过 set_weights 覆盖）
-        self._weights: Dict[str, float] = {
-            "profit_state": self.DEFAULT_WEIGHT_PROFIT_STATE,
-            "duration": self.DEFAULT_WEIGHT_DURATION,
-            "obi_alignment": self.DEFAULT_WEIGHT_OBI_ALIGNMENT,
-            "pll_frequency": self.DEFAULT_WEIGHT_PLL_FREQUENCY,
-            "volume_confirm": self.DEFAULT_WEIGHT_VOLUME_CONFIRM,
-        }
-
-        # 外部依赖注入（当前版本预留，不直接调用）
-        self._visual_cortex = None
+    def __init__(self, config_loader=None):
+        self._olfactory_cortex = None
         self._multi_band_pll = None
         self._tactile_cortex = None
+        self._lifecycle_stages = None
+        self._account_ledger = None
+        self._negotiation_bus = None
+        self._behavioral_logger = None
+        self._config_loader = config_loader
 
-        logger.info("PositionHealthScorer 初始化完成，默认权重已加载")
+        self._load_config()
 
-    # ========== 依赖注入 ==========
+        self._cache: OrderedDict[str, Dict] = OrderedDict()
+        self._score_history: Dict[str, List[float]] = {}  # pid -> [scores]
+        self._alert_timers: OrderedDict[str, float] = OrderedDict()
+        self._lock = threading.Lock()
+
+        # 统计计数器
+        self._stats = {
+            "cache_hits": 0,
+            "cache_misses": 0,
+            "level_counts": {"healthy": 0, "degraded": 0, "critical": 0, "danger": 0},
+        }
+        self._last_deep_probe = 0.0
+
+        logger.info("PositionHealthScorer 初始化完成")
+
+    # ---------- 配置管理 ----------
+    def _load_config(self) -> None:
+        if self._config_loader is None:
+            return
+        try:
+            cfg = self._config_loader.get("position_health_scorer", {})
+            if cfg:
+                self._apply_config(cfg, source="initial")
+        except Exception as e:
+            logger.error(f"初始配置加载失败: {e}")
+
+    def reload_config(self, config: Dict[str, Any]) -> None:
+        try:
+            self._apply_config(config, source="reload")
+            logger.info("PositionHealthScorer 配置热重载成功")
+        except Exception as e:
+            logger.error(f"配置热重载失败: {e}")
+
+    def _apply_config(self, cfg: Dict, source: str = "unknown") -> None:
+        provided_keys = set(k for k in self.ALL_WEIGHT_KEYS if k in cfg)
+        if provided_keys and provided_keys != self.ALL_WEIGHT_KEYS:
+            logger.error(f"权重配置不完整，需要 {self.ALL_WEIGHT_KEYS}，实际 {provided_keys}，拒绝更新")
+            return
+
+        new_weights = {
+            "profit": cfg.get("weight_profit", self.WEIGHT_PROFIT),
+            "duration": cfg.get("weight_duration", self.WEIGHT_DURATION),
+            "obi": cfg.get("weight_obi", self.WEIGHT_OBI),
+            "pll": cfg.get("weight_pll", self.WEIGHT_PLL),
+            "volume": cfg.get("weight_volume", self.WEIGHT_VOLUME),
+            "freshness": cfg.get("weight_freshness", self.WEIGHT_FRESHNESS),
+        }
+        total = sum(new_weights.values())
+        if abs(total - 1.0) > 0.01:
+            logger.error(f"权重总和 {total:.4f} 偏离 1.0，拒绝更新")
+            return
+
+        self.WEIGHT_PROFIT = new_weights["profit"]
+        self.WEIGHT_DURATION = new_weights["duration"]
+        self.WEIGHT_OBI = new_weights["obi"]
+        self.WEIGHT_PLL = new_weights["pll"]
+        self.WEIGHT_VOLUME = new_weights["volume"]
+        self.WEIGHT_FRESHNESS = new_weights["freshness"]
+        self.SCORE_HEALTHY = cfg.get("score_healthy", self.SCORE_HEALTHY)
+        self.SCORE_DEGRADED = cfg.get("score_degraded", self.SCORE_DEGRADED)
+        self.SCORE_CRITICAL = cfg.get("score_critical", self.SCORE_CRITICAL)
+        self.CACHE_TTL_FAST = cfg.get("cache_ttl_fast", self.CACHE_TTL_FAST)
+        self.CACHE_TTL_DEEP = cfg.get("cache_ttl_deep", self.CACHE_TTL_DEEP)
+        self.ALERT_COOLDOWN = cfg.get("alert_cooldown", self.ALERT_COOLDOWN)
+
+    # ---------- 依赖注入 ----------
     def inject_dependencies(
-        self,
-        visual_cortex: Optional[Any] = None,
-        multi_band_pll: Optional[Any] = None,
-        tactile_cortex: Optional[Any] = None,
+        self, olfactory_cortex=None, multi_band_pll=None, tactile_cortex=None,
+        lifecycle_stages=None, account_ledger=None, negotiation_bus=None,
+        behavioral_logger=None,
     ) -> None:
-        """注入外部依赖（可选，当前版本预留）"""
-        if visual_cortex is not None:
-            self._visual_cortex = visual_cortex
-            logger.info("VisualCortex 注入成功")
-        else:
-            logger.debug("VisualCortex 未注入，OBI 维度将通过参数传入")
+        self._olfactory_cortex = olfactory_cortex
+        self._multi_band_pll = multi_band_pll
+        self._tactile_cortex = tactile_cortex
+        self._lifecycle_stages = lifecycle_stages
+        self._account_ledger = account_ledger
+        self._negotiation_bus = negotiation_bus
+        self._behavioral_logger = behavioral_logger
+        if account_ledger is None:
+            logger.error("AccountLedger 未注入，评分器无法工作")
 
-        if multi_band_pll is not None:
-            self._multi_band_pll = multi_band_pll
-            logger.info("MultiBandPLL 注入成功")
-        else:
-            logger.debug("MultiBandPLL 未注入，PLL 维度将通过参数传入")
+    # ---------- 公共接口 ----------
+    def evaluate_health(self, position_id: str, mode: str = "fast") -> Dict[str, Any]:
+        if self._account_ledger is None:
+            return {"status": "error", "error_code": "MISSING_DEPENDENCY",
+                    "reason": "AccountLedger 未注入", "data": {}, "warnings": []}
 
-        if tactile_cortex is not None:
-            self._tactile_cortex = tactile_cortex
-            logger.info("TactileCortex 注入成功")
-        else:
-            logger.debug("TactileCortex 未注入，成交量维度将通过参数传入")
+        ttl = self.CACHE_TTL_FAST if mode == "fast" else self.CACHE_TTL_DEEP
+        with self._lock:
+            cached = self._cache.get(position_id)
+            if cached and (time.time() - cached["timestamp"]) < ttl:
+                self._stats["cache_hits"] += 1
+                return self._build_ok(position_id, cached)
+            self._stats["cache_misses"] += 1
 
-    # ========== 公共接口 ==========
-    def set_weights(self, weights: Dict[str, float]) -> Dict[str, Any]:
-        """动态调整评分权重（由条件权重引擎调用）"""
-        total = sum(weights.values())
-        if abs(total - 1.0) > self.WEIGHT_TOLERANCE:
-            logger.warning(f"权重总和不等于1.0: {total}，忽略本次调整")
-            return {
-                "status": "error",
-                "reason": f"权重总和不等于1.0: {total}",
-                "data": {},
-                "warnings": ["weights_not_normalized"],
-            }
+        try:
+            position = self._account_ledger.get_position(position_id)
+        except Exception as e:
+            return {"status": "error", "error_code": "POSITION_FETCH_FAILED",
+                    "reason": str(e), "data": {}, "warnings": []}
+        if position is None:
+            return {"status": "error", "error_code": "POSITION_NOT_FOUND",
+                    "reason": f"持仓不存在: {position_id}", "data": {}, "warnings": []}
 
-        updated = {}
-        for k in self._weights:
-            if k in weights:
-                self._weights[k] = weights[k]
-                updated[k] = weights[k]
-        logger.info(f"持仓健康度权重已更新: {updated}")
-        return {
-            "status": "ok",
-            "reason": f"权重已更新: {updated}",
-            "data": {"new_weights": self._weights.copy()},
-            "warnings": [],
+        dims = {
+            "profit": self._calc_profit(position),
+            "duration": self._calc_duration(position),
+            "obi": self._calc_obi(position),
+            "pll": self._calc_pll(),
+            "volume": self._calc_volume(),
+            "freshness": self._calc_freshness(position),
         }
 
-    def get_weights(self) -> Dict[str, float]:
-        """获取当前生效的权重配置"""
-        return self._weights.copy()
+        weights = {
+            "profit": self.WEIGHT_PROFIT, "duration": self.WEIGHT_DURATION,
+            "obi": self.WEIGHT_OBI, "pll": self.WEIGHT_PLL,
+            "volume": self.WEIGHT_VOLUME, "freshness": self.WEIGHT_FRESHNESS,
+        }
+        total = sum(weights[k] * dims[k] for k in dims)
+        total = max(0.0, min(100.0, total))
 
-    def evaluate(
-        self,
-        position_id: str,
-        profit_atr: float,
-        hold_seconds: float,
-        direction: int,
-        obi_direction: Optional[int] = None,
-        pll_frequency: Optional[float] = None,
-        volume_cv: Optional[float] = None,
-        mode: str = "deep",
-    ) -> Dict[str, Any]:
-        """计算持仓综合健康度评分"""
+        if total >= self.SCORE_HEALTHY:
+            level, diag, sugg = "healthy", "持仓健康", "维持现有策略"
+        elif total >= self.SCORE_DEGRADED:
+            level, diag, sugg = "degraded", "部分维度走弱", "收紧止损至ATR×0.8"
+        elif total >= self.SCORE_CRITICAL:
+            level, diag, sugg = "critical", "多维度恶化", "立即减仓50%"
+        else:
+            level, diag, sugg = "danger", "极度危险", "全部平仓"
+
+        min_dim = min(dims, key=dims.get)
+        diag += f" | 最低维度:{min_dim}({dims[min_dim]:.1f})"
+
+        entry = {"score": total, "level": level, "timestamp": time.time(),
+                 "dimensions": dims, "diagnosis": diag, "suggestion": sugg}
+
+        with self._lock:
+            self._cache[position_id] = entry
+            self._cache.move_to_end(position_id, last=True)
+            while len(self._cache) > self.MAX_CACHE_SIZE:
+                self._cache.popitem(last=False)
+
+            if position_id not in self._score_history:
+                self._score_history[position_id] = []
+            self._score_history[position_id].append(total)
+            if len(self._score_history[position_id]) > self.MAX_SCORE_HISTORY:
+                self._score_history[position_id] = self._score_history[position_id][-self.MAX_SCORE_HISTORY:]
+
+            self._stats["level_counts"][level] += 1
+
+        if level in ("critical", "danger"):
+            self._trigger_alert(position_id, level, diag, sugg)
+
+        return self._build_ok(position_id, entry)
+
+    def get_all_unhealthy_positions(self, threshold: float = 40.0) -> Dict[str, Any]:
+        if self._account_ledger is None:
+            return {"status": "error", "error_code": "MISSING_DEPENDENCY",
+                    "reason": "AccountLedger 未注入", "data": {}, "warnings": []}
         try:
-            if direction not in (1, -1):
-                logger.warning(f"无效方向参数 direction={direction}")
-                return {
-                    "status": "error",
-                    "reason": f"无效方向参数: {direction}，有效值为 1 (多头) 或 -1 (空头)",
-                    "data": {},
-                    "warnings": ["invalid_direction"],
-                }
+            all_pos = list(self._account_ledger.get_all_positions())
+        except Exception as e:
+            return {"status": "error", "error_code": "POSITION_LIST_FAILED",
+                    "reason": str(e), "data": {}, "warnings": []}
+        unhealthy = []
+        for pid in all_pos:
+            res = self.evaluate_health(pid, mode="fast")
+            if res.get("status") == "ok" and res["data"]["score"] < threshold:
+                unhealthy.append(res["data"])
+        return {"status": "ok", "reason": f"{len(unhealthy)}个不健康",
+                "data": {"unhealthy": unhealthy}, "warnings": []}
 
-            if hold_seconds < 0:
-                logger.warning(f"无效持仓时长: {hold_seconds}s，已置为0")
-                hold_seconds = 0.0
+    def health_check(self) -> Dict[str, Any]:
+        try:
+            deps = {
+                "account_ledger": self._account_ledger is not None,
+                "olfactory_cortex": self._olfactory_cortex is not None,
+                "multi_band_pll": self._multi_band_pll is not None,
+                "tactile_cortex": self._tactile_cortex is not None,
+                "lifecycle_stages": self._lifecycle_stages is not None,
+            }
 
-            active_dimensions = (
-                self.DEEP_MODE_DIMENSIONS if mode == "deep" else self.FAST_MODE_DIMENSIONS
-            )
-
-            warnings = []
-            dimension_scores = {}
-
-            # ---- 维度一：浮盈状态得分 (允许负分以区分深套) ----
-            dimension_scores["profit_state"] = self._score_profit_state(profit_atr)
-
-            # ---- 维度二：持仓时长得分 (超时加速衰减) ----
-            dimension_scores["duration"] = self._score_duration(hold_seconds)
-
-            # ---- 维度三：OBI 方向匹配得分 (反向容忍度) ----
-            obi_score = self._score_obi_alignment(obi_direction, direction)
-            dimension_scores["obi_alignment"] = obi_score
-            if obi_direction is None:
-                warnings.append("OBI 方向数据缺失，使用中性评分")
-
-            # ---- 维度四：锁相环频率得分 (灵敏度提升) ----
-            if "pll_frequency" in active_dimensions:
-                pll_score = self._score_pll_frequency(pll_frequency)
-                dimension_scores["pll_frequency"] = pll_score
-                if pll_frequency is None:
-                    warnings.append("PLL 频率数据缺失，使用保守评分")
-            else:
-                dimension_scores["pll_frequency"] = self.DEFAULT_PLL_FREQUENCY
-
-            # ---- 维度五：成交量配合得分 ----
-            if "volume_confirm" in active_dimensions:
-                volume_score = self._score_volume_confirm(volume_cv)
-                dimension_scores["volume_confirm"] = volume_score
-                if volume_cv is None:
-                    warnings.append("成交量数据缺失，使用中性评分")
-            else:
-                dimension_scores["volume_confirm"] = self.DEFAULT_VOLUME_SCORE
-
-            # ---- 综合加权计算 ----
-            if mode == "fast":
-                active_weight_total = sum(self._weights[d] for d in active_dimensions)
-                if active_weight_total > 0:
-                    effective_weights = {
-                        d: self._weights[d] / active_weight_total for d in active_dimensions
-                    }
+            now = time.time()
+            alive = {
+                "account_ledger": hasattr(self._account_ledger, 'get_position') if self._account_ledger else False,
+                "olfactory_cortex": False,
+                "multi_band_pll": False,
+            }
+            if now - self._last_deep_probe > self.DEEP_PROBE_INTERVAL:
+                self._last_deep_probe = now
+                # 深度探测前二次校验依赖非空
+                if self._olfactory_cortex is not None and hasattr(self._olfactory_cortex, 'get_current_obi'):
+                    try:
+                        obi = float(self._olfactory_cortex.get_current_obi())
+                        alive["olfactory_cortex"] = -1.0 <= obi <= 1.0
+                    except Exception:
+                        alive["olfactory_cortex"] = False
                 else:
-                    effective_weights = {d: 0.0 for d in active_dimensions}
+                    alive["olfactory_cortex"] = False
+                if self._multi_band_pll is not None and hasattr(self._multi_band_pll, 'get_instantaneous_frequency'):
+                    try:
+                        freq = float(self._multi_band_pll.get_instantaneous_frequency())
+                        alive["multi_band_pll"] = freq >= 0.0
+                    except Exception:
+                        alive["multi_band_pll"] = False
+                else:
+                    alive["multi_band_pll"] = False
             else:
-                effective_weights = {
-                    d: self._weights[d] for d in active_dimensions
-                }
+                alive["olfactory_cortex"] = self._olfactory_cortex is not None
+                alive["multi_band_pll"] = self._multi_band_pll is not None
 
-            health_score = 0.0
-            for dim in active_dimensions:
-                score = dimension_scores.get(dim, 0.5)
-                weight = effective_weights.get(dim, 0.0)
-                health_score += score * weight
-            # 映射到 0-100 区间，负分自然截断为 0
-            health_score = round(max(0.0, min(100.0, health_score * 100.0)), 1)
-
-            tier = self._get_health_tier(health_score)
+            with self._lock:
+                stats = dict(self._stats)
+                cache_sz = len(self._cache)
+                history_sz = sum(len(v) for v in self._score_history.values())
 
             return {
-                "status": "ok",
-                "reason": f"持仓健康度评分完成，得分={health_score:.1f}，等级={tier}",
+                "status": "ok" if all(deps.values()) else "degraded",
+                "reason": f"缓存{cache_sz}条, 统计{stats}",
                 "data": {
-                    "position_id": position_id,
-                    "health_score": health_score,
-                    "tier": tier,
-                    "dimension_scores": {k: round(v, 3) for k, v in dimension_scores.items()},
-                    "weights": {k: round(v, 3) for k, v in effective_weights.items()},
-                    "mode": mode,
-                    "direction": direction,
+                    "dependencies": deps,
+                    "alive": alive,
+                    "stats": stats,
+                    "cache_hit_rate": round(
+                        stats["cache_hits"] / max(1, stats["cache_hits"] + stats["cache_misses"]), 3
+                    ),
+                    "cache_entries": cache_sz,
+                    "history_entries": history_sz,
                 },
-                "warnings": warnings,
+                "warnings": [],
             }
-
         except Exception as e:
-            logger.error(f"持仓健康度评估异常: {e} #RECOVERY: 检查输入参数和权重配置")
-            return {
-                "status": "degraded",
-                "reason": f"内部评估异常，返回降级评分: {str(e)}",
-                "data": {
-                    "position_id": position_id,
-                    "health_score": self.DEGRADED_HEALTH_SCORE,
-                    "tier": "unknown",
-                    "dimension_scores": {},
-                    "weights": {},
-                    "mode": mode,
-                    "direction": direction,
-                },
-                "warnings": ["internal_error_degraded"],
-            }
+            return {"status": "error", "error_code": "HEALTH_CHECK_FAILED",
+                    "reason": str(e), "data": {}, "warnings": []}
 
-    # ========== 健康检查 ==========
-    @classmethod
-    def health_check(cls) -> Dict[str, Any]:
-        """模块自检"""
+    # ---------- 维度计算 ----------
+    def _calc_profit(self, pos: Dict) -> float:
+        """浮盈状态得分，使用ATR标准化，上限5倍ATR"""
         try:
-            scorer = cls()
-            # 验证默认权重和
-            weight_sum = sum(scorer._weights.values())
-            if abs(weight_sum - 1.0) > 0.01:
-                return {"status": "error", "reason": f"默认权重总和不等于1.0: {weight_sum}", "data": {}, "warnings": ["weights_not_normalized"]}
+            pnl = float(pos.get("unrealized_pnl_pct", 0.0))
+            atr = float(pos.get("atr_at_entry_pct", 1.0))
+            if atr <= 0.1:  # ATR过小视为数据异常
+                logger.warning(f"ATR={atr:.4f}异常偏小，使用默认值1.0")
+                atr = 1.0
+            if 0 < abs(pnl) < 0.1:
+                logger.error(f"浮盈比例 {pnl:.4f} 过小，疑似单位错误，降级为默认分")
+                return self.DEFAULT_DIM_SCORE
+            normalized = min(pnl / atr, 5.0)  # 上限5倍ATR，防止极端值
+            if normalized >= 2.0: return 100.0
+            elif normalized >= 1.0: return 85.0
+            elif normalized >= 0.5: return 70.0
+            elif normalized >= 0.0: return 50.0
+            elif normalized >= -0.5: return 30.0
+            else: return 10.0
+        except Exception:
+            return self.DEFAULT_DIM_SCORE
 
-            # 默认权重下深度评估
-            result = scorer.evaluate(position_id="test", profit_atr=1.2, hold_seconds=90.0, direction=1, obi_direction=1, pll_frequency=0.025, volume_cv=0.5, mode="deep")
-            if result["status"] != "ok":
-                return {"status": "error", "reason": f"深度评估异常: {result.get('reason')}", "data": {}, "warnings": ["deep_evaluate_failed"]}
-            if not (0.0 <= result["data"]["health_score"] <= 100.0):
-                return {"status": "error", "reason": "评分超范围", "data": {}, "warnings": ["score_out_of_range"]}
+    def _calc_duration(self, pos: Dict) -> float:
+        """持仓时长得分，优先使用LifecycleStages，降级使用指数衰减模型"""
+        if self._lifecycle_stages:
+            try:
+                stage = self._lifecycle_stages.get_stage(pos.get("position_id", ""))
+                if stage == "maturity": return 90.0
+                elif stage == "acceleration": return 80.0
+                elif stage == "incubation": return 50.0
+                elif stage == "decline": return 20.0
+                elif stage == "termination": return 5.0
+            except Exception:
+                pass
+        try:
+            entry = float(pos.get("entry_timestamp", time.time()))
+            age = time.time() - entry
+            # 使用半衰期为600秒的指数衰减模型
+            score = 85.0 * (0.5 ** (age / 600.0)) + 15.0
+            return max(15.0, min(85.0, score))
+        except Exception:
+            return self.DEFAULT_DIM_SCORE
 
-            # 快速评估
-            fast_result = scorer.evaluate(position_id="test_fast", profit_atr=0.5, hold_seconds=30.0, direction=-1, obi_direction=-1, mode="fast")
-            if fast_result["status"] != "ok":
-                return {"status": "error", "reason": f"快速评估异常: {fast_result.get('reason')}", "data": {}, "warnings": ["fast_evaluate_failed"]}
+    def _calc_obi(self, pos: Dict) -> float:
+        """
+        OBI得分采用连续映射。
+        方向一致时得分与OBI绝对值成正比（50-100分）。
+        方向相反时得分随OBI强度递减，下限10分。
+        """
+        if not self._olfactory_cortex:
+            return self.DEFAULT_DIM_SCORE
+        try:
+            obi = float(self._olfactory_cortex.get_current_obi())
+            direction = int(pos.get("direction", 0))
+            if (direction == 1 and obi > 0.0) or (direction == -1 and obi < 0.0):
+                # 方向一致：OBI越强分越高
+                base = 50.0 + min(50.0, abs(obi) * 80.0)
+            elif abs(obi) < 0.05:
+                base = 50.0
+            else:
+                # 方向相反：得分随OBI强度递减，下限10分
+                # OBI=0.1 → 42分, OBI=0.3 → 26分, OBI=0.5 → 10分
+                opposite_score = 50.0 - abs(obi) * 80.0
+                base = max(10.0, opposite_score)
 
-            # 权重更新与拒绝测试
-            set_ok = scorer.set_weights({"profit_state": 0.5, "duration": 0.3, "obi_alignment": 0.1, "pll_frequency": 0.05, "volume_confirm": 0.05})
-            if set_ok["status"] != "ok":
-                return {"status": "error", "reason": "合法权重更新失败", "data": {}, "warnings": ["set_weights_failed"]}
-            set_fail = scorer.set_weights({"profit_state": 0.8, "duration": 0.5})
-            if set_fail["status"] != "error":
-                return {"status": "error", "reason": "非法权重未被拒绝", "data": {}, "warnings": ["weight_validation_failed"]}
+            # 斜率修正
+            slope = 0.0
+            slope_attr = getattr(self._olfactory_cortex, 'get_obi_slope', None)
+            if callable(slope_attr):
+                slope = float(slope_attr())
+            elif isinstance(slope_attr, (int, float)):
+                slope = float(slope_attr)
+            if (direction == 1 and slope > 0.01) or (direction == -1 and slope < -0.01):
+                base += 10.0
+            elif (direction == 1 and slope < -0.01) or (direction == -1 and slope > 0.01):
+                base -= 15.0
+            return max(0.0, min(100.0, base))
+        except Exception:
+            return self.DEFAULT_DIM_SCORE
 
-            # 动态权重生效测试
-            dyn_result = scorer.evaluate(position_id="dyn_test", profit_atr=1.2, hold_seconds=90.0, direction=1, obi_direction=1, pll_frequency=0.025, volume_cv=0.5, mode="deep")
-            if dyn_result["status"] != "ok":
-                return {"status": "error", "reason": f"动态权重评估异常: {dyn_result.get('reason')}", "data": {}, "warnings": ["dynamic_evaluate_failed"]}
+    def _calc_pll(self) -> float:
+        if not self._multi_band_pll:
+            return self.DEFAULT_DIM_SCORE
+        try:
+            locked = False
+            lock_attr = getattr(self._multi_band_pll, 'is_locked', None)
+            if callable(lock_attr):
+                locked = lock_attr()
+            elif lock_attr is not None:
+                locked = bool(lock_attr)
+            if not locked:
+                return 30.0
+            freq = float(self._multi_band_pll.get_instantaneous_frequency())
+            if freq > 0.02: return 90.0
+            elif freq > 0.01: return 70.0
+            elif freq > 0.005: return 50.0
+            else: return 30.0
+        except Exception:
+            return self.DEFAULT_DIM_SCORE
 
-            return {"status": "ok", "reason": f"所有测试通过，深度评分={result['data']['health_score']:.1f}", "data": {}, "warnings": []}
-        except Exception as e:
-            logger.error(f"健康检查失败: {e} #RECOVERY: 检查权重配置和评分函数完整性")
-            return {"status": "error", "reason": f"健康检查异常: {str(e)}", "data": {}, "warnings": [f"health_check_failed: {str(e)}"]}
+    def _calc_volume(self) -> float:
+        if not self._tactile_cortex:
+            return self.DEFAULT_DIM_SCORE
+        try:
+            pulse = float(self._tactile_cortex.get_trade_pulse())
+            if pulse > 0.8: return 90.0
+            elif pulse > 0.5: return 70.0
+            else: return 40.0
+        except Exception:
+            return self.DEFAULT_DIM_SCORE
 
-    # ========== 私有方法 ==========
-    @classmethod
-    def _score_profit_state(cls, profit_atr: float) -> float:
-        """浮盈状态得分（允许负分以区分深套程度）"""
-        if profit_atr <= 0:
-            return max(-2.0, 1.0 + profit_atr * 0.5)
-        return min(1.0, profit_atr / 2.0)
+    def _calc_freshness(self, pos: Dict) -> float:
+        try:
+            entry = float(pos.get("entry_timestamp", 0.0))
+            if entry <= 0: return self.DEFAULT_DIM_SCORE
+            age = time.time() - entry
+            if age < 30: return 100.0
+            elif age < 120: return 75.0
+            elif age < 300: return 50.0
+            else: return 20.0
+        except Exception:
+            return self.DEFAULT_DIM_SCORE
 
-    @classmethod
-    def _score_duration(cls, hold_seconds: float) -> float:
-        """持仓时长得分（超时加速衰减）"""
-        if hold_seconds < cls.OPTIMAL_HOLD_MIN:
-            return hold_seconds / cls.OPTIMAL_HOLD_MIN
-        if hold_seconds <= cls.OPTIMAL_HOLD_MAX:
-            return 1.0
-        decay = (hold_seconds - cls.OPTIMAL_HOLD_MAX) / (cls.OPTIMAL_HOLD_MAX * 2.0)
-        return max(0.0, 1.0 - decay)
+    # ---------- 辅助 ----------
+    def _build_ok(self, pid: str, entry: Dict) -> Dict:
+        return {
+            "status": "ok", "error_code": "SUCCESS",
+            "reason": f"评分{entry['score']:.1f}",
+            "data": {
+                "position_id": pid, "score": entry["score"],
+                "level": entry["level"], "dimensions": entry["dimensions"],
+                "diagnosis": entry["diagnosis"], "suggestion": entry["suggestion"]
+            }, "warnings": []
+        }
 
-    @classmethod
-    def _score_obi_alignment(cls, obi_direction: Optional[int], position_direction: int) -> float:
-        """OBI方向匹配得分（反向容忍度）"""
-        if obi_direction is None:
-            return cls.DEFAULT_OBI_SCORE
-        if obi_direction == position_direction:
-            return 1.0
-        if obi_direction == 0:
-            return 0.5
-        return cls.OBI_REVERSE_TOLERANCE_SCORE
+    def _trigger_alert(self, pid: str, level: str, diag: str, sugg: str) -> None:
+        now = time.time()
+        with self._lock:
+            self._cleanup_alert_timers()
+            if pid in self._alert_timers:
+                if now - self._alert_timers[pid] < self.ALERT_COOLDOWN:
+                    return
+            self._alert_timers[pid] = now
+            while len(self._alert_timers) > self.MAX_ALERT_TIMERS:
+                self._alert_timers.popitem(last=False)
 
-    @classmethod
-    def _score_pll_frequency(cls, frequency: Optional[float]) -> float:
-        """锁相环频率得分（灵敏度提升）"""
-        if frequency is None:
-            return 0.0
-        return min(1.0, abs(frequency) / cls.PLL_FULL_SCORE_FREQUENCY)
+        if self._negotiation_bus and hasattr(self._negotiation_bus, 'publish_alert'):
+            try:
+                self._negotiation_bus.publish_alert(
+                    alert_type="position_health", position_id=pid,
+                    level=level, diagnosis=diag, suggestion=sugg)
+            except Exception as e:
+                logger.warning(f"协商总线告警失败: {e}")
 
-    @classmethod
-    def _score_volume_confirm(cls, volume_cv: Optional[float]) -> float:
-        """成交量配合得分"""
-        if volume_cv is None:
-            return cls.DEFAULT_VOLUME_SCORE
-        cv = abs(volume_cv)
-        if 0.3 <= cv <= 0.7:
-            return 1.0
-        if cv < 0.3:
-            return cv / 0.3
-        return max(0.0, 1.0 - (cv - 0.7) / 0.3)
+        if level == "danger":
+            try:
+                with open(EMERGENCY_ALERT_FILE, "a") as f:
+                    f.write(f"{time.time()} DANGER position_health {pid} diag={diag}\n")
+            except Exception:
+                pass
 
-    @classmethod
-    def _get_health_tier(cls, score: float) -> str:
-        """健康等级判定"""
-        if score >= 80:
-            return "healthy"
-        if score >= 60:
-            return "moderate"
-        if score >= 40:
-            return "unhealthy"
-        return "critical"
+        log_msg = f"[{level.upper()}] 持仓 {pid}: {diag}. {sugg} #RECOVERY: 立即评估并执行"
+        if level in ("critical", "danger"):
+            logger.error(log_msg)
+        else:
+            logger.warning(log_msg)
+
+    def _cleanup_alert_timers(self) -> None:
+        cutoff = time.time() - self.ALERT_COOLDOWN * 2
+        expired = [k for k, v in self._alert_timers.items() if v < cutoff]
+        for k in expired:
+            del self._alert_timers[k]
