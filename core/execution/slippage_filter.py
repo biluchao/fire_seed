@@ -693,4 +693,260 @@ class SlippageFilter:
                 "status": "degraded" if warnings else "ok",
                 "reason": f"SlippageFilter 正常，监控 {monitored_symbols} 品种",
                 "data": {
-                   
+                    "monitored_symbols": monitored_symbols,
+                    "total_records": total_records,
+                    "total_opportunity_cost_records": total_opportunity,
+                    "stale_cache_alerts": stale_alerts,
+                    "slippage_trends": trends,
+                    "opportunity_cost_max_depth": max_opp_depth,
+                    "lock_statistics": {
+                        "avg_wait_ms": round(avg_wait, 2),
+                        "max_wait_ms": round(max_wait, 2),
+                        "contention_count": contention_count,
+                    },
+                    "dependencies": {
+                        "tactile_cortex": self._tactile_cortex is not None,
+                        "order_risk_gateway": self._order_risk_gateway is not None,
+                        "account_ledger": self._account_ledger is not None,
+                        "behavioral_logger": self._behavioral_logger is not None,
+                    },
+                },
+                "warnings": warnings,
+            }
+        except Exception as e:
+            logger.error(f"健康检查失败: {e} #RECOVERY: 检查锁状态和数据结构完整性")
+            return {
+                "status": "error", "reason": f"健康检查异常: {str(e)}",
+                "data": {}, "warnings": [f"health_check_failed: {str(e)}"],
+            }
+
+    # ========== 私有方法 ==========
+    def _acquire_lock_with_timeout(self, lock: threading.Lock, critical: bool = False) -> bool:
+        """尝试获取锁，关键操作使用更长超时"""
+        timeout = self.DEFAULT_LOCK_TIMEOUT_CRITICAL_SEC if critical else self.DEFAULT_LOCK_TIMEOUT_NORMAL_SEC
+        start = time.perf_counter()
+        acquired = lock.acquire(timeout=timeout)
+        elapsed = time.perf_counter() - start
+        if not acquired:
+            with self._lock_contention_lock:
+                self._lock_contention_count += 1
+            logger.warning(f"锁获取超时 ({elapsed*1000:.2f}ms, critical={critical})")
+        else:
+            with self._lock_contention_lock:
+                self._lock_wait_times.append(elapsed)
+                if elapsed > timeout * 0.8:
+                    self._lock_contention_count += 1
+        return acquired
+
+    def _get_orderbook_snapshot(self, symbol: str) -> Optional[Dict[str, Any]]:
+        if self._tactile_cortex is not None:
+            try:
+                snapshot = self._tactile_cortex.get_orderbook_snapshot(symbol)
+                if snapshot:
+                    with self._depth_cache_lock:
+                        self._depth_cache[symbol] = (time.time(), snapshot)
+                    self._stale_cache_counters[symbol] = 0
+                    return snapshot
+            except Exception as e:
+                logger.warning(f"TactileCortex 获取深度失败: {e}")
+
+        with self._depth_cache_lock:
+            if symbol in self._depth_cache:
+                ts, cached = self._depth_cache[symbol]
+                if time.time() - ts < self.DEFAULT_DEPTH_SNAPSHOT_TTL_SEC:
+                    return cached
+                else:
+                    self._stale_cache_counters[symbol] = self._stale_cache_counters.get(symbol, 0) + 1
+
+        return None
+
+    def _get_volatility_percentile(self, symbol: str) -> float:
+        if self._tactile_cortex is not None and hasattr(self._tactile_cortex, 'get_volatility_percentile'):
+            try:
+                return self._tactile_cortex.get_volatility_percentile(symbol)
+            except Exception:
+                pass
+        return self._estimate_local_vol_percentile(symbol)
+
+    def _estimate_local_vol_percentile(self, symbol: str) -> float:
+        acquired = self._acquire_lock_with_timeout(self._cumulative_slippage_lock, critical=False)
+        if not acquired:
+            return 50.0
+        try:
+            if symbol not in self._local_slippage_vol:
+                return 50.0
+            cutoff = time.time() - self.DEFAULT_LOCAL_VOL_WINDOW_SEC
+            recent = [r for r in self._local_slippage_vol[symbol] if r[0] >= cutoff]
+            if len(recent) < self.DEFAULT_LOCAL_VOL_MIN_SAMPLES:
+                return 50.0
+            slippages = [r[1] for r in recent]
+            mean_val = np.mean(slippages)
+            if mean_val < 2.0:
+                return 25.0
+            elif mean_val < 5.0:
+                return 50.0
+            elif mean_val < 10.0:
+                return 75.0
+            else:
+                return 90.0
+        finally:
+            self._cumulative_slippage_lock.release()
+
+    def _get_historical_avg_slippage(self, symbol: str) -> Tuple[float, float]:
+        """获取按时间衰减加权的历史买卖滑点均值，半衰期与波动率挂钩"""
+        with self._cumulative_slippage_lock:
+            if symbol not in self._cumulative_slippage:
+                return self.DEFAULT_MAX_SLIPPAGE_BPS, self.DEFAULT_MAX_SLIPPAGE_BPS
+            records = list(self._cumulative_slippage[symbol])
+            if not records:
+                return self.DEFAULT_MAX_SLIPPAGE_BPS, self.DEFAULT_MAX_SLIPPAGE_BPS
+
+            # 根据波动率选择半衰期
+            vol_pct = self._get_volatility_percentile(symbol)
+            if vol_pct > 70:
+                half_life = self.DEFAULT_HALFLIFE_HIGH_VOL_SEC
+            elif vol_pct < 30:
+                half_life = self.DEFAULT_HALFLIFE_LOW_VOL_SEC
+            else:
+                half_life = self.DEFAULT_HALFLIFE_NORMAL_VOL_SEC
+
+            now = time.time()
+            buy_slippages = []
+            buy_weights = []
+            sell_slippages = []
+            sell_weights = []
+
+            for ts, bps, side in records:
+                weight = np.exp(- (now - ts) * np.log(2) / half_life)
+                if side == 1:
+                    buy_slippages.append(bps)
+                    buy_weights.append(weight)
+                else:
+                    sell_slippages.append(bps)
+                    sell_weights.append(weight)
+
+            if buy_weights:
+                avg_buy = np.average(buy_slippages, weights=buy_weights)
+            else:
+                avg_buy = self.DEFAULT_MAX_SLIPPAGE_BPS
+            if sell_weights:
+                avg_sell = np.average(sell_slippages, weights=sell_weights)
+            else:
+                avg_sell = self.DEFAULT_MAX_SLIPPAGE_BPS
+            return float(avg_buy), float(avg_sell)
+
+    def _get_overflow_multiplier(self, symbol: str) -> float:
+        vol_pct = self._get_volatility_percentile(symbol)
+        if vol_pct > 80:
+            return self.DEFAULT_OVERFLOW_PREMIUM_MULTIPLIER * 1.5
+        elif vol_pct > 50:
+            return self.DEFAULT_OVERFLOW_PREMIUM_MULTIPLIER
+        return self.DEFAULT_OVERFLOW_PREMIUM_MULTIPLIER * 0.8
+
+    def _get_suggested_offset(self, symbol: str, side: int) -> float:
+        orderbook = self._get_orderbook_snapshot(symbol)
+        if orderbook:
+            if side == 1:
+                asks = orderbook.get("asks", [])
+                if len(asks) >= 2:
+                    spread = (asks[1][0] - asks[0][0]) / asks[0][0] * 10000
+                    return max(self.DEFAULT_SUGGESTED_LIMIT_OFFSET_BPS, spread * 0.5)
+            else:
+                bids = orderbook.get("bids", [])
+                if len(bids) >= 2:
+                    spread = (bids[0][0] - bids[1][0]) / bids[0][0] * 10000
+                    return max(self.DEFAULT_SUGGESTED_LIMIT_OFFSET_BPS, spread * 0.5)
+        return self.DEFAULT_SUGGESTED_LIMIT_OFFSET_BPS
+
+    def _get_max_order_size(self, symbol: str) -> float:
+        if self._order_risk_gateway is not None:
+            try:
+                limit = self._order_risk_gateway.get_max_order_size(symbol)
+                if limit is not None and limit > 0:
+                    return limit
+            except Exception as e:
+                logger.warning(f"OrderRiskGateway 查询失败: {e}")
+        equity = self._get_equity()
+        return equity * self.DEFAULT_MAX_ORDER_SIZE_PCT_EQUITY
+
+    def _get_min_order_size(self, symbol: str) -> float:
+        return 0.00001
+
+    def _get_mid_price(self, symbol: str) -> float:
+        orderbook = self._get_orderbook_snapshot(symbol)
+        if orderbook:
+            bids = orderbook.get("bids", [])
+            asks = orderbook.get("asks", [])
+            if bids and asks:
+                return (bids[0][0] + asks[0][0]) / 2.0
+        return 0.0
+
+    def _get_equity(self) -> float:
+        if self._account_ledger is not None:
+            try:
+                equity = self._account_ledger.get_equity()
+                if equity is not None and equity > 0:
+                    return equity
+            except Exception as e:
+                logger.warning(f"AccountLedger 查询失败: {e}")
+        return 1_000_000.0
+
+    def _record_rejection(self, symbol: str, side: int, order_size: float, reason: str, est_slippage: float):
+        with self._rejection_lock:
+            self._rejection_records.append({
+                "timestamp": time.time(),
+                "symbol": symbol,
+                "side": side,
+                "order_size": order_size,
+                "reason": reason,
+                "estimated_slippage_bps": est_slippage,
+            })
+
+    def _try_cleanup(self) -> None:
+        """分批清理过期数据，避免长时间持锁，增加对 _opportunity_cost 的独立清理"""
+        now = time.time()
+        if now - self._last_cleanup < self.DEFAULT_CLEANUP_INTERVAL_SEC:
+            return
+
+        total_removed = 0
+        acquired = self._acquire_lock_with_timeout(self._cumulative_slippage_lock, critical=False)
+        if not acquired:
+            logger.warning("清理失败：无法获取锁")
+            return
+        try:
+            cutoff = now - self.DEFAULT_SLIPPAGE_DATA_MAX_AGE_SEC
+            # 清理成交滑点队列
+            for symbol in list(self._cumulative_slippage.keys()):
+                records = self._cumulative_slippage[symbol]
+                removed_this_batch = 0
+                while records and records[0][0] < cutoff and removed_this_batch < self.DEFAULT_CLEANUP_BATCH_SIZE:
+                    records.popleft()
+                    removed_this_batch += 1
+                    total_removed += 1
+                if not records:
+                    del self._cumulative_slippage[symbol]
+                    self._cleanup_cursors.pop(symbol, None)
+            # 清理本地波动率队列
+            for symbol in list(self._local_slippage_vol.keys()):
+                vol_records = self._local_slippage_vol[symbol]
+                removed_vol = 0
+                while vol_records and vol_records[0][0] < cutoff and removed_vol < self.DEFAULT_CLEANUP_BATCH_SIZE:
+                    vol_records.popleft()
+                    removed_vol += 1
+                if not vol_records:
+                    del self._local_slippage_vol[symbol]
+            # 清理机会成本队列（新增独立清理）
+            for symbol in list(self._opportunity_cost.keys()):
+                opp_records = self._opportunity_cost[symbol]
+                removed_opp = 0
+                while opp_records and opp_records[0][0] < cutoff and removed_opp < self.DEFAULT_CLEANUP_BATCH_SIZE:
+                    opp_records.popleft()
+                    removed_opp += 1
+                if not opp_records:
+                    del self._opportunity_cost[symbol]
+        finally:
+            self._cumulative_slippage_lock.release()
+
+        self._last_cleanup = now
+        if total_removed > 0:
+            logger.info(f"分批清理完成，共移除 {total_removed} 条过期记录")
