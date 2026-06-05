@@ -2,282 +2,620 @@
 火种系统 · 因子时效分层管理器 (TemporalWeightManager)
 
 核心职责：
-1. 根据因子的时效分类（快/中/慢/休眠），记录每个因子上次权重更新时间，判断当前是否需要触发权重更新。
-2. 提供标准化的因子到期查询接口，供条件权重引擎调度器调用，确保不同时效的因子以最优频率重新评估。
+1. 根据因子的时效特性（快/中/慢/休眠），管理其IC更新周期和权重衰减节奏
+2. 追踪每个因子的生命周期阶段（成长/成熟/衰退/休眠/复活），自动触发阶段迁移
 
 外部依赖（真实模块接口）：
-- 无外部模块依赖。本模块为纯状态管理器，所有配置参数从构造函数注入。
+- core.conditional_weight.ic_predictive_adjuster.ICPredictiveAdjuster (需实现 get_latest_ic 方法，且必须线程安全)
+- core.behavioral_logger.BehavioralLogger : 记录因子状态变更日志
+- numpy : 数值计算库（必需依赖）
+- config.weights.yaml : 动态权重快照配置
 
 接口契约：
-- should_update(factor_name: str, factor_type: str) -> Dict[str, Any]
-  输出字典固定包含 "should_update" (bool), "reason" (str), "warnings" (List[str])
-- mark_updated(factor_name: str) -> None
-- get_all_due_factors() -> Dict[str, Any]
-  输出字典固定包含 "due_factors" (List[str]), "reason" (str)
-- health_check() -> Dict[str, Any]
-  输出字典固定包含 "status" (str), "message" (str)
+- update_factor_ic(factor_name: str, ic_value: float, tier: str) -> Dict[str, Any] : 更新指定因子在指定时效层级的IC值
+- get_factor_weight(factor_name: str) -> Dict[str, Any] : 返回指定因子的当前权重（含阶段信息）
+- get_active_factors() -> Dict[str, Any] : 返回所有活跃因子的权重列表（按权重降序排列）
+- migrate_factor_stage(factor_name: str) -> Dict[str, Any] : 手动触发因子生命周期阶段迁移
+- get_stage_distribution() -> Dict[str, Any] : 获取所有因子的生命周期阶段分布统计
+- get_metrics() -> Dict[str, Any] : 获取运维监控指标
+- health_check() -> Dict[str, Any] : 模块自检
+- 所有公共方法输出字典固定包含 "status" (str), "reason" (str), "data" (Dict), "warnings" (List[str])
 
 异常与降级：
-- 若传入的 factor_type 不在预定义的分类中，使用默认更新间隔（慢因子），并记录 WARNING 日志。
-- 若内部状态字典因未知原因损坏，自动重建空字典，确保方法不抛出异常。
-- 若系统时钟出现回拨（ntp 修正等），`should_update` 将基于实际时间戳进行保守处理，标记为需要更新。
+- 当 ICPredictiveAdjuster 不可用或超时时，使用因子滑动窗口IC均值作为回退
+- 当 IC 值包含 NaN/Inf 时，自动过滤并记录告警
+- 当 BehavioralLogger 未注入时，阶段变更日志降级为 WARNING 级别
+- 当外部依赖调用线程池满时，使用滑动窗口IC（不阻塞主流程）
+- 所有外部依赖调用均设置超时，超时后立即回退
 
 资源管理：
-- 本模块仅维护一个内存中的字典，不持有任何需要手动释放的外部资源。
-- 内部状态使用轻量级锁保护，确保多线程查询安全。
+- 生命周期阶段持续时间基于真实时间戳计算
+- `_stage_history` 保留最近 10 条记录，防止内存无限增长
+- `_decay_weights_cache` 最大 200 条，超出后 LRU 淘汰
+- 滑动窗口容量由 `DEFAULT_IC_WINDOW_SIZE` 限制
+- 所有共享状态受 `threading.RLock` 保护
+- 外部依赖调用使用线程池 + 信号量，超时自动丢弃
 """
 
 import time
-import threading
 import logging
-from typing import Dict, Any, List, Optional
+import threading
+import math
+import re
+from typing import Dict, Any, List, Optional, Tuple
+from collections import deque, OrderedDict
+from enum import Enum
+
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
 
+class FactorLifecycleStage(Enum):
+    """因子生命周期阶段枚举"""
+    GROWTH = "growth"
+    MATURE = "mature"
+    DECLINE = "decline"
+    DORMANT = "dormant"
+    REVIVAL = "revival"
+    RETIRED = "retired"
+
+
 class TemporalWeightManager:
-    """因子时效分层管理器：按分类控制因子权重更新频率"""
+    """因子时效分层管理器"""
 
-    # 类常量（默认配置，附带单位与取值范围注释）
-    # 更新间隔，秒，取值范围 [5, 604800]（5 秒到一周）
-    DEFAULT_INTERVAL_FAST = 300          # 快因子默认更新间隔，5 分钟
-    DEFAULT_INTERVAL_MEDIUM = 1800       # 中因子默认更新间隔，30 分钟
-    DEFAULT_INTERVAL_SLOW = 86400        # 慢因子默认更新间隔，24 小时
-    DEFAULT_INTERVAL_DORMANT = 604800    # 休眠因子默认更新间隔，7 天（仅复活检查）
-    
-    # 上次更新时间的默认初始值（设为 0，表示从未更新，首次必定触发）
-    DEFAULT_LAST_UPDATE = 0.0
+    # ========== 类常量（默认配置，附带单位与取值范围注释） ==========
+    DEFAULT_IC_WINDOW_SIZE = 30           # IC滑动窗口最大样本数，无量纲，[10, 90]
+    DEFAULT_MIN_SAMPLES_FOR_EVAL = 10     # 最少样本数用于评估，无量纲，[5, 30]
+    DEFAULT_GROWTH_MAX_SECONDS = 2592000  # 成长期最长时长（30天），秒，[1209600, 5184000]
+    DEFAULT_MATURE_MIN_SECONDS = 2592000  # 成熟期最少稳定时长（30天），秒
+    DEFAULT_DECLINE_IC_THRESHOLD = 0.01   # 衰退期IC阈值，无量纲，[0.001, 0.05]
+    DEFAULT_DECLINE_CONSECUTIVE_COUNT = 3 # 衰退期需连续低于阈值次数，无量纲，[2, 10]
+    DEFAULT_DECLINE_RECOVERY_CONSECUTIVE = 2 # 衰退期需连续高于恢复阈值次数，无量纲，[1, 5]
+    DEFAULT_DORMANT_IC_THRESHOLD = 0.005  # 休眠期IC最低阈值，无量纲，[0.001, 0.02]
+    DEFAULT_REVIVAL_TEST_INTERVAL_SEC = 1209600  # 休眠因子复活检测间隔（14天），秒
+    DEFAULT_RETIRED_NO_REVIVAL_SEC = 15552000    # 退役前无复活时长（180天），秒
+    DEFAULT_NEUTRAL_WEIGHT = 0.1          # 中性权重（回退值），无量纲，[0.01, 0.5]
+    DEFAULT_IC_DECAY_HALFLIFE_DAYS = 15   # IC指数衰减半衰期，天，[5, 60]
+    MAX_STAGE_HISTORY = 10                 # 每个因子保留的迁移历史记录数
+    MAX_DECAY_CACHE_SIZE = 200             # 衰减权重缓存最大容量
+    MAX_INACTIVE_FACTORS_IN_RESPONSE = 200 # API返回的非活跃因子最大数量
 
-    # 时钟回拨容忍值，秒，取值范围 [1, 30]
-    CLOCK_BACKWARD_TOLERANCE = 5.0
+    # 各生命周期阶段的权重上限
+    STAGE_WEIGHT_CAPS = {
+        FactorLifecycleStage.GROWTH: 0.5,
+        FactorLifecycleStage.MATURE: 1.0,
+        FactorLifecycleStage.DECLINE: 0.4,
+        FactorLifecycleStage.DORMANT: 0.0,
+        FactorLifecycleStage.REVIVAL: 0.5,
+        FactorLifecycleStage.RETIRED: 0.0,
+    }
 
-    def __init__(self, config: Optional[Dict[str, Any]] = None):
-        """
-        初始化时效管理器。
-        所有参数优先从配置字典读取，缺失时使用类常量作为安全默认值。
-        """
-        cfg = config or {}
-        # 从配置加载各分类的更新间隔（若提供），并进行边界校验
-        self._interval_fast = self._validate_positive_float(
-            cfg.get("interval_fast", self.DEFAULT_INTERVAL_FAST),
-            5, 604800, "interval_fast"
-        )
-        self._interval_medium = self._validate_positive_float(
-            cfg.get("interval_medium", self.DEFAULT_INTERVAL_MEDIUM),
-            5, 604800, "interval_medium"
-        )
-        self._interval_slow = self._validate_positive_float(
-            cfg.get("interval_slow", self.DEFAULT_INTERVAL_SLOW),
-            5, 604800, "interval_slow"
-        )
-        self._interval_dormant = self._validate_positive_float(
-            cfg.get("interval_dormant", self.DEFAULT_INTERVAL_DORMANT),
-            5, 604800, "interval_dormant"
-        )
-        self._clock_tolerance = float(cfg.get("clock_backward_tolerance", self.CLOCK_BACKWARD_TOLERANCE))
+    # 各生命周期阶段的衰减系数
+    STAGE_DECAY_FACTORS = {
+        FactorLifecycleStage.GROWTH: 1.0,
+        FactorLifecycleStage.MATURE: 1.0,
+        FactorLifecycleStage.DECLINE: 0.9,
+        FactorLifecycleStage.DORMANT: 0.0,
+        FactorLifecycleStage.REVIVAL: 0.8,
+        FactorLifecycleStage.RETIRED: 0.0,
+    }
 
-        # 内部状态及其线程安全锁
-        self._lock = threading.Lock()
-        self._last_update_map: Dict[str, float] = {}
-        self._factor_type_map: Dict[str, str] = {}
+    DECLINE_RECOVERY_MULTIPLIER = 1.5      # 衰退恢复的IC乘数，[1.2, 2.0]
+    FACTOR_TIERS = ["fast", "medium", "slow"]
+    EXTERNAL_CALL_TIMEOUT_SEC = 1.0        # 外部调用超时（1秒，避免阻塞主流程）
+    ACTIVE_WEIGHT_THRESHOLD = 0.001
+    MAX_FACTOR_NAME_LENGTH = 128
+    MAX_WORKER_THREADS = 8
 
-        # 监控指标
-        self._metrics: Dict[str, Any] = {
-            "total_checks": 0,
-            "total_updates": 0,
-            "last_check_time": 0.0
-        }
+    # 各时效层级的权重（用于混合IC时的加权平均）
+    TIER_WEIGHTS = {
+        "fast": 0.5,
+        "medium": 0.3,
+        "slow": 0.2,
+    }
+
+    def __init__(self):
+        self._ic_history: Dict[str, Dict[str, deque]] = {}
+        self._lifecycle_stage: Dict[str, FactorLifecycleStage] = {}
+        self._last_update: Dict[str, float] = {}
+        self._stage_start_time: Dict[str, float] = {}
+        self._stage_history: Dict[str, deque] = {}
+        self._decline_consecutive_count: Dict[str, int] = {}
+        self._decline_recovery_count: Dict[str, int] = {}
+        self._ic_adjuster = None
+        self._behavioral_logger = None
+        self._lock = threading.RLock()
+        self._worker_semaphore = threading.BoundedSemaphore(self.MAX_WORKER_THREADS)
+        self._total_ic_updates: int = 0
+        self._total_stage_migrations: int = 0
+        self._total_external_call_drops: int = 0
+        self._decay_weights_cache: OrderedDict = OrderedDict()
 
         logger.info(
-            f"TemporalWeightManager 初始化完成: "
-            f"fast={self._interval_fast}s, medium={self._interval_medium}s, "
-            f"slow={self._interval_slow}s, dormant={self._interval_dormant}s"
+            "TemporalWeightManager 初始化完成，支持 %d 种因子时效层级",
+            len(self.FACTOR_TIERS)
         )
 
-    # ────────────────────────── 配置校验 ──────────────────────────
-    @staticmethod
-    def _validate_positive_float(value: Any, low: float, high: float, name: str) -> float:
-        """校验浮点配置在边界内，否则返回默认值并警告"""
-        try:
-            v = float(value)
-            if low <= v <= high:
-                return v
-            logger.warning(f"配置 {name}={value} 超出范围 [{low},{high}]，使用默认值")
-        except (ValueError, TypeError):
-            logger.warning(f"配置 {name}={value} 无效，使用默认值")
-        return getattr(TemporalWeightManager, name.upper(), None) or low
-
-    # ────────────────────────── 公共接口 ──────────────────────────
-    def should_update(self, factor_name: str, factor_type: str = "medium") -> Dict[str, Any]:
-        """
-        判断指定因子是否达到了更新周期。
-        
-        参数:
-            factor_name: 因子名称。
-            factor_type: 因子分类，支持 "fast", "medium", "slow", "dormant"。
-                        未知类型将降级为 "slow"，并记录 WARNING。
-        
-        返回:
-            标准化字典，包含更新判定、原因和警告。
-        """
-        warnings: List[str] = []
-        now = time.time()
-        
-        # 1. 解析因子类型，获取对应的更新间隔
-        interval = self._get_interval_for_type(factor_type)
-        effective_type = factor_type
-        if factor_type not in ("fast", "medium", "slow", "dormant"):
-            warn = f"未知的因子类型 '{factor_type}'，降级为 'slow' 处理"
-            logger.warning(warn)
-            warnings.append(warn)
-            effective_type = "slow"
-            interval = self._interval_slow
-
-        # 2. 获取上次更新时间（若从未更新，默认为 0）
-        with self._lock:
-            last_update = self._last_update_map.get(factor_name, self.DEFAULT_LAST_UPDATE)
-        elapsed = now - last_update
-
-        # 3. 时钟回拨检测
-        if elapsed < -self._clock_tolerance:
-            # 系统时钟发生了显著回拨，保守处理：强制标记需要更新
-            warn = (
-                f"检测到系统时钟回拨 (last={last_update:.0f}, now={now:.0f}, "
-                f"diff={elapsed:.0f}s)，因子 '{factor_name}' 强制标记为需要更新"
-            )
-            logger.warning(warn)
-            warnings.append(warn)
-            should = True
-            with self._lock:
-                self._last_update_map[factor_name] = now
-            reason = f"因子 '{factor_name}' ({effective_type}): 时钟回拨，强制触发更新"
+    # ========== 依赖注入 ==========
+    def inject_dependencies(
+        self,
+        ic_adjuster: Optional[Any] = None,
+        behavioral_logger: Optional[Any] = None,
+    ) -> None:
+        if ic_adjuster is not None:
+            if not hasattr(ic_adjuster, 'get_latest_ic'):
+                logger.warning("ICPredictiveAdjuster 缺少 get_latest_ic 方法，IC数据源不可用")
+                self._ic_adjuster = None
+            else:
+                self._ic_adjuster = ic_adjuster
+                logger.info("ICPredictiveAdjuster 注入成功")
         else:
-            elapsed = max(0.0, elapsed)  # 微小的负值归零
-            should = elapsed >= interval
-            reason = (
-                f"因子 '{factor_name}' ({effective_type}): "
-                f"距上次更新 {elapsed:.0f} 秒，{'需要' if should else '无需'}更新 "
-                f"(间隔={interval:.0f}秒)"
-            )
+            logger.warning("ICPredictiveAdjuster 未注入，IC数据源降级为内部缓存")
 
-        # 4. 更新因子类型映射（线程安全）
-        with self._lock:
-            self._factor_type_map[factor_name] = effective_type
-            self._metrics["total_checks"] += 1
-            self._metrics["last_check_time"] = now
+        if behavioral_logger is not None:
+            self._behavioral_logger = behavioral_logger
+            logger.info("BehavioralLogger 注入成功")
+        else:
+            logger.warning("BehavioralLogger 未注入，阶段变更日志降级为标准 WARNING logger")
 
-        logger.debug(reason)
-        return {
-            "should_update": should,
-            "reason": reason,
-            "warnings": warnings
-        }
+    # ========== 公共接口 ==========
+    def update_factor_ic(
+        self, factor_name: str, ic_value: float, tier: str = "medium"
+    ) -> Dict[str, Any]:
+        # 参数校验
+        if not factor_name or not isinstance(factor_name, str) or factor_name.strip() == "":
+            logger.warning("无效因子名称: %s", factor_name)
+            return self._error_response("invalid_factor_name", f"无效因子名称: '{factor_name}'")
+        factor_name = factor_name.strip()
+        if len(factor_name) > self.MAX_FACTOR_NAME_LENGTH:
+            logger.warning("因子名称过长: %d > %d", len(factor_name), self.MAX_FACTOR_NAME_LENGTH)
+            return self._error_response("factor_name_too_long", f"因子名称过长")
+        if not re.match(r'^[a-zA-Z0-9_\.]+$', factor_name):
+            logger.warning("因子名称包含非法字符: %s", factor_name)
+            return self._error_response("invalid_characters", f"因子名称包含非法字符: {factor_name}")
 
-    def mark_updated(self, factor_name: str) -> None:
-        """
-        标记指定因子为“已更新”，将当前时间记录为最近更新时间。
-        
-        参数:
-            factor_name: 因子名称。
-        """
+        if ic_value is None or math.isnan(ic_value) or math.isinf(ic_value):
+            logger.warning("因子 %s 收到无效IC值: %s，已丢弃", factor_name, ic_value)
+            self._log_anomaly(factor_name, f"无效IC值: {ic_value}")
+            return self._error_response("invalid_ic_value", f"无效IC值: {ic_value}")
+
+        ic_value = max(-1.0, min(1.0, float(ic_value)))
+
+        if tier not in self.FACTOR_TIERS:
+            logger.warning("未知时效层级: %s，已拒绝写入。有效值: %s", tier, self.FACTOR_TIERS)
+            return self._error_response("invalid_tier", f"未知时效层级: {tier}")
+
         now = time.time()
-        with self._lock:
-            self._last_update_map[factor_name] = now
-            self._metrics["total_updates"] += 1
-        logger.debug(f"因子 '{factor_name}' 已标记为更新 (timestamp={now:.0f})")
+        stage_changed = False
+        old_stage = None
+        new_stage = None
 
-    def get_all_due_factors(self) -> Dict[str, Any]:
-        """
-        获取所有当前到期的因子列表。
-        遍历内部状态表，对每个已记录的因子调用 should_update 判定，
-        返回所有需要更新的因子名称。
-        """
-        due_factors: List[str] = []
         with self._lock:
-            snapshot = dict(self._factor_type_map)
-        for name, ftype in snapshot.items():
-            result = self.should_update(name, ftype)
-            if result["should_update"]:
-                due_factors.append(name)
+            # 初始化因子数据结构（仅分配当前写入层级）
+            if factor_name not in self._ic_history:
+                self._ic_history[factor_name] = {
+                    t: deque(maxlen=self.DEFAULT_IC_WINDOW_SIZE) for t in self.FACTOR_TIERS
+                }
+                self._lifecycle_stage[factor_name] = FactorLifecycleStage.GROWTH
+                self._stage_start_time[factor_name] = now
+                self._stage_history[factor_name] = deque(maxlen=self.MAX_STAGE_HISTORY)
+                self._decline_consecutive_count[factor_name] = 0
+                self._decline_recovery_count[factor_name] = 0
+                logger.info("新因子注册: %s，进入成长期", factor_name)
 
-        reason = (
-            f"到期因子扫描完成，共 {len(snapshot)} 个因子，{len(due_factors)} 个需要更新"
-        )
+            self._ic_history[factor_name][tier].append(ic_value)
+            self._last_update[factor_name] = now
+            self._total_ic_updates += 1
+
+            if ic_value < self.DEFAULT_DECLINE_IC_THRESHOLD:
+                self._decline_consecutive_count[factor_name] += 1
+            else:
+                self._decline_consecutive_count[factor_name] = 0
+
+            if ic_value > self.DEFAULT_DECLINE_IC_THRESHOLD * self.DECLINE_RECOVERY_MULTIPLIER:
+                self._decline_recovery_count[factor_name] += 1
+            else:
+                self._decline_recovery_count[factor_name] = 0
+
+            old_stage = self._lifecycle_stage[factor_name]
+            new_stage = self._evaluate_lifecycle_migration(factor_name, ic_value, now)
+            if new_stage != old_stage:
+                self._lifecycle_stage[factor_name] = new_stage
+                self._stage_start_time[factor_name] = now
+                self._stage_history[factor_name].append({
+                    "timestamp": now,
+                    "old_stage": old_stage.value,
+                    "new_stage": new_stage.value,
+                    "ic_value": ic_value,
+                })
+                self._decline_consecutive_count[factor_name] = 0
+                self._decline_recovery_count[factor_name] = 0
+                self._total_stage_migrations += 1
+                stage_changed = True
+                logger.info(
+                    "因子 %s 生命周期迁移: %s -> %s (IC=%.4f)",
+                    factor_name, old_stage.value, new_stage.value, ic_value
+                )
+                self._log_stage_change(factor_name, old_stage.value, new_stage.value, ic_value, now)
+
         return {
-            "due_factors": due_factors,
-            "reason": reason
+            "status": "ok",
+            "reason": f"因子 {factor_name} IC已更新: {ic_value:.4f} (层级: {tier})",
+            "data": {
+                "factor_name": factor_name,
+                "ic_value": round(ic_value, 4),
+                "tier": tier,
+                "lifecycle_stage": (new_stage or old_stage).value,
+                "stage_changed": stage_changed,
+                "timestamp": now,
+            },
+            "warnings": [],
         }
 
-    def get_factor_interval(self, factor_type: str) -> float:
-        """
-        获取指定因子类型的更新间隔（秒）。
-        主要用于外部模块查询配置。
-        """
-        return self._get_interval_for_type(factor_type)
+    def get_factor_weight(self, factor_name: str) -> Dict[str, Any]:
+        with self._lock:
+            if factor_name not in self._lifecycle_stage:
+                logger.warning("因子 %s 未注册", factor_name)
+                return self._error_response("unknown_factor", f"因子 {factor_name} 未注册")
+            stage = self._lifecycle_stage[factor_name]
+
+        if stage in (FactorLifecycleStage.DORMANT, FactorLifecycleStage.RETIRED):
+            return {
+                "status": "ok",
+                "reason": f"因子 {factor_name} 处于 {stage.value} 期，权重为0",
+                "data": {
+                    "factor_name": factor_name,
+                    "current_weight": 0.0,
+                    "lifecycle_stage": stage.value,
+                    "weight_cap": self.STAGE_WEIGHT_CAPS.get(stage, 0.0),
+                },
+                "warnings": [],
+            }
+
+        current_ic = self._get_latest_effective_ic(factor_name)
+
+        with self._lock:
+            # 再次确认阶段未变（可能已被迁移）
+            stage = self._lifecycle_stage.get(factor_name, stage)
+            if stage in (FactorLifecycleStage.DORMANT, FactorLifecycleStage.RETIRED):
+                return {
+                    "status": "ok",
+                    "reason": f"因子 {factor_name} 刚进入 {stage.value} 期，权重为0",
+                    "data": {"factor_name": factor_name, "current_weight": 0.0},
+                    "warnings": [],
+                }
+            if current_ic is None or math.isnan(current_ic):
+                current_ic = 0.0
+            weight_cap = self.STAGE_WEIGHT_CAPS.get(stage, 0.5)
+            decay_factor = self.STAGE_DECAY_FACTORS.get(stage, 1.0)
+            raw_weight = max(0.0, current_ic * decay_factor)
+            effective_weight = min(raw_weight, weight_cap)
+
+        return {
+            "status": "ok",
+            "reason": f"因子 {factor_name} 权重: {effective_weight:.4f} (阶段: {stage.value})",
+            "data": {
+                "factor_name": factor_name,
+                "current_weight": round(effective_weight, 4),
+                "lifecycle_stage": stage.value,
+                "current_ic": round(current_ic, 4),
+            },
+            "warnings": [],
+        }
+
+    def get_active_factors(self) -> Dict[str, Any]:
+        active_weights = {}
+        inactive_factors = []
+        with self._lock:
+            all_factors = list(self._lifecycle_stage.keys())
+            stage_map = {f: self._lifecycle_stage[f] for f in all_factors}
+
+        for factor_name in all_factors:
+            stage = stage_map[factor_name]
+            if stage in (FactorLifecycleStage.DORMANT, FactorLifecycleStage.RETIRED):
+                inactive_factors.append(factor_name)
+                continue
+            current_ic = self._get_latest_effective_ic(factor_name)
+            with self._lock:
+                # 再次确认阶段和因子存在性
+                if factor_name not in self._lifecycle_stage:
+                    continue
+                stage = self._lifecycle_stage[factor_name]
+                if stage in (FactorLifecycleStage.DORMANT, FactorLifecycleStage.RETIRED):
+                    inactive_factors.append(factor_name)
+                    continue
+                if current_ic is None or math.isnan(current_ic):
+                    current_ic = 0.0
+                weight_cap = self.STAGE_WEIGHT_CAPS.get(stage, 0.5)
+                decay_factor = self.STAGE_DECAY_FACTORS.get(stage, 1.0)
+                raw_weight = max(0.0, current_ic * decay_factor)
+                effective_weight = min(raw_weight, weight_cap)
+                if effective_weight > self.ACTIVE_WEIGHT_THRESHOLD:
+                    active_weights[factor_name] = round(effective_weight, 4)
+
+        sorted_active = OrderedDict(
+            sorted(active_weights.items(), key=lambda x: x[1], reverse=True)
+        )
+
+        # 限制返回的非活跃因子数量
+        inactive_preview = inactive_factors[:self.MAX_INACTIVE_FACTORS_IN_RESPONSE]
+
+        return {
+            "status": "ok",
+            "reason": f"活跃因子数量: {len(sorted_active)}, 非活跃: {len(inactive_factors)}",
+            "data": {
+                "active_factors": sorted_active,
+                "active_count": len(sorted_active),
+                "inactive_count": len(inactive_factors),
+                "inactive_factors_preview": inactive_preview,
+            },
+            "warnings": [],
+        }
+
+    def migrate_factor_stage(self, factor_name: str) -> Dict[str, Any]:
+        with self._lock:
+            if factor_name not in self._lifecycle_stage:
+                return self._error_response("unknown_factor", f"因子 {factor_name} 未注册")
+            old_stage = self._lifecycle_stage[factor_name]
+            current_ic = self._get_latest_effective_ic_internal(factor_name)
+            now = time.time()
+            new_stage = self._evaluate_lifecycle_migration(factor_name, current_ic, now)
+            if new_stage != old_stage:
+                self._lifecycle_stage[factor_name] = new_stage
+                self._stage_start_time[factor_name] = now
+                self._decline_consecutive_count[factor_name] = 0
+                self._decline_recovery_count[factor_name] = 0
+                self._total_stage_migrations += 1
+                self._stage_history[factor_name].append({
+                    "timestamp": now,
+                    "old_stage": old_stage.value,
+                    "new_stage": new_stage.value,
+                    "ic_value": current_ic,
+                })
+
+            return {
+                "status": "ok",
+                "reason": f"因子 {factor_name} 阶段迁移: {old_stage.value} -> {new_stage.value}",
+                "data": {"factor_name": factor_name, "old_stage": old_stage.value, "new_stage": new_stage.value},
+                "warnings": [],
+            }
+
+    def get_stage_distribution(self) -> Dict[str, Any]:
+        with self._lock:
+            distribution = {stage.value: 0 for stage in FactorLifecycleStage}
+            for stage in self._lifecycle_stage.values():
+                distribution[stage.value] += 1
+
+        return {
+            "status": "ok",
+            "reason": f"因子阶段分布: {distribution}",
+            "data": {"distribution": distribution, "total_factors": len(self._lifecycle_stage)},
+            "warnings": [],
+        }
 
     def get_metrics(self) -> Dict[str, Any]:
-        """获取内部监控指标，线程安全"""
         with self._lock:
-            return dict(self._metrics)
+            distribution = {}
+            for s in FactorLifecycleStage:
+                distribution[s.value] = sum(1 for x in self._lifecycle_stage.values() if x == s)
 
-    @classmethod
-    def health_check(cls) -> Dict[str, Any]:
-        """模块自检：模拟因子注册、到期判定、时钟回拨和更新标记流程。"""
+        return {
+            "status": "ok",
+            "reason": "运维指标采集完成",
+            "data": {
+                "total_factors": len(self._lifecycle_stage),
+                "total_ic_updates": self._total_ic_updates,
+                "total_stage_migrations": self._total_stage_migrations,
+                "total_external_call_drops": self._total_external_call_drops,
+                "stage_distribution": distribution,
+                "dependencies": {
+                    "ic_adjuster_available": self._ic_adjuster is not None,
+                    "behavioral_logger_available": self._behavioral_logger is not None,
+                },
+            },
+            "warnings": [],
+        }
+
+    def health_check(self) -> Dict[str, Any]:
         try:
-            instance = cls()
-            test_factor = "health_test_factor"
+            with self._lock:
+                total_factors = len(self._lifecycle_stage)
+                distribution = {}
+                for s in FactorLifecycleStage:
+                    distribution[s.value] = sum(1 for x in self._lifecycle_stage.values() if x == s)
+                ic_history_snapshot = list(self._ic_history.keys())
+                total_ic_samples = 0
+                for name in ic_history_snapshot:
+                    for tier_data in self._ic_history[name].values():
+                        total_ic_samples += len(tier_data)
 
-            # 1. 首次检查应触发更新
-            result = instance.should_update(test_factor, "fast")
-            if not result["should_update"]:
-                return {"status": "error", "message": "首次检查应触发更新，但返回 False"}
-
-            # 2. 标记更新后，短时间内不应再触发
-            instance.mark_updated(test_factor)
-            result2 = instance.should_update(test_factor, "fast")
-            if result2["should_update"]:
-                return {"status": "error", "message": "刚更新后不应再次触发"}
-
-            # 3. 模拟时钟回拨
-            with instance._lock:
-                instance._last_update_map[test_factor] = time.time() + 60  # 未来时间
-            result3 = instance.should_update(test_factor, "fast")
-            if not result3["should_update"]:
-                return {"status": "error", "message": "时钟回拨应触发强制更新"}
-            if not any("时钟回拨" in w for w in result3.get("warnings", [])):
-                return {"status": "error", "message": "时钟回拨应产生警告"}
-
-            # 4. 测试未知类型降级
-            result4 = instance.should_update("unknown_factor", "unknown_type")
-            if not result4.get("warnings"):
-                return {"status": "error", "message": "未知类型应产生警告"}
-
-            # 5. 到期扫描
-            due = instance.get_all_due_factors()
-            if not isinstance(due.get("due_factors"), list):
-                return {"status": "error", "message": "到期扫描返回值格式错误"}
-
-            # 6. 验证监控指标
-            metrics = instance.get_metrics()
-            if metrics.get("total_checks", 0) == 0:
-                return {"status": "error", "message": "监控指标未正确更新"}
-
-            return {"status": "ok", "message": "健康检查通过"}
+            return {
+                "status": "ok",
+                "reason": (
+                    f"TemporalWeightManager 正常，管理 {total_factors} 个因子，"
+                    f"累计IC更新 {self._total_ic_updates} 次，阶段迁移 {self._total_stage_migrations} 次"
+                ),
+                "data": {
+                    "total_factors": total_factors,
+                    "stage_distribution": distribution,
+                    "total_ic_samples": total_ic_samples,
+                    "total_ic_updates": self._total_ic_updates,
+                    "total_stage_migrations": self._total_stage_migrations,
+                    "dependencies": {
+                        "ic_adjuster": self._ic_adjuster is not None,
+                        "behavioral_logger": self._behavioral_logger is not None,
+                    },
+                },
+                "warnings": [],
+            }
         except Exception as e:
-            logger.error(f"健康检查失败: {e}")
-            return {"status": "error", "message": str(e)}
+            logger.error("健康检查失败: %s #RECOVERY: 检查锁状态和数据结构完整性", e)
+            return self._error_response("health_check_failed", f"健康检查异常: {str(e)}")
 
-    # ────────────────────────── 内部方法 ──────────────────────────
-    def _get_interval_for_type(self, factor_type: str) -> float:
-        """根据因子类型字符串返回对应的更新间隔（秒）。"""
-        type_lower = factor_type.lower()
-        if type_lower == "fast":
-            return self._interval_fast
-        elif type_lower == "medium":
-            return self._interval_medium
-        elif type_lower == "slow":
-            return self._interval_slow
-        elif type_lower == "dormant":
-            return self._interval_dormant
+    # ========== 私有方法 ==========
+    def _error_response(self, error_code: str, reason: str) -> Dict[str, Any]:
+        return {
+            "status": "error",
+            "reason": reason,
+            "data": {"error_code": error_code},
+            "warnings": [error_code],
+        }
+
+    def _log_anomaly(self, factor_name: str, message: str) -> None:
+        if self._behavioral_logger:
+            try:
+                self._behavioral_logger.log_event(
+                    event_type="factor_ic_anomaly",
+                    details={"factor_name": factor_name, "message": message, "timestamp": time.time()},
+                )
+            except Exception:
+                pass
+
+    def _get_latest_effective_ic(self, factor_name: str) -> float:
+        if self._ic_adjuster is not None:
+            external_ic = self._call_external_with_timeout(factor_name)
+            if external_ic is not None:
+                return external_ic
+        return self._get_latest_effective_ic_internal(factor_name)
+
+    def _get_latest_effective_ic_internal(self, factor_name: str) -> float:
+        """从内部滑动窗口计算加权IC，按层级加权平均"""
+        weighted_sum = 0.0
+        total_weight = 0.0
+        if factor_name in self._ic_history:
+            for tier in self.FACTOR_TIERS:
+                tier_data = self._ic_history[factor_name].get(tier, deque())
+                if not tier_data:
+                    continue
+                valid = [v for v in tier_data if v is not None and not math.isnan(v) and not math.isinf(v)]
+                if not valid:
+                    continue
+                n = len(valid)
+                decay_weights = self._get_decay_weights(n)
+                tier_ic = float(np.dot(valid, decay_weights)) / float(np.sum(decay_weights))
+                tier_w = self.TIER_WEIGHTS.get(tier, 0.33)
+                weighted_sum += tier_ic * tier_w
+                total_weight += tier_w
+        if total_weight > 0:
+            return max(-1.0, min(1.0, weighted_sum / total_weight))
+        return 0.0
+
+    def _call_external_with_timeout(self, factor_name: str) -> Optional[float]:
+        if not self._worker_semaphore.acquire(blocking=False):
+            self._total_external_call_drops += 1
+            logger.debug("外部依赖调用线程池已满，跳过对 %s 的IC获取", factor_name)
+            return None
+        try:
+            result_container: Dict[str, Any] = {"value": None, "error": None}
+
+            def _call_target():
+                try:
+                    result_container["value"] = self._ic_adjuster.get_latest_ic(factor_name)
+                except Exception as e:
+                    result_container["error"] = e
+
+            thread = threading.Thread(target=_call_target, daemon=True)
+            thread.start()
+            thread.join(timeout=self.EXTERNAL_CALL_TIMEOUT_SEC)
+
+            if thread.is_alive():
+                logger.warning("ICPredictiveAdjuster.get_latest_ic 超时，回退到滑动窗口")
+                return None
+            if result_container["error"] is not None:
+                logger.debug("ICPredictiveAdjuster 调用异常: %s", result_container["error"])
+                return None
+            if result_container["value"] is not None:
+                val = float(result_container["value"])
+                if not math.isnan(val) and not math.isinf(val):
+                    return max(-1.0, min(1.0, val))
+        except Exception as e:
+            logger.debug("ICPredictiveAdjuster 调用失败: %s", e)
+        finally:
+            self._worker_semaphore.release()
+        return None
+
+    def _get_decay_weights(self, n: int) -> np.ndarray:
+        half_life = self.DEFAULT_IC_DECAY_HALFLIFE_DAYS
+        cache_key = (n, half_life)
+        if cache_key not in self._decay_weights_cache:
+            if len(self._decay_weights_cache) >= self.MAX_DECAY_CACHE_SIZE:
+                self._decay_weights_cache.popitem(last=False)
+            weights = np.exp(-np.log(2) * np.arange(n - 1, -1, -1) / half_life)
+            self._decay_weights_cache[cache_key] = weights
+        return self._decay_weights_cache[cache_key]
+
+    def _evaluate_lifecycle_migration(
+        self, factor_name: str, current_ic: float, now: float
+    ) -> FactorLifecycleStage:
+        if current_ic is None or math.isnan(current_ic):
+            current_ic = 0.0
+
+        current_stage = self._lifecycle_stage.get(factor_name, FactorLifecycleStage.GROWTH)
+        stage_start = self._stage_start_time.get(factor_name, now)
+        duration_seconds = now - stage_start
+
+        if current_stage == FactorLifecycleStage.GROWTH:
+            if duration_seconds >= self.DEFAULT_GROWTH_MAX_SECONDS:
+                if current_ic > self.DEFAULT_DECLINE_IC_THRESHOLD:
+                    return FactorLifecycleStage.MATURE
+                return FactorLifecycleStage.DECLINE
+
+        elif current_stage == FactorLifecycleStage.MATURE:
+            if current_ic < self.DEFAULT_DECLINE_IC_THRESHOLD:
+                return FactorLifecycleStage.DECLINE
+
+        elif current_stage == FactorLifecycleStage.DECLINE:
+            if (self._decline_recovery_count.get(factor_name, 0) >=
+                    self.DEFAULT_DECLINE_RECOVERY_CONSECUTIVE):
+                return FactorLifecycleStage.MATURE
+            if (self._decline_consecutive_count.get(factor_name, 0) >=
+                    self.DEFAULT_DECLINE_CONSECUTIVE_COUNT):
+                if current_ic < self.DEFAULT_DORMANT_IC_THRESHOLD:
+                    return FactorLifecycleStage.DORMANT
+
+        elif current_stage == FactorLifecycleStage.DORMANT:
+            if duration_seconds >= self.DEFAULT_REVIVAL_TEST_INTERVAL_SEC:
+                if current_ic > self.DEFAULT_DORMANT_IC_THRESHOLD:
+                    return FactorLifecycleStage.REVIVAL
+                # 延长检测间隔，避免刚重启就检测
+                self._stage_start_time[factor_name] = now
+            if duration_seconds >= self.DEFAULT_RETIRED_NO_REVIVAL_SEC:
+                return FactorLifecycleStage.RETIRED
+
+        elif current_stage == FactorLifecycleStage.REVIVAL:
+            if current_ic > self.DEFAULT_DECLINE_IC_THRESHOLD:
+                return FactorLifecycleStage.MATURE
+            if duration_seconds >= self.DEFAULT_GROWTH_MAX_SECONDS:
+                return FactorLifecycleStage.DECLINE
+
+        return current_stage
+
+    def _log_stage_change(
+        self,
+        factor_name: str,
+        old_stage: str,
+        new_stage: str,
+        ic_value: float,
+        timestamp: float,
+    ) -> None:
+        event_details = {
+            "factor_name": factor_name,
+            "old_stage": old_stage,
+            "new_stage": new_stage,
+            "ic_value": round(ic_value, 4),
+            "timestamp": timestamp,
+        }
+        if self._behavioral_logger is not None:
+            try:
+                self._behavioral_logger.log_event(
+                    event_type="factor_stage_migration",
+                    details=event_details,
+                )
+            except Exception as e:
+                logger.warning("行为日志记录失败: %s", e)
         else:
-            return self._interval_slow  # 默认兜底
+            logger.warning(
+                "因子 %s 阶段变更: %s -> %s (IC=%.4f) [行为日志未注入]",
+                factor_name, old_stage, new_stage, ic_value,
+            )
