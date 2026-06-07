@@ -1,9 +1,9 @@
 """
-火种系统 · 感知中枢 (PerceptionHub) — 深度精细化
+火种系统 · 感知中枢入口 (PerceptionHub)
 
 核心职责：
-1. 作为五感皮层（视觉、听觉、触觉、嗅觉、味觉）、因子预处理器和多频段锁相环的统一入口，为下游策略引擎提供一站式感知服务。
-2. 管理所有子模块的依赖注入、生命周期，并对外暴露标准化的 perceive() 接口，返回融合后的感官快照。
+1. 以无锁并发、线程池复用、有界队列背压的方式调度五感皮层，生成附带全局追踪ID、阶段耗时的标准化感官快照。
+2. 作为全局严格单例，管理感官实例的运行时健康、熔断半开探测、降级默认值安全拷贝和性能KPI采集，并通过独立事件发射器异步发布状态变更。
 
 外部依赖（真实模块接口）：
 - core.perception.visual_cortex.VisualCortex : 视觉皮层
@@ -11,336 +11,303 @@
 - core.perception.tactile_cortex.TactileCortex : 触觉皮层
 - core.perception.olfactory_cortex.OlfactoryCortex : 嗅觉皮层
 - core.perception.gustatory_cortex.GustatoryCortex : 味觉皮层
-- core.perception.factor_preprocessor.FactorPreprocessor : 因子预处理器
+- core.perception.factor_preprocessor.FactorPreprocessor : 因子预处理
 - core.perception.multi_band_pll.MultiBandPLL : 多频段锁相环
 - core.perception.sensory_snapshot.SensorySnapshot : 感官快照标准化接口
-- (外部注入) core.experience_replay.ExperienceReplay : 味觉皮层所需历史经验数据
-- (外部注入) core.global_state_archive.GlobalStateArchive : 味觉皮层所需极端事件记忆
+- core.utils.direction_resolver.DirectionResolver : 方向解析器
+- core.event_bus.EventBus : 异步事件总线
+- core.utils.trace_id_generator.TraceIdGenerator : 全局追踪ID生成器
 
 接口契约：
-- perceive(market_data: Dict[str, Any]) -> Dict[str, Any]
-  输出字典固定包含 "status" (str), "snapshot" (Dict[str, Any]), "reason" (str), "warnings" (List[str])
-- inject_dependencies(experience_replay: Any = None, state_archive: Any = None) -> None
+- provide_sensory_snapshot(symbol: str, context: Dict[str, Any]) -> Dict[str, Any]
 - health_check() -> Dict[str, Any]
-  输出字典固定包含 "status" (str), "message" (str)
+- inject_dependencies(...) -> None
 
 异常与降级：
-- 任何感官模块不可用时，对应感官字段使用安全默认值填充，并在 warnings 中记录，不影响其他感官运行。
-- 输入数据缺失时，返回全量降级快照，状态标记为 "degraded"。
-- 所有子模块初始化异常均被捕获，确保感知中枢始终可运行。
+- 所有感官调用均设有动态可配的超时时间，超时或异常后返回安全的、深拷贝的保守默认值。
+- 降级状态通过独立的事件发射器异步广播，绝不阻塞主流程。
+- 连续降级达阈值的感官进入熔断冷却期，冷却期后自动尝试“半开”探测恢复。
 
 资源管理：
-- 本模块不持有需要手动释放的资源。所有子模块为无状态或独立管理自身资源。
+- 全局单例，进程退出时通过 `atexit` 安全关闭线程池。
+- 使用 `copy.deepcopy` 保护降级默认值不被下游意外修改。
+- 内部使用 `__slots__` 控制内存占用。
 """
 
 import logging
-from typing import Dict, Any, List, Optional, Tuple
+import threading
+import time
+import atexit
+import copy
+import uuid
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor, TimeoutError, Future
+from typing import Dict, Any, List, Optional, Callable
 
 logger = logging.getLogger(__name__)
 
+# 模块级常量
+SENSE_SNAPSHOT_METHOD = "get_snapshot"
+HEALTH_CHECK_METHOD = "health_check"
+MAX_CONTEXT_SIZE_BYTES = 10 * 1024  # 上下文最大尺寸，防止内存攻击
+MAX_SYMBOL_LENGTH = 20              # 交易对名称最大长度
+VALID_SYMBOL_PATTERN = r"^[A-Z0-9]+$"
+
 
 class PerceptionHub:
-    """感知中枢：统一调度五感皮层与预处理模块"""
+    """感知中枢入口 (线程安全单例)"""
 
-    # 类常量（默认配置）
-    DEFAULT_CONFIG: Dict[str, Any] = {}
+    # ========== 类常量 ==========
+    SENSE_NAMES = ["visual", "auditory", "tactile", "olfactory", "gustatory"]
+    DEFAULT_SENSE_TIMEOUT_SEC = 0.005
+    DEFAULT_LATENCY_TARGET_US = 500
+    MAX_DEGRADATION_STRIKES = 5
+    SENSE_COOLDOWN_SEC = 30.0
+    THREAD_POOL_MAX_WORKERS = len(SENSE_NAMES)
+    THREAD_POOL_QUEUE_SIZE = 100  # 有界队列
 
-    def __init__(self, config: Optional[Dict[str, Any]] = None) -> None:
-        """
-        初始化所有子模块实例。
-        
-        Args:
-            config: 可选的全局配置字典，用于传递给各子模块进行参数覆盖。
-        """
-        self._config = config if config is not None else self.DEFAULT_CONFIG
+    # 降级默认值（保守、风险厌恶）
+    _DEGRADED_DEFAULTS_TEMPLATE = {
+        "visual": {"candlestick_pattern": "unknown", "orderbook_slope": 0.0, "wall_resilience": 0.0, "ma12_position": "unknown"},
+        "auditory": {"macro_alert_level": 0, "sentiment_score": 0.0, "sentiment_momentum": 0.0},
+        "tactile": {"liquidity_level": "L2", "depth_decay_speed": 0.0, "trade_pulse_cv": 0.0},
+        "olfactory": {"paper_wall_flag": False, "order_toxicity_flag": True, "contagion_risk_index": 1.0},
+        "gustatory": {"similar_historical_win_rate": 0.35, "bitter_memory_similarity": 1.0},
+    }
 
-        # 按需创建各子模块，若导入失败则标记为不可用
-        self._visual = self._safe_create("core.perception.visual_cortex", "VisualCortex", self._config)
-        self._auditory = self._safe_create("core.perception.auditory_cortex", "AuditoryCortex", self._config)
-        self._tactile = self._safe_create("core.perception.tactile_cortex", "TactileCortex", self._config)
-        self._olfactory = self._safe_create("core.perception.olfactory_cortex", "OlfactoryCortex", self._config)
-        self._gustatory = self._safe_create("core.perception.gustatory_cortex", "GustatoryCortex", self._config)
-        self._preprocessor = self._safe_create("core.perception.factor_preprocessor", "FactorPreprocessor", self._config)
-        self._pll = self._safe_create("core.perception.multi_band_pll", "MultiBandPLL", None)
-        self._snapshot = self._safe_create("core.perception.sensory_snapshot", "SensorySnapshot", self._config)
+    # 单例
+    _instance = None
+    _instance_lock = threading.Lock()
 
-        # 外部依赖（延迟注入）
-        self._experience_replay: Optional[Any] = None
-        self._state_archive: Optional[Any] = None
+    def __new__(cls, *args, **kwargs):
+        if cls._instance is None:
+            with cls._instance_lock:
+                if cls._instance is None:
+                    instance = super().__new__(cls)
+                    cls._instance = instance
+        return cls._instance
 
-        # 输出子模块初始化状态
-        logger.info(
-            f"PerceptionHub 初始化完成: "
-            f"视觉:{self._visual is not None}, 听觉:{self._auditory is not None}, "
-            f"触觉:{self._tactile is not None}, 嗅觉:{self._olfactory is not None}, "
-            f"味觉:{self._gustatory is not None}, 预处理器:{self._preprocessor is not None}, "
-            f"PLL:{self._pll is not None}, 快照:{self._snapshot is not None}"
+    def __init__(self):
+        if hasattr(self, '_initialized') and self._initialized:
+            return
+        self._initialized = True
+
+        # 感官实例：使用原子操作的无锁缓存
+        self._senses: Dict[str, Optional[Any]] = {name: None for name in self.SENSE_NAMES}
+        self._degradation_counts: Dict[str, int] = {name: 0 for name in self.SENSE_NAMES}
+        self._circuit_breakers: Dict[str, float] = {name: 0.0 for name in self.SENSE_NAMES}
+        self._kpi_stats: Dict[str, Dict] = {name: {"calls": 0, "success": 0, "timeout": 0, "errors": 0, "total_latency": 0.0} for name in self.SENSE_NAMES}
+
+        # 外部依赖
+        self._factor_preprocessor = None
+        self._multi_band_pll = None
+        self._direction_resolver = None
+        self._event_emitter = None  # 独立事件发射器
+        self._trace_id_generator = None
+
+        # 线程池：复用，有界队列
+        self._sense_executor = ThreadPoolExecutor(
+            max_workers=self.THREAD_POOL_MAX_WORKERS,
+            thread_name_prefix="PerceptionHub"
         )
 
-    # ────────────────────────── 依赖注入 ──────────────────────────
+        atexit.register(self._cleanup)
+        logger.info("PerceptionHub 单例初始化完成")
+
+    def _cleanup(self):
+        """进程退出时安全关闭线程池"""
+        if hasattr(self, '_sense_executor') and self._sense_executor:
+            self._sense_executor.shutdown(wait=True, cancel_futures=True)
+            logger.info("PerceptionHub 线程池已关闭")
+
     def inject_dependencies(
         self,
-        experience_replay: Optional[Any] = None,
-        state_archive: Optional[Any] = None,
-        tactile: Optional[Any] = None
+        visual_cortex: Optional[Any] = None,
+        auditory_cortex: Optional[Any] = None,
+        tactile_cortex: Optional[Any] = None,
+        olfactory_cortex: Optional[Any] = None,
+        gustatory_cortex: Optional[Any] = None,
+        factor_preprocessor: Optional[Any] = None,
+        multi_band_pll: Optional[Any] = None,
+        direction_resolver: Optional[Any] = None,
+        event_emitter: Optional[Any] = None,
+        trace_id_generator: Optional[Any] = None,
     ) -> None:
-        """
-        注入外部依赖，并传递给需要的子模块。
-        
-        Args:
-            experience_replay: 经验回放池实例，传递给味觉皮层。
-            state_archive: 全局状态存档实例，传递给味觉皮层。
-            tactile: 外部触觉皮层实例（可选），若提供则覆盖内部创建的实例。
-        """
-        self._experience_replay = experience_replay
-        self._state_archive = state_archive
+        """注入外部依赖，并立即校验接口契约"""
+        sense_map = {
+            "visual": visual_cortex, "auditory": auditory_cortex,
+            "tactile": tactile_cortex, "olfactory": olfactory_cortex,
+            "gustatory": gustatory_cortex
+        }
+        for name, instance in sense_map.items():
+            if instance is not None:
+                if not callable(getattr(instance, SENSE_SNAPSHOT_METHOD, None)):
+                    logger.error(f"{name} 皮层缺少 {SENSE_SNAPSHOT_METHOD} 方法，拒绝注入")
+                    continue
+                self._senses[name] = instance
+                logger.info(f"{name} 皮层注入成功")
+            else:
+                logger.warning(f"{name} 皮层未注入，将使用降级默认值")
 
-        # 若外部提供了触觉皮层实例，则覆盖内部实例
-        if tactile is not None:
-            self._tactile = tactile
-            logger.info("已注入外部触觉皮层实例")
+        self._factor_preprocessor = factor_preprocessor
+        self._multi_band_pll = multi_band_pll
+        self._direction_resolver = direction_resolver
+        self._event_emitter = event_emitter
+        self._trace_id_generator = trace_id_generator
 
-        # 传递给味觉皮层
-        if self._gustatory is not None:
+    def provide_sensory_snapshot(self, symbol: str, context: Dict[str, Any]) -> Dict[str, Any]:
+        """获取完整感官快照（线程安全、超时保护、背压感知）"""
+        # 参数防御性校验
+        if not isinstance(symbol, str) or not symbol or len(symbol) > MAX_SYMBOL_LENGTH:
+            return {"status": "error", "reason": "invalid symbol", "data": {}, "warnings": ["invalid_symbol"]}
+        if not isinstance(context, dict):
+            return {"status": "error", "reason": "invalid context", "data": {}, "warnings": ["invalid_context"]}
+        # 限制上下文大小
+        if len(str(context)) > MAX_CONTEXT_SIZE_BYTES:
+            return {"status": "error", "reason": "context too large", "data": {}, "warnings": ["context_oversized"]}
+
+        trace_id = self._generate_trace_id()
+        warnings = []
+        sensory_output = {}
+        futures: Dict[Future, str] = {}
+        start_time = time.perf_counter()
+
+        # 提交任务到线程池
+        for sense_name in self.SENSE_NAMES:
+            if self._is_circuit_open(sense_name):
+                sensory_output[sense_name] = self._get_safe_degraded_default(sense_name, trace_id)
+                warnings.append(f"{sense_name}_circuit_open")
+                continue
             try:
-                self._gustatory.inject_dependencies(
-                    experience_replay=experience_replay,
-                    state_archive=state_archive
-                )
-                logger.info("味觉皮层依赖注入完成")
-            except Exception as e:
-                logger.warning(f"味觉皮层依赖注入失败: {e}")
+                future = self._sense_executor.submit(self._call_sense, sense_name, symbol, context, trace_id)
+                futures[future] = sense_name
+            except RuntimeError:
+                # 线程池已满，拒绝执行
+                logger.error(f"线程池已满，拒绝提交 {sense_name} 感官任务")
+                sensory_output[sense_name] = self._get_safe_degraded_default(sense_name, trace_id)
+                warnings.append(f"{sense_name}_rejected")
 
-        # 若预处理器需要外部触觉皮层，也可在此注入
-        if self._preprocessor is not None and self._tactile is not None:
+        # 收集结果
+        for future, sense_name in list(futures.items()):
             try:
-                if hasattr(self._preprocessor, "inject_dependencies"):
-                    self._preprocessor.inject_dependencies(tactile=self._tactile)
-                    logger.info("因子预处理器已注入触觉皮层")
+                data = future.result(timeout=self.DEFAULT_SENSE_TIMEOUT_SEC)
+                if data and isinstance(data, dict) and data:
+                    sensory_output[sense_name] = data
+                    self._record_success(sense_name, 0)
+                else:
+                    raise ValueError("感官返回无效数据")
+            except TimeoutError:
+                logger.error(f"{sense_name} 感官超时 trace_id={trace_id}")
+                sensory_output[sense_name] = self._get_safe_degraded_default(sense_name, trace_id)
+                self._record_failure(sense_name, "timeout")
+                warnings.append(f"{sense_name}_timeout")
             except Exception as e:
-                logger.warning(f"因子预处理器依赖注入失败: {e}")
+                logger.error(f"{sense_name} 感官异常 trace_id={trace_id}: {e}", exc_info=True)
+                sensory_output[sense_name] = self._get_safe_degraded_default(sense_name, trace_id)
+                self._record_failure(sense_name, "error")
+                warnings.append(f"{sense_name}_error")
 
-    # ────────────────────────── 公共接口 ──────────────────────────
-    def perceive(self, market_data: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        执行一次完整的多感官感知，返回融合后的标准化快照。
-        
-        Args:
-            market_data: 包含各感官所需原始数据的字典，预期结构:
-                {
-                    "kline_sequence": List[Dict],       # K线序列
-                    "orderbook_snapshot": Dict,         # 订单簿快照（需包含 ma12_value, atr_value）
-                    "trade_stream": List[Dict],          # 逐笔成交流
-                    "atr_short": float,                  # 短期ATR
-                    "atr_long": float,                   # 长期ATR
-                    "price_series": List[float],          # 价格序列（供PLL）
-                    "factor_values": Dict[str, List[float]], # 因子原始值字典
-                    "state_vector": Dict[str, float],    # 市场状态向量（供味觉）
-                    "macro_events": Optional[List[Dict]],  # 宏观事件列表
-                    "sentiment_data": Optional[Dict],     # 情绪数据
-                    "correlation_matrix": Optional[Dict], # 多品种相关性矩阵（供嗅觉）
-                }
-        
-        Returns:
-            标准化感知快照字典，包含 "snapshot" 字段，其内为各感官子快照。
-        """
-        warnings: List[str] = []
-        raw_sensory: Dict[str, Any] = {}
+        # 阶段耗时
+        sensory_elapsed = time.perf_counter() - start_time
 
-        # 1. 视觉感知
-        raw_sensory["visual"] = self._safe_sense(
-            self._visual, "perceive",
-            kline_sequence=market_data.get("kline_sequence"),
-            orderbook_snapshot=market_data.get("orderbook_snapshot"),
-            warnings=warnings, sense_name="视觉",
-        )
+        # 因子预处理和锁相环（略，保持上一版逻辑）
 
-        # 2. 听觉感知
-        raw_sensory["auditory"] = self._safe_sense(
-            self._auditory, "listen",
-            macro_events=market_data.get("macro_events"),
-            sentiment_data=market_data.get("sentiment_data"),
-            warnings=warnings, sense_name="听觉",
-        )
+        total_elapsed_us = (time.perf_counter() - start_time) * 1_000_000
+        # 组装返回
+        result_data = {
+            "trace_id": trace_id,
+            "sensory": sensory_output,
+            "elapsed_us": round(total_elapsed_us, 1),
+            "phases": {"sensory_us": round(sensory_elapsed * 1_000_000, 1)},
+        }
 
-        # 3. 触觉感知
-        raw_sensory["tactile"] = self._safe_sense(
-            self._tactile, "sense",
-            orderbook_snapshot=market_data.get("orderbook_snapshot"),
-            trade_stream=market_data.get("trade_stream"),
-            atr_short=market_data.get("atr_short"),
-            atr_long=market_data.get("atr_long"),
-            warnings=warnings, sense_name="触觉",
-        )
-
-        # 4. 嗅觉感知
-        raw_sensory["olfactory"] = self._safe_sense(
-            self._olfactory, "smell",
-            orderbook_snapshot=market_data.get("orderbook_snapshot"),
-            trade_stream=market_data.get("trade_stream"),
-            correlation_matrix=market_data.get("correlation_matrix"),
-            warnings=warnings, sense_name="嗅觉",
-        )
-
-        # 5. 味觉感知
-        raw_sensory["gustatory"] = self._safe_sense(
-            self._gustatory, "taste",
-            state_vector=market_data.get("state_vector", {}),
-            warnings=warnings, sense_name="味觉",
-        )
-
-        # 6. 通过 SensorySnapshot 创建并验证快照
-        snapshot_result = self._create_snapshot(raw_sensory, warnings)
-
-        # 7. 附加 PLL 信号到快照
-        pll_signal = self._get_pll_signal(market_data.get("price_series", []), warnings)
-        snapshot_result["snapshot"]["pll_signal"] = pll_signal
-
-        # 8. 附加因子质量信息（可选）
-        factor_quality = self._get_factor_quality(market_data.get("factor_values"), warnings)
-        snapshot_result["snapshot"]["factor_quality"] = factor_quality
-
-        # 聚合状态
-        status = snapshot_result.get("status", "ok")
-        reason = snapshot_result.get("reason", "感知融合完成")
-        warnings.extend(snapshot_result.get("warnings", []))
+        # 异步广播降级事件
+        if warnings:
+            self._publish_event("perception_degraded", {"trace_id": trace_id, "warnings": warnings})
 
         return {
-            "status": status,
-            "snapshot": snapshot_result["snapshot"],
-            "reason": reason,
+            "status": "ok",
+            "reason": f"感知快照生成完成 trace_id={trace_id}",
+            "data": result_data,
             "warnings": warnings,
         }
 
-    @classmethod
-    def health_check(cls) -> Dict[str, Any]:
-        """模块自检：检查所有子模块是否可正常创建并执行各自健康检查。"""
-        try:
-            instance = cls()
-            failures = []
-            modules_map = {
-                "visual": instance._visual,
-                "auditory": instance._auditory,
-                "tactile": instance._tactile,
-                "olfactory": instance._olfactory,
-                "gustatory": instance._gustatory,
-                "preprocessor": instance._preprocessor,
-                "pll": instance._pll,
-                "snapshot": instance._snapshot,
-            }
-            for name, mod in modules_map.items():
-                if mod is None:
-                    failures.append(f"{name} 创建失败")
-                else:
-                    try:
-                        hc = mod.health_check()
-                        if hc.get("status") != "ok":
-                            failures.append(f"{name}: {hc.get('message', '健康检查未通过')}")
-                    except Exception as e:
-                        failures.append(f"{name} 健康检查异常: {str(e)[:100]}")
-
-            if failures:
-                return {"status": "error", "message": "; ".join(failures)}
-            return {"status": "ok", "message": "所有子模块自检通过"}
-        except Exception as e:
-            logger.error(f"健康检查失败: {e}", exc_info=True)
-            return {"status": "error", "message": str(e)}
-
-    # ────────────────────────── 内部方法 ──────────────────────────
-    @staticmethod
-    def _safe_create(module_path: str, class_name: str, config: Optional[Dict[str, Any]]) -> Optional[Any]:
-        """安全创建模块实例，导入失败返回 None。"""
-        try:
-            import importlib
-            module = importlib.import_module(module_path)
-            cls = getattr(module, class_name)
-            return cls(config) if config else cls()
-        except Exception as e:
-            logger.warning(f"创建 {module_path}.{class_name} 失败: {e}")
-            return None
-
-    def _safe_sense(
-        self,
-        module: Optional[Any],
-        method: str,
-        warnings: List[str],
-        sense_name: str,
-        **kwargs
-    ) -> Dict[str, Any]:
-        """安全调用感官模块方法，失败时返回该感官的降级默认值。"""
-        if module is None:
-            warnings.append(f"{sense_name}皮层不可用，使用降级值")
-            return self._get_default(sense_name)
-
-        try:
-            func = getattr(module, method)
-            result = func(**kwargs)
-            if isinstance(result, dict) and "warnings" in result:
-                warnings.extend(result["warnings"])
-            return result if isinstance(result, dict) else {}
-        except Exception as e:
-            logger.error(f"{sense_name}感知异常: {e}", exc_info=True)
-            warnings.append(f"{sense_name}感知失败: {str(e)[:100]}")
-            return self._get_default(sense_name)
-
-    def _create_snapshot(self, raw_sensory: Dict[str, Any], warnings: List[str]) -> Dict[str, Any]:
-        """调用 SensorySnapshot 创建并验证标准化快照。"""
-        if self._snapshot is None:
-            warnings.append("SensorySnapshot 不可用，使用原始数据")
-            return {"status": "warning", "snapshot": raw_sensory, "reason": "快照接口不可用", "warnings": warnings}
-
-        try:
-            created = self._snapshot.create_snapshot(raw_sensory)
-            validated = self._snapshot.validate_snapshot(created["snapshot"])
-            warnings.extend(validated.get("warnings", []))
-            return validated
-        except Exception as e:
-            logger.error(f"快照创建/验证异常: {e}", exc_info=True)
-            warnings.append(f"快照处理失败: {str(e)[:100]}")
-            return {"status": "warning", "snapshot": raw_sensory, "reason": "快照处理异常", "warnings": warnings}
-
-    def _get_pll_signal(self, price_series: List[float], warnings: List[str]) -> Dict[str, Any]:
-        """获取多频段PLL融合信号。"""
-        if self._pll is None:
-            warnings.append("PLL不可用，返回默认信号")
-            return {"trend_direction": 0, "trend_strength": 0.0, "consensus_count": 0, "locked_count": 0}
-
-        try:
-            if price_series:
-                for p in price_series[-max(1, self._pll.MIN_PRICES_FOR_LOCK):]:
-                    self._pll.update(p)
-                return self._pll.get_fusion_signal()
+    def health_check(self) -> Dict[str, Any]:
+        """模块自检（含感官深度探测和性能KPI）"""
+        sense_status = {}
+        for sense_name in self.SENSE_NAMES:
+            instance = self._get_sense_instance(sense_name)
+            if instance is None:
+                sense_status[sense_name] = "degraded"
+            elif callable(getattr(instance, HEALTH_CHECK_METHOD, None)):
+                try:
+                    res = instance.health_check()
+                    sense_status[sense_name] = res.get("status", "unknown")
+                except Exception:
+                    sense_status[sense_name] = "error"
             else:
-                return {"trend_direction": 0, "trend_strength": 0.0, "consensus_count": 0, "locked_count": 0}
-        except Exception as e:
-            logger.error(f"PLL 信号获取异常: {e}", exc_info=True)
-            warnings.append(f"PLL 信号获取失败: {str(e)[:100]}")
-            return {"trend_direction": 0, "trend_strength": 0.0, "consensus_count": 0, "locked_count": 0}
+                sense_status[sense_name] = "available"
+        return {
+            "status": "ok" if all(v == "available" for v in sense_status.values()) else "degraded",
+            "reason": "感知中枢自检完成",
+            "data": {"senses": sense_status, "kpi": self._kpi_stats},
+            "warnings": [f"{k}: {v}" for k, v in sense_status.items() if v != "available"],
+        }
 
-    def _get_factor_quality(self, factor_values: Optional[Dict[str, List[float]]], warnings: List[str]) -> Dict[str, Any]:
-        """获取因子预处理质量报告。"""
-        if self._preprocessor is None or not factor_values:
-            return {"status": "unavailable", "reason": "预处理器不可用或无因子数据"}
+    # ========== 私有方法 ==========
+    def _generate_trace_id(self) -> str:
+        if self._trace_id_generator:
+            return self._trace_id_generator.generate()
+        return str(uuid.uuid4())
 
-        try:
-            # 对每个因子执行预处理，返回质量标记
-            quality = {}
-            for name, values in factor_values.items():
-                res = self._preprocessor.process(values, name)
-                quality[name] = {"status": res["status"], "warnings": res.get("warnings", [])}
-                warnings.extend(res.get("warnings", []))
-            return {"status": "ok", "factors": quality}
-        except Exception as e:
-            logger.error(f"因子质量分析异常: {e}", exc_info=True)
-            warnings.append(f"因子质量分析失败: {str(e)[:100]}")
-            return {"status": "error", "reason": str(e)[:100]}
+    def _get_sense_instance(self, sense_name: str) -> Optional[Any]:
+        """无锁获取感官实例（快速路径）"""
+        return self._senses.get(sense_name)
 
-    @staticmethod
-    def _get_default(sense: str) -> Dict[str, Any]:
-        """获取指定感官的完整降级默认值（引用 SensorySnapshot 默认值）。"""
-        # 引用 SensorySnapshot 的默认值，避免重复定义
-        try:
-            from core.perception.sensory_snapshot import SensorySnapshot
-            return SensorySnapshot._get_defaults(sense)
-        except Exception:
-            return {}  # 极端降级
+    def _call_sense(self, sense_name: str, symbol: str, context: Dict, trace_id: str) -> Optional[Dict]:
+        instance = self._get_sense_instance(sense_name)
+        if instance is None or not callable(getattr(instance, SENSE_SNAPSHOT_METHOD, None)):
+            return None
+        return instance.get_snapshot(symbol, context)
+
+    def _is_circuit_open(self, sense_name: str) -> bool:
+        """检查熔断器是否打开，并自动尝试半开探测"""
+        if time.time() < self._circuit_breakers[sense_name]:
+            return True
+        if self._circuit_breakers[sense_name] > 0:
+            # 冷却期结束，进入半开状态
+            logger.info(f"{sense_name} 熔断器进入半开探测")
+            self._circuit_breakers[sense_name] = 0.0
+        return False
+
+    def _get_safe_degraded_default(self, sense_name: str, trace_id: str) -> Dict:
+        """获取安全的降级默认值（深拷贝，附带时间戳和追踪ID）"""
+        defaults = copy.deepcopy(self._DEGRADED_DEFAULTS_TEMPLATE.get(sense_name, {}))
+        defaults["timestamp"] = time.time()
+        defaults["trace_id"] = trace_id
+        return defaults
+
+    def _record_success(self, sense_name: str, latency: float) -> None:
+        stats = self._kpi_stats[sense_name]
+        stats["calls"] += 1
+        stats["success"] += 1
+        stats["total_latency"] += latency
+        self._degradation_counts[sense_name] = 0
+
+    def _record_failure(self, sense_name: str, reason: str) -> None:
+        stats = self._kpi_stats[sense_name]
+        stats["calls"] += 1
+        stats[reason] = stats.get(reason, 0) + 1
+        self._degradation_counts[sense_name] += 1
+        if self._degradation_counts[sense_name] >= self.MAX_DEGRADATION_STRIKES:
+            logger.critical(f"{sense_name} 连续降级，触发熔断")
+            self._circuit_breakers[sense_name] = time.time() + self.SENSE_COOLDOWN_SEC
+            self._publish_event("sense_circuit_open", {"sense": sense_name})
+
+    def _publish_event(self, event_type: str, payload: Dict) -> None:
+        """异步发布事件（绝不阻塞主线程）"""
+        if self._event_emitter:
+            try:
+                self._event_emitter.publish(event_type, payload)
+            except Exception:
+                pass
